@@ -28,6 +28,8 @@ dev = [
     "pytest>=7.0",
     "pytest-asyncio>=0.21",
     "pytest-cov>=4.0",
+    "aiosqlite>=0.19",  # conftest 用 sqlite 临时文件做集成测试
+    "tzdata>=2024.1",   # tests/test_time_util.py 的 America/New_York 等非 UTC tz 测试
 ]
 
 [build-system]
@@ -36,3 +38,32 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/infra"]
+
+# ============================================================
+# pytest 配置
+# ============================================================
+[tool.pytest.ini_options]
+# 自动识别 async def test_* ——无需 @pytest.mark.asyncio
+asyncio_mode = "auto"
+# 关键：所有测试和 async fixture 默认跑在 session 级 event loop，
+# 这样 session-scoped 的 DatabaseConnectionManager.engine 不会被换 loop 搞坏。
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
+# 测试根目录
+testpaths = ["tests"]
+# 简短 traceback（CI 友好）
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--tb=short",
+    # 默认跳过 @pytest.mark.slow 标记的测试（多数是 trend_analyzer 的趋势分支）。
+    # 显式跑全部：`pytest -m slow` 或 `pytest -m ""`（清空 deselect）。
+    "-m",
+    "not slow",
+]
+# 自定义 marker
+markers = [
+    "integration: 集成测试（需要真实 PG/Redis）",
+    "unit: 单元测试",
+    "slow: 慢速测试",
+]

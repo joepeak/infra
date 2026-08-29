@@ -14,3 +14,7 @@ env/
 # 编辑器
 .idea/
 .vscode/
+
+# 本地运行时产物 / 凭据
+.env
+logs/

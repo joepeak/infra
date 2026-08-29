@@ -151,12 +151,15 @@ def _get_loader() -> ConfigLoader:
 def init_config(config_dir: Path) -> Dict[str, Any]:
     """
     初始化配置（应用启动时调用）
-    
+
     Args:
         config_dir: 配置文件目录（如 project_root / "conf"）
+
+    总是 force_reload——保证 _config 与 _config_dir 一致，避免切目录后
+    get_config() 仍返回旧 dict 的静默不一致。
     """
     _get_loader().configure(config_dir)
-    return _get_loader().load_config()
+    return _get_loader().load_config(force_reload=True)
 
 
 def get_config() -> Dict[str, Any]:
