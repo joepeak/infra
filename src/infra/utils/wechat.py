@@ -12,7 +12,7 @@ import json
 import re
 
 from infra.logger import get_logger
-from .retry import retry_async_decorator
+from .retry import retry_async_deco, RetryConfig
 
 logger = get_logger(__name__)
 
@@ -70,7 +70,7 @@ def _extract_cooldown(error_msg: str) -> float:
         return total
     return None
 
-@retry_async_decorator(max_retries=5)
+@retry_async_deco(config=RetryConfig.default().copy(max_retries=5))
 async def send_to_wechat(message: str, timeout: int = 180) -> bool:
     """
     发送消息到微信（纯粹 HTTP 层）
