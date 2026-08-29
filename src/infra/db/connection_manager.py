@@ -92,6 +92,7 @@ class DatabaseConnectionManager:
         """加载数据库配置，支持优雅降级或强制报错"""
         full_config = get_config()
         db_config = full_config.get(self.db_config_key)
+        db_type = full_config.get("db_type", "postgresql")
 
         if not db_config:
             if self.require_db:
@@ -125,7 +126,8 @@ class DatabaseConnectionManager:
         merged_engine_config = engine_defaults.copy()
         merged_engine_config.update(engine_config)
         db_config['engine'] = merged_engine_config
-
+        db_config['type'] = db_type
+        
         return db_config
 
     def _initialize_engine(self) -> None:

@@ -17,7 +17,7 @@ logger = get_logger(__name__)
 # 固定的配置文件名
 DEFAULT_CONFIG_FILES = ["config.yaml", "jobs.yaml"]
 
-_config: Optional[Dict[str, Any]] = None
+# _config: Optional[Dict[str, Any]] = None
 _config_loaded = False
 
 
@@ -42,9 +42,12 @@ class ConfigLoader:
     def configure(self, config_dir: Path):
         """
         配置配置目录（由调用方调用）
-        
+
         Args:
             config_dir: 配置文件目录
+
+        只设置 _config_dir，不主动 load。load 由 init_config()（force_reload）
+        或 get_config() 首次调用时触发。
         """
         self._config_dir = Path(config_dir)
         logger.info(f"配置目录已设置: {self._config_dir}")
@@ -84,10 +87,10 @@ class ConfigLoader:
     
     def load_config(self, force_reload: bool = False) -> Dict[str, Any]:
         """加载配置"""
-        global _config, _config_loaded
+        global  _config_loaded
         
         if _config_loaded and not force_reload:
-            return _config
+            return self._config
         
         if self._config_dir is None:
             raise RuntimeError("请先调用 configure() 设置配置目录")
@@ -116,18 +119,18 @@ class ConfigLoader:
             merged = self._deep_merge(merged, self._load_yaml(local_file))
             logger.info("已加载: local.yaml")
         
-        _config = merged
+        self._config = merged
         _config_loaded = True
-        
-        logger.info(f"配置加载完成: {list(_config.keys())}")
-        return _config
+
+        logger.info(f"配置加载完成: {list(merged.keys())}")
+        return self._config
     
     def get_config(self) -> Dict[str, Any]:
         """获取配置"""
         if not _config_loaded:
             return self.load_config()
-        return _config
-    
+        return self._config
+
     def reload_config(self) -> Dict[str, Any]:
         """重新加载"""
         return self.load_config(force_reload=True)
@@ -165,7 +168,6 @@ def init_config(config_dir: Path) -> Dict[str, Any]:
 def get_config() -> Dict[str, Any]:
     """获取配置"""
     return _get_loader().get_config()
-
 
 
 def reload_config() -> Dict[str, Any]:

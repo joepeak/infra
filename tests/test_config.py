@@ -63,7 +63,7 @@ def _reset_config_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     loader_module._config = None
     loader_module._config_loaded = False
     loader_module._loader = None
-    # 破坏单例
+    # 破坏单例（下次 _get_loader() 会建新实例，避免 self._config 跨测试残留）
     ConfigLoader._instance = None
 
     yield
