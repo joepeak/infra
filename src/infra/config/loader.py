@@ -131,6 +131,12 @@ class ConfigLoader:
             return self.load_config()
         return self._config
 
+    def set_config(self, conf: Dict[str, Any]) -> None:
+        """设置配置（整体替换）。"""
+        if not _config_loaded:
+            self.load_config()
+        self._config = conf
+
     def reload_config(self) -> Dict[str, Any]:
         """重新加载"""
         return self.load_config(force_reload=True)
@@ -168,6 +174,11 @@ def init_config(config_dir: Path) -> Dict[str, Any]:
 def get_config() -> Dict[str, Any]:
     """获取配置"""
     return _get_loader().get_config()
+
+
+def set_config(conf: Dict[str, Any]) -> None:
+    """设置配置（整体替换）"""
+    _get_loader().set_config(conf)
 
 
 def reload_config() -> Dict[str, Any]:
