@@ -1,288 +1,214 @@
-# macro_monitor/utils/retry.py
-"""
-统一的重试机制，支持同步和异步函数
+"""infra.utils.retry：通用重试机制（20260829 升级）。
+
+升级要点（采纳 dramacraft 设计）：
+- @dataclass 替代老式 __init__ 类——更 Pythonic
+- deny_exceptions 黑名单（deny > allow）——精准控制（不重试 KeyError/ValueError 等程序错误）
+- 失败 raise 原始异常（不 return None）——调用方 try/except 清晰
+- .copy(**override) 单点配置覆盖
+- 去 requests 依赖——通用（不绑死 HTTP）
+- 默认 exceptions 改用通用类（ConnectionError, TimeoutError, OSError）
+
+用法：
+    from infra.utils.retry import retry_async, RetryConfig
+
+    cfg = RetryConfig.default()
+    result = await retry_async(http_get, url, config=cfg)
+
+    @retry_async_deco(config=RetryConfig.aggressive())
+    async def fetch(): ...
 """
 import asyncio
-import time
 import random
-from typing import Callable, TypeVar, Any, Optional, Tuple, Type, Union, Dict
+import time
+from dataclasses import dataclass, field
 from functools import wraps
-import requests
+from typing import (Callable, TypeVar, Any, Optional, Tuple, Type, Dict)
 
 from infra.logger import get_logger
 
 logger = get_logger(__name__)
+T = TypeVar("T")
 
-T = TypeVar('T')
+
+# 默认重试异常（通用——非 HTTP 专属）
+_DEFAULT_RETRY_EXCEPTIONS: Tuple[Type[Exception], ...] = (
+    ConnectionError, TimeoutError, OSError,
+)
 
 
+@dataclass
 class RetryConfig:
-    """重试配置类"""
-    
-    def __init__(
-        self,
-        max_retries: int = 3,
-        base_delay: float = 1.0,
-        max_delay: float = 30.0,
-        exponential_base: float = 2,
-        jitter: bool = True,
-        retry_exceptions: Tuple[Type[Exception], ...] = (
-            requests.RequestException,
-            requests.ConnectionError,
-            requests.Timeout,
-            ConnectionError,
-            TimeoutError,
-            ValueError,
-        )
-    ):
-        self.max_retries = max_retries
-        self.base_delay = base_delay
-        self.max_delay = max_delay
-        self.exponential_base = exponential_base
-        self.jitter = jitter
-        self.retry_exceptions = retry_exceptions
-    
-    def to_dict(self) -> Dict[str, Any]:
-        """转换为字典"""
-        return {
-            'max_retries': self.max_retries,
-            'base_delay': self.base_delay,
-            'max_delay': self.max_delay,
-            'exponential_base': self.exponential_base,
-            'jitter': self.jitter,
-        }
-    
+    """重试配置——纯数据对象，可自由拷贝修改。"""
+    max_retries: int = 3
+    base_delay: float = 1.0
+    max_delay: float = 30.0
+    exponential_base: float = 2.0
+    jitter: bool = True
+    allow_exceptions: Tuple[Type[Exception], ...] = _DEFAULT_RETRY_EXCEPTIONS
+    deny_exceptions: Tuple[Type[Exception], ...] = ()
+
+    def copy(self, **override) -> "RetryConfig":
+        """拷贝并局部覆盖参数——方便单次调用修改配置。"""
+        data = {k: v for k, v in self.__dict__.items()}
+        data.update(override)
+        return RetryConfig(**data)
+
     @classmethod
-    def default(cls) -> 'RetryConfig':
-        """默认配置"""
+    def default(cls) -> "RetryConfig":
         return cls()
-    
+
     @classmethod
-    def aggressive(cls) -> 'RetryConfig':
-        """激进的重试配置（更多重试，更短延迟）"""
-        return cls(
-            max_retries=10,
-            base_delay=0.5,
-            max_delay=10.0,
-            exponential_base=1.5
-        )
-    
+    def aggressive(cls) -> "RetryConfig":
+        """激进：更多重试，等待更短，适合网络抖动场景。"""
+        return cls(max_retries=10, base_delay=0.5, max_delay=10.0, exponential_base=1.5)
+
     @classmethod
-    def conservative(cls) -> 'RetryConfig':
-        """保守的重试配置（更少重试，更长延迟）"""
-        return cls(
-            max_retries=3,
-            base_delay=5.0,
-            max_delay=60.0,
-            exponential_base=2
-        )
+    def conservative(cls) -> "RetryConfig":
+        """保守：少重试，长等待，适合限流严格服务。"""
+        return cls(max_retries=2, base_delay=5.0, max_delay=60.0, exponential_base=2.0)
 
 
 class RetryExecutor:
-    """
-    统一的重试执行器，支持同步和异步函数
-    """
-    
+    """重试执行器（同步/异步统一支持）。"""
+
     def __init__(self, config: Optional[RetryConfig] = None):
-        self.config = config or RetryConfig.default()
-    
-    def _calculate_delay(self, attempt: int) -> float:
-        """计算退避延迟"""
+        self.config: RetryConfig = config or RetryConfig.default()
+
+    def _calc_delay(self, attempt: int) -> float:
+        """计算退避延迟——带上限 + jitter。"""
         delay = self.config.base_delay * (self.config.exponential_base ** attempt)
         delay = min(delay, self.config.max_delay)
-        
         if self.config.jitter:
-            # 添加 ±50% 的随机抖动
-            delay = delay * (0.5 + random.random())
-        
+            # ±50% jitter
+            delay *= 0.5 + random.random()
         return delay
-    
-    def _should_retry(self, exception: Exception) -> bool:
-        """检查是否应该重试"""
-        return isinstance(exception, self.config.retry_exceptions)
-    
-    def execute_sync(self, func: Callable[..., T], *args, **kwargs) -> Optional[T]:
+
+    def _should_retry(self, exc: Exception) -> bool:
         """
-        同步执行带重试的函数
-        
-        Example:
-            result = executor.execute_sync(requests.get, url, timeout=30)
+        判断是否应重试。
+        规则：
+        1. 命中 deny_exceptions 黑名单 → False（绝不再试）
+        2. 在 allow_exceptions 白名单 → True
+        3. 其它所有异常 → False
         """
-        last_exception = None
-        
-        for attempt in range(self.config.max_retries + 1):
+        # 黑名单优先
+        if self.config.deny_exceptions and isinstance(exc, self.config.deny_exceptions):
+            return False
+        if self.config.allow_exceptions and isinstance(exc, self.config.allow_exceptions):
+            return True
+        return False
+
+    def execute_sync(self, func: Callable[..., T], *args, **kwargs) -> T:
+        """同步执行带重试——失败 raise 原始异常。"""
+        last_exc: Optional[Exception] = None
+        cfg = self.config
+        for attempt in range(cfg.max_retries + 1):
             try:
                 return func(*args, **kwargs)
-                
             except Exception as e:
-                last_exception = e
-                
-                if not self._should_retry(e) or attempt == self.config.max_retries:
-                    logger.error(
-                        f"{func.__name__} 执行失败，不再重试: {e}"
-                    )
+                last_exc = e
+                if not self._should_retry(e) or attempt >= cfg.max_retries:
                     break
-                
-                delay = self._calculate_delay(attempt)
+                delay = self._calc_delay(attempt)
+                func_name = getattr(func, "__name__", str(func))
                 logger.warning(
-                    f"{func.__name__} 失败 (尝试 {attempt + 1}/{self.config.max_retries + 1}): {e}. "
-                    f"等待 {delay:.2f} 秒后重试..."
+                    f"[Retry] {func_name} attempt={attempt+1}/{cfg.max_retries+1} "
+                    f"error={type(e).__name__}, sleep={delay:.2f}s"
                 )
                 time.sleep(delay)
-        
-        return None
-    
-    async def execute_async(self, func: Callable, *args, **kwargs) -> Optional[Any]:
+
+        # 全部失败——raise 原始异常
+        assert last_exc is not None
+        raise last_exc
+
+    async def execute_async(self, func: Callable, *args, **kwargs) -> Any:
+        """异步执行带重试——失败 raise 原始异常。
+
+        支持同步函数（在线程池中运行，避免阻塞事件循环）。
         """
-        异步执行带重试的函数
-        
-        Example:
-            result = await executor.execute_async(async_fetch, url)
-            result = await executor.execute_async(requests.get, url)  # 自动处理同步函数
-        """
-        last_exception = None
-        
-        for attempt in range(self.config.max_retries + 1):
+        last_exc: Optional[Exception] = None
+        cfg = self.config
+        for attempt in range(cfg.max_retries + 1):
             try:
                 if asyncio.iscoroutinefunction(func):
-                    return await func(*args, **kwargs)
+                    result = await func(*args, **kwargs)
                 else:
                     # 同步函数在线程池中运行，避免阻塞事件循环
                     loop = asyncio.get_running_loop()
-                    return await loop.run_in_executor(
-                        None, lambda: func(*args, **kwargs)
-                    )
-                    
+                    result = await loop.run_in_executor(None, lambda: func(*args, **kwargs))
+                return result
             except Exception as e:
-                last_exception = e
-                
-                if not self._should_retry(e) or attempt == self.config.max_retries:
-                    logger.error(
-                        f"{func.__name__} 执行失败，不再重试: {e}"
-                    )
+                last_exc = e
+                if not self._should_retry(e) or attempt >= cfg.max_retries:
                     break
-                
-                delay = self._calculate_delay(attempt)
+                delay = self._calc_delay(attempt)
+                func_name = getattr(func, "__name__", str(func))
                 logger.warning(
-                    f"{func.__name__} 失败 (尝试 {attempt + 1}/{self.config.max_retries + 1}): {e}. "
-                    f"等待 {delay:.2f} 秒后重试..."
+                    f"[Retry] {func_name} attempt={attempt+1}/{cfg.max_retries+1} "
+                    f"error={type(e).__name__}, sleep={delay:.2f}s"
                 )
                 await asyncio.sleep(delay)
-        
-        return None
+
+        # 全部失败——raise 原始异常
+        assert last_exc is not None
+        raise last_exc
 
 
-# ============ 装饰器（向后兼容） ============
-
-def retry_sync_decorator(
-    max_retries: int = 3,
-    base_delay: float = 1.0,
-    max_delay: float = 30.0,
-    exponential_base: float = 2,
-    jitter: bool = True,
-    retry_exceptions: Tuple[Type[Exception], ...] = (
-        requests.RequestException,
-        requests.ConnectionError,
-        requests.Timeout,
-        ConnectionError,
-        TimeoutError,
-    )
-):
-    """
-    同步函数重试装饰器（向后兼容）
-    
-    Example:
-        @retry_sync_decorator(max_retries=3)
-        def fetch_data():
-            return requests.get(url)
-    """
-    config = RetryConfig(
-        max_retries=max_retries,
-        base_delay=base_delay,
-        max_delay=max_delay,
-        exponential_base=exponential_base,
-        jitter=jitter,
-        retry_exceptions=retry_exceptions
-    )
-    executor = RetryExecutor(config)
-    
-    def decorator(func: Callable[..., T]) -> Callable[..., Optional[T]]:
-        @wraps(func)
-        def wrapper(*args, **kwargs) -> Optional[T]:
-            return executor.execute_sync(func, *args, **kwargs)
-        return wrapper
-    return decorator
-
-
-def retry_async_decorator(
-    max_retries: int = 3,
-    base_delay: float = 1.0,
-    max_delay: float = 30.0,
-    exponential_base: float = 2,
-    jitter: bool = True,
-    retry_exceptions: Tuple[Type[Exception], ...] = (
-        requests.RequestException,
-        requests.ConnectionError,
-        requests.Timeout,
-        ConnectionError,
-        TimeoutError,
-    )
-):
-    """
-    异步函数重试装饰器
-    
-    Example:
-        @retry_async_decorator(max_retries=3)
-        async def fetch_data():
-            return await async_request(url)
-    """
-    config = RetryConfig(
-        max_retries=max_retries,
-        base_delay=base_delay,
-        max_delay=max_delay,
-        exponential_base=exponential_base,
-        jitter=jitter,
-        retry_exceptions=retry_exceptions
-    )
-    executor = RetryExecutor(config)
-    
-    def decorator(func: Callable):
-        @wraps(func)
-        async def wrapper(*args, **kwargs) -> Optional[Any]:
-            return await executor.execute_async(func, *args, **kwargs)
-        return wrapper
-    return decorator
-
-
-# ============ 函数式调用 ============
+# ==================== 函数式 API ====================
 
 def retry_sync(
     func: Callable[..., T],
     *args,
     config: Optional[RetryConfig] = None,
-    **kwargs
-) -> Optional[T]:
-    """
-    同步函数重试（函数式调用）
-    
-    Example:
-        result = retry_sync(requests.get, url, timeout=30, config=RetryConfig.default())
-    """
-    executor = RetryExecutor(config)
-    return executor.execute_sync(func, *args, **kwargs)
+    **kwargs,
+) -> T:
+    """同步函数重试（函数式调用）——失败 raise 原始异常。"""
+    return RetryExecutor(config).execute_sync(func, *args, **kwargs)
 
 
 async def retry_async(
-    func: Callable,
+    func: Callable[..., T],
     *args,
     config: Optional[RetryConfig] = None,
-    **kwargs
-) -> Optional[Any]:
-    """
-    异步函数重试（函数式调用）
-    
-    Example:
-        result = await retry_async(async_fetch, url, config=RetryConfig.aggressive())
-    """
-    executor = RetryExecutor(config)
-    return await executor.execute_async(func, *args, **kwargs)
+    **kwargs,
+) -> T:
+    """异步函数重试（函数式调用）——失败 raise 原始异常。"""
+    return await RetryExecutor(config).execute_async(func, *args, **kwargs)
+
+
+# ==================== 装饰器 ====================
+
+def retry_sync_deco(config: Optional[RetryConfig] = None):
+    """同步函数重试装饰器。"""
+    cfg = config or RetryConfig.default()
+    exe = RetryExecutor(cfg)
+
+    def decorator(func: Callable[..., T]) -> Callable[..., T]:
+        @wraps(func)
+        def wrapper(*args, **kwargs) -> T:
+            return exe.execute_sync(func, *args, **kwargs)
+        return wrapper
+    return decorator
+
+
+def retry_async_deco(config: Optional[RetryConfig] = None):
+    """异步函数重试装饰器。"""
+    cfg = config or RetryConfig.default()
+    exe = RetryExecutor(cfg)
+
+    def decorator(func: Callable[..., T]) -> Callable[..., T]:
+        @wraps(func)
+        async def wrapper(*args, **kwargs) -> T:
+            return await exe.execute_async(func, *args, **kwargs)
+        return wrapper
+    return decorator
+
+
+__all__ = [
+    "RetryConfig",
+    "RetryExecutor",
+    "retry_sync",
+    "retry_async",
+    "retry_sync_deco",
+    "retry_async_deco",
+]

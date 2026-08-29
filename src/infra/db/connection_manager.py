@@ -5,6 +5,7 @@
 """
 
 import os
+import re
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from typing import Optional, Dict, Any, AsyncGenerator
@@ -137,20 +138,101 @@ class DatabaseConnectionManager:
             logger.error(f"异步数据库引擎初始化失败: {e}")
             raise DatabaseError(f"异步数据库引擎初始化失败: {e}", operation="initialize_engine")
 
+    @staticmethod
+    def _expand_env_vars(value: Any) -> Any:
+        """展开字符串中的 ${VAR} 形式环境变量（来自 .env / 系统环境）。
+
+        未定义的变量保留原样——不阻断启动，便于排查配置遗漏。
+        """
+        if not isinstance(value, str):
+            return value
+        import re
+        pattern = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+        def _sub(m: "re.Match") -> str:
+            var = m.group(1)
+            val = os.getenv(var)
+            if val is None:
+                logger.warning(f"环境变量 {var} 未定义（.env 或系统环境），保留占位符")
+                return m.group(0)
+            return val
+
+        return pattern.sub(_sub, value)
+
+    @staticmethod
+    def _is_sqlite_engine(engine: Any) -> bool:
+        """判断 engine 是否 SQLite（用 engine.dialect.name 单一真理）。"""
+        if engine is None:
+            return False
+        dialect_name = getattr(getattr(engine, "dialect", None), "name", "")
+        return dialect_name.startswith("sqlite")
+
     def _create_engine(self) -> None:
-        """创建异步数据库引擎，优先使用url，其次拼接"""
+        """创建异步数据库引擎，优先使用 url，其次拼接。
+
+        URL 解析策略（按优先级）：
+        1. db.url（支持 ${ENV_VAR} 展开）
+        2. db.writer.url（兼容旧结构）
+        3. 环境变量 POSTGRES_URL / DATABASE_URL
+        4. db.host/port/user/password/database 拼接
+
+        SQLite 走 StaticPool——用 _is_sqlite_engine 后续判断（不要靠 URL 字符串解析）。
+        """
         db_config = self.config
         engine_config = db_config.get('engine', {})
+        db_type = str(db_config.get('type', 'postgresql')).lower()
 
-        database_url = db_config.get('url')
+        # 1. 从 db.url 取
+        database_url = self._expand_env_vars(db_config.get('url'))
+
+        # 2. 兼容旧 dev.yaml 的 writer 子结构
+        if not database_url and isinstance(db_config.get('writer'), dict):
+            database_url = self._expand_env_vars(db_config['writer'].get('url'))
+
+        # 3. 整体回退：环境变量（来自 .env 或系统）
         if not database_url:
-            logger.info("URL未提供，拼接PostgreSQL连接字符串")
-            host = db_config['host']
-            port = db_config['port']
-            user = db_config['user']
-            password = db_config['password']
-            database = db_config['database']
-            database_url = f"postgresql+asyncpg://{user}:{password}@{host}:{port}/{database}"
+            for env_key in ("POSTGRES_URL", "DATABASE_URL"):
+                env_url = self._expand_env_vars(os.getenv(env_key))
+                if env_url:
+                    if env_url.startswith("postgres://"):
+                        env_url = env_url.replace("postgres://", "postgresql+asyncpg://", 1)
+                    elif env_url.startswith("postgresql://"):
+                        env_url = env_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+                    database_url = env_url
+                    logger.info(f"db.url 未配置，使用环境变量 {env_key}")
+                    break
+
+        # 4. url 缺驱动前缀时按 type 补齐
+        if database_url:
+            has_dialect = "://" in database_url and database_url.split("://", 1)[0].startswith(
+                ("postgresql", "postgres", "sqlite", "mysql")
+            )
+            if not has_dialect:
+                if db_type == "postgresql":
+                    database_url = f"postgresql+asyncpg://{database_url}"
+                elif db_type == "sqlite":
+                    database_url = f"sqlite+aiosqlite:///{database_url}"
+            # url 含密码——日志脱敏
+            masked_url = re.sub(r"(://[^:/@]+:)[^@]+(@)", r"\1***\2", database_url) if database_url else ""
+            logger.info(f"使用 URL 创建数据库引擎: {masked_url}")
+        else:
+            host = db_config.get('host')
+            port = db_config.get('port')
+            user = self._expand_env_vars(db_config.get('user'))
+            password = self._expand_env_vars(db_config.get('password'))
+            database = db_config.get('database')
+            missing = [k for k, v in (("host", host), ("user", user), ("password", password), ("database", database)) if v in (None, "")]
+            if missing:
+                raise DatabaseError(
+                    f"数据库配置不完整：db.url 未提供且分项缺少 {missing}（检查 configs/*.yaml 与 .env）",
+                    operation="load_config",
+                )
+            if db_type == "sqlite":
+                database_url = f"sqlite+aiosqlite:///{database}"
+            else:
+                database_url = f"postgresql+asyncpg://{user}:{password}@{host}:{port}/{database}"
+            masked_url = re.sub(r"(://[^:/@]+:)[^@]+(@)", r"\1***\2", database_url) if database_url else ""
+            logger.info(f"URL 未提供，按 type={db_type} 拼接: {masked_url}")
 
         # 基础引擎参数
         engine_args = {
@@ -163,9 +245,31 @@ class DatabaseConnectionManager:
             "pool_reset_on_return": 'commit',
         }
 
-        if "sqlite" in database_url:
-            logger.info("检测到SQLite数据库，移除不支持的连接池参数")
-            # SQLite 不支持这些参数
+        # application_name 配置化（不再硬编码 'dramacraft'）
+        app_name = engine_config.get('application_name', 'crypto-watcher')
+        server_settings = {
+            'application_name': app_name,
+        }
+        # 允许用户覆盖
+        custom_server_settings = engine_config.get('server_settings', {})
+        server_settings.update(custom_server_settings)
+
+        # 通用 connect_args
+        connect_args = {
+            'timeout': engine_config.get('connect_timeout', 10),
+            'command_timeout': 60,
+            'server_settings': server_settings,
+        }
+        if 'connect_args' in engine_config:
+            connect_args.update(engine_config['connect_args'])
+
+        self.engine = create_async_engine(database_url, **engine_args)
+
+        # 5. **创建 engine 后**——用 engine.dialect.name 决定特性（不靠 URL 字符串）
+        # SQLAlchemy 2.0+ create_async_engine 不允许事后改 connect_args——
+        # 重建 engine 一次以应用正确参数（同步 dispose——非 async）
+        if self._is_sqlite_engine(self.engine):
+            logger.info("检测到 SQLite 数据库，移除不支持的连接池参数")
             engine_args.pop("pool_size", None)
             engine_args.pop("max_overflow", None)
             engine_args.pop("pool_timeout", None)
@@ -173,18 +277,17 @@ class DatabaseConnectionManager:
             engine_args["poolclass"] = StaticPool
             engine_args["connect_args"] = {'check_same_thread': False}
         else:
-            engine_args["connect_args"] = {
-                'timeout': engine_config.get('connect_timeout', 10),
-                'command_timeout': 60,
-                'server_settings': {
-                    'application_name': 'dramacraft',
-                }
-            }
-            if 'connect_args' in engine_config:
-                engine_args["connect_args"].update(engine_config['connect_args'])
+            # PostgreSQL 等标准方言——使用 connect_args（之前默认值是 'dramacraft'）
+            engine_args["connect_args"] = connect_args
+
+        # 重新创建以应用最终参数
+        try:
+            self.engine.sync_engine.dispose()  # 同步 dispose 旧 engine
+        except Exception:
+            pass  # ignore——首次创建时无 sync_engine
 
         self.engine = create_async_engine(database_url, **engine_args)
-        logger.info(f"异步引擎创建成功 for {self.db_config_key}")
+        logger.info(f"异步引擎创建成功 for {self.db_config_key}（dialect={self.engine.dialect.name}）")
 
     def _create_session_factory(self) -> None:
         """创建异步会话工厂"""
