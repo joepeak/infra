@@ -98,6 +98,10 @@ class RetryExecutor:
             return True
         return False
 
+    def should_retry(self, exc: Exception) -> bool:
+        """公开方法——判断异常是否应被重试（暴露给业务使用）。"""
+        return self._should_retry(exc)
+
     def execute_sync(self, func: Callable[..., T], *args, **kwargs) -> T:
         """同步执行带重试——失败 raise 原始异常。"""
         last_exc: Optional[Exception] = None

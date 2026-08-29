@@ -18,7 +18,9 @@ dependencies = [
     "pytz>=2023.3",
     "lark-oapi>=1.2",
     "numpy>=1.24",
-    "python-dotenv>=1.0",  # 20260829 新增——infra.bootstrap 自动加载 .env
+    "python-dotenv>=1.0",  # infra.bootstrap 自动加载 .env
+    "pydantic>=2.0",  # infra.llm models
+    "openai>=1.30",  # infra.llm OpenAI provider
 ]
 
 [project.optional-dependencies]
