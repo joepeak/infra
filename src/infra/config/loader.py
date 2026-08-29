@@ -6,6 +6,7 @@
 """
 
 import os
+import copy
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 import yaml
@@ -126,16 +127,30 @@ class ConfigLoader:
         return self._config
     
     def get_config(self) -> Dict[str, Any]:
-        """获取配置"""
+        """
+        获取配置（返回深拷贝——调用方可任意修改不影响内部状态）。
+
+        嵌套 dict 也完全隔离。
+        """
         if not _config_loaded:
             return self.load_config()
-        return self._config
+        return copy.deepcopy(self._config)
 
     def set_config(self, conf: Dict[str, Any]) -> None:
-        """设置配置（整体替换）。"""
+        """
+        浅覆盖设置配置（deep merge 语义）。
+
+        与整 dict 替换不同——只覆盖传入的 key，未传入的 key 保留。
+        嵌套 dict 递归合并，原值与新值都是 dict 时递归。
+
+        例：
+            当前 _config = {"a": 1, "b": {"x": 10, "y": 20}}
+            set_config({"b": {"y": 999, "z": 30}})
+            → _config = {"a": 1, "b": {"x": 10, "y": 999, "z": 30}}
+        """
         if not _config_loaded:
             self.load_config()
-        self._config = conf
+        self._config = self._deep_merge(self._config, conf)
 
     def reload_config(self) -> Dict[str, Any]:
         """重新加载"""
@@ -172,12 +187,12 @@ def init_config(config_dir: Path) -> Dict[str, Any]:
 
 
 def get_config() -> Dict[str, Any]:
-    """获取配置"""
+    """获取配置（深拷贝——可任意修改返回值不影响内部状态）"""
     return _get_loader().get_config()
 
 
 def set_config(conf: Dict[str, Any]) -> None:
-    """设置配置（整体替换）"""
+    """浅覆盖设置配置（deep merge 语义）"""
     _get_loader().set_config(conf)
 
 

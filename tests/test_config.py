@@ -38,6 +38,7 @@ from infra.config import (
     get_config_path,
     init_config,
     reload_config,
+    set_config,
 )
 import infra.config.loader as loader_module
 
@@ -387,6 +388,79 @@ class TestReconfigure:
         # 再次 init_config 同一目录 → force_reload → 新值
         init_config(config_dir)
         assert get_config() == {"v": 2}
+
+
+# ============================================================
+# 9. set_config / get_config 语义（deep merge + 深拷贝隔离）
+# ============================================================
+class TestSetAndGetIsolation:
+    def test_get_config_returns_deep_copy(self, config_dir):
+        """get_config 返深拷贝——改嵌套 dict 不污染 self._config。"""
+        _write(config_dir, "config.yaml", {"a": 1, "nested": {"x": 10, "y": 20}})
+        init_config(config_dir)
+        c = get_config()
+        c["a"] = 999
+        c["nested"]["x"] = 999
+        # 重新 get 应拿原值
+        c2 = get_config()
+        assert c2 == {"a": 1, "nested": {"x": 10, "y": 20}}
+
+    def test_get_config_different_instances_each_call(self, config_dir):
+        """每次 get_config 都拿新对象——两个返回值互不影响。"""
+        _write(config_dir, "config.yaml", {"a": 1})
+        init_config(config_dir)
+        a = get_config()
+        b = get_config()
+        assert a is not b
+        a["a"] = 999
+        assert b["a"] == 1
+
+    def test_set_config_deep_merge_partial(self, config_dir):
+        """set_config 浅覆盖——未传 key 保留，嵌套 dict 递归合并。"""
+        _write(config_dir, "config.yaml", {"a": 1, "b": {"x": 10, "y": 20}})
+        init_config(config_dir)
+        set_config({"b": {"y": 999, "z": 30}})
+        # a 保留, b 合并
+        assert get_config() == {"a": 1, "b": {"x": 10, "y": 999, "z": 30}}
+
+    def test_set_config_replaces_non_dict_value_with_dict(self, config_dir):
+        """原值非 dict，新值是 dict → 直接覆盖。"""
+        _write(config_dir, "config.yaml", {"a": "old_value"})
+        init_config(config_dir)
+        set_config({"a": {"nested": 1}})
+        assert get_config() == {"a": {"nested": 1}}
+
+    def test_set_config_replaces_dict_value_with_scalar(self, config_dir):
+        """原值是 dict，新值非 dict → 直接覆盖。"""
+        _write(config_dir, "config.yaml", {"a": {"x": 1}})
+        init_config(config_dir)
+        set_config({"a": "scalar"})
+        assert get_config() == {"a": "scalar"}
+
+    def test_set_config_adds_new_top_level_keys(self, config_dir):
+        """新 key 直接加进 _config。"""
+        _write(config_dir, "config.yaml", {"a": 1})
+        init_config(config_dir)
+        set_config({"b": 2, "c": 3})
+        assert get_config() == {"a": 1, "b": 2, "c": 3}
+
+    def test_set_config_empty_dict_no_op(self, config_dir):
+        """空 dict 等价于无操作。"""
+        _write(config_dir, "config.yaml", {"a": 1, "b": {"x": 10}})
+        init_config(config_dir)
+        set_config({})
+        assert get_config() == {"a": 1, "b": {"x": 10}}
+
+    def test_set_config_triggers_lazy_load_if_not_loaded(self, tmp_path):
+        """未 init 时调 set_config 仍能正确工作——先 lazy load 再 merge。"""
+        # 走 _get_loader() 拿实例但不走 init_config
+        from infra.config.loader import _get_loader
+        _get_loader().configure(tmp_path)
+        _write(tmp_path, "config.yaml", {"initial": True})
+        set_config({"added": 1})
+        # set_config 内部应触发 load_config → 读到 initial=True
+        # 然后与 {"added": 1} 合并
+        assert get_config() == {"initial": True, "added": 1}
 
 
 # ============================================================
