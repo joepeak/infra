@@ -88,12 +88,20 @@ class OpenAIClient(LLMClient):
 
     async def ainvoke(self, request: LLMRequest) -> LLMResponse:
         from infra.utils.retry import retry_async
-        model = request.model or self.default_model
-        create_func = partial(
-            self._async_client.chat.completions.create,
-            model=model,
-            **request.to_openai_kwargs(),
-        )
+        # request.model 显式给出时优先（partial 里不重复传 model，避免 **kwargs 冲突）
+        kwargs = request.to_openai_kwargs()
+        if "model" in kwargs:
+            create_func = partial(
+                self._async_client.chat.completions.create,
+                **kwargs,
+            )
+        else:
+            model = request.model or self.default_model
+            create_func = partial(
+                self._async_client.chat.completions.create,
+                model=model,
+                **kwargs,
+            )
         response = await retry_async(create_func, config=self.retry_config)
         result = LLMResponse.from_openai_response(response)
         self._record_usage_from_response(result)
@@ -101,12 +109,19 @@ class OpenAIClient(LLMClient):
 
     def invoke(self, request: LLMRequest) -> LLMResponse:
         from infra.utils.retry import retry_sync
-        model = request.model or self.default_model
-        create_func = partial(
-            self._sync_client.chat.completions.create,
-            model=model,
-            **request.to_openai_kwargs(),
-        )
+        kwargs = request.to_openai_kwargs()
+        if "model" in kwargs:
+            create_func = partial(
+                self._sync_client.chat.completions.create,
+                **kwargs,
+            )
+        else:
+            model = request.model or self.default_model
+            create_func = partial(
+                self._sync_client.chat.completions.create,
+                model=model,
+                **kwargs,
+            )
         response = retry_sync(create_func, config=self.retry_config)
         result = LLMResponse.from_openai_response(response)
         self._record_usage_from_response(result)

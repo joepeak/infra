@@ -140,6 +140,11 @@ class RetryExecutor:
                     # 同步函数在线程池中运行，避免阻塞事件循环
                     loop = asyncio.get_running_loop()
                     result = await loop.run_in_executor(None, lambda: func(*args, **kwargs))
+                # 防御：partial(async_func, ...) 在 iscoroutinefunction 里会判 False，
+                # 走线程池分支调一次，拿到的是 coroutine 对象不是真值。补一下 await。
+                import inspect
+                if inspect.iscoroutine(result):
+                    result = await result
                 return result
             except Exception as e:
                 last_exc = e
