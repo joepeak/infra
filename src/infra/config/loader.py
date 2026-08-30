@@ -147,10 +147,32 @@ class ConfigLoader:
             当前 _config = {"a": 1, "b": {"x": 10, "y": 20}}
             set_config({"b": {"y": 999, "z": 30}})
             → _config = {"a": 1, "b": {"x": 10, "y": 999, "z": 30}}
+
+        测试场景想"整替换"——用 replace_config。
         """
         if not _config_loaded:
             self.load_config()
         self._config = self._deep_merge(self._config, conf)
+
+    def replace_config(self, conf: Dict[str, Any]) -> None:
+        """
+        整 dict 替换 _config（测试场景用——不想保留任何旧 key）。
+
+        与 set_config 区别：
+        - set_config: deep merge，传部分 dict 不会擦掉未传的 key
+        - replace_config: 完整替换，传什么用什么
+
+        用法：
+            # 测试前想完全替换 db 子节点
+            replace_config({"db": {"url": "sqlite+aiosqlite:///test.db"}})
+            # 之后 get_config()['db'] 严格等于传入的 dict（不会保留原 host/port 等）
+
+        生产环境应优先用 set_config（merge 更安全）。
+        """
+        global _config_loaded
+        # 不走 load 流程——replace_config 是"我说了算"语义，未 init 时直接覆盖
+        self._config = dict(conf)  # 拷贝一层防外部 mutate
+        _config_loaded = True
 
     def reload_config(self) -> Dict[str, Any]:
         """重新加载"""
@@ -172,18 +194,19 @@ def _get_loader() -> ConfigLoader:
     return _loader
 
 
-def init_config(config_dir: Path) -> Dict[str, Any]:
+def init_config(config_dir: Path, force_reload: bool = True) -> Dict[str, Any]:
     """
     初始化配置（应用启动时调用）
 
     Args:
         config_dir: 配置文件目录（如 project_root / "conf"）
-
-    总是 force_reload——保证 _config 与 _config_dir 一致，避免切目录后
-    get_config() 仍返回旧 dict 的静默不一致。
+        force_reload: 强制重新读 yaml 文件（默认 True——
+            保证 _config 与 _config_dir 一致，避免切目录后
+            get_config() 仍返回旧 dict 的静默不一致）。
+            设 False 可复用缓存（不推荐）。
     """
     _get_loader().configure(config_dir)
-    return _get_loader().load_config(force_reload=True)
+    return _get_loader().load_config(force_reload=force_reload)
 
 
 def get_config() -> Dict[str, Any]:
@@ -192,8 +215,21 @@ def get_config() -> Dict[str, Any]:
 
 
 def set_config(conf: Dict[str, Any]) -> None:
-    """浅覆盖设置配置（deep merge 语义）"""
+    """
+    浅覆盖设置配置（deep merge 语义）。
+
+    详见 ConfigLoader.set_config。测试场景想整替换请用 replace_config。
+    """
     _get_loader().set_config(conf)
+
+
+def replace_config(conf: Dict[str, Any]) -> None:
+    """
+    整 dict 替换配置（测试场景用——不想保留任何旧 key）。
+
+    详见 ConfigLoader.replace_config。生产环境优先用 set_config（merge 安全）。
+    """
+    _get_loader().replace_config(conf)
 
 
 def reload_config() -> Dict[str, Any]:

@@ -464,6 +464,78 @@ class TestSetAndGetIsolation:
 
 
 # ============================================================
+# 10. replace_config（整替换，测试场景用）
+# ============================================================
+class TestReplaceConfig:
+    def test_replace_drops_all_old_keys(self, config_dir):
+        """replace_config 整替换——未传 key 全部消失。"""
+        from infra.config import replace_config
+        _write(config_dir, "config.yaml", {"a": 1, "b": {"x": 10, "y": 20}})
+        init_config(config_dir)
+        # 整替换：只保留 b（替换版），a 完全消失
+        replace_config({"b": {"x": 999}})
+        result = get_config()
+        # a 不在
+        assert "a" not in result
+        # b 完全替换（不是 merge）—— y 也消失
+        assert result["b"] == {"x": 999}
+
+    def test_replace_top_level_keys(self, config_dir):
+        """顶层 key 整替换。"""
+        from infra.config import replace_config
+        _write(config_dir, "config.yaml", {"a": 1, "b": 2, "c": 3})
+        init_config(config_dir)
+        replace_config({"a": 99})
+        # b/c 消失，只剩 a
+        assert get_config() == {"a": 99}
+
+    def test_replace_does_not_affect_caller_dict(self, config_dir):
+        """replace_config 拷贝一层——调用方改传入 dict 不影响内部。"""
+        from infra.config import replace_config
+        _write(config_dir, "config.yaml", {"a": 1})
+        init_config(config_dir)
+        callers = {"x": 100}
+        replace_config(callers)
+        # 调用方 mutate 自己的 dict
+        callers["x"] = 999
+        callers["new_key"] = "leak"
+        # 内部状态不变
+        assert get_config() == {"x": 100}
+
+    def test_replace_works_before_load(self):
+        """未 init 时 replace_config 直接覆盖（不走 load 流程）。"""
+        from infra.config import replace_config
+        replace_config({"a": 1, "b": {"x": 10}})
+        # 没 init_config —— replace_config 应不报错
+        assert get_config() == {"a": 1, "b": {"x": 10}}
+
+    def test_db_subkey_full_replace(self, config_dir):
+        """测试场景：db 子节点整替换（生产 PG 配置 → 测试 SQLite）。"""
+        from infra.config import replace_config
+        _write(config_dir, "config.yaml", {
+            "db": {
+                "host": "192.168.123.11", "port": 5432,
+                "user": "u", "password": "p", "database": "prod_db",
+                "engine": {"pool_size": 100, "echo": False},
+            }
+        })
+        init_config(config_dir)
+        # 测试场景想"完全替换 db 子节点"
+        replace_config({"db": {
+            "url": "sqlite+aiosqlite:///test.db",
+            "engine": {"echo": False, "pool_pre_ping": False},
+        }})
+        # 整替换后 db 严格等于传入的 dict
+        assert get_config()["db"] == {
+            "url": "sqlite+aiosqlite:///test.db",
+            "engine": {"echo": False, "pool_pre_ping": False},
+        }
+        # 没有 host/port/user 残留
+        for k in ("host", "port", "user", "password", "database"):
+            assert k not in get_config()["db"]
+
+
+# ============================================================
 # 运行入口
 # ============================================================
 if __name__ == "__main__":
