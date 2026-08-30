@@ -231,7 +231,7 @@ def mq_with_redis():
     mq.connect = AsyncMock(return_value=True)
     mq._redis = MagicMock()  # 假装已连
     # xadd 返回 msg_id
-    mq._redis.xadd = AsyncMock(return_value=b"1234567890-0")
+    mq._redis.xadd = AsyncMock(return_value="1234567890-0")
     return mq
 
 
@@ -242,7 +242,7 @@ class TestPublish:
         msg = create_message("new_order", {"sku": "ABC"})
         # TaskMessage 应被 to_mq 转换
         result = await mq.publish("orders", msg)
-        assert result == b"1234567890-0"
+        assert result == "1234567890-0"
         # 验证 xadd 被调，参数含 data dict
         mq._redis.xadd.assert_called_once()
         call_args = mq._redis.xadd.call_args
@@ -263,7 +263,7 @@ class TestPublish:
             "task_type": "manual",
             "payload": {"k": "v"},
         })
-        assert result == b"1234567890-0"
+        assert result == "1234567890-0"
         data = mq._redis.xadd.call_args.args[1]
         # 自动补齐
         assert "task_id" in data  # uuid 自动生成
@@ -302,10 +302,10 @@ class TestPublishByRouting:
         mq = mq_with_redis
         mq.create_queue("etl_q")
         mq.set_routing({"etl": "etl_q"})
-        mq._redis.xadd = AsyncMock(return_value=b"msg-1")
+        mq._redis.xadd = AsyncMock(return_value="msg-1")
         msg = create_message("etl", {"k": "v"})
         result = await mq.publish_by_routing(msg)
-        assert result == b"msg-1"
+        assert result == "msg-1"
         # 验证 xadd 走到了 etl_q
         assert mq._redis.xadd.call_args.args[0] == "etl_q"
 
@@ -314,10 +314,10 @@ class TestPublishByRouting:
         mq = mq_with_redis
         mq.create_queue("default_q")
         mq.set_default_queue("default_q")
-        mq._redis.xadd = AsyncMock(return_value=b"msg-2")
+        mq._redis.xadd = AsyncMock(return_value="msg-2")
         msg = create_message("unknown_type", {"k": "v"})
         result = await mq.publish_by_routing(msg)
-        assert result == b"msg-2"
+        assert result == "msg-2"
         assert mq._redis.xadd.call_args.args[0] == "default_q"
 
     async def test_routing_miss_no_default_raises(self, mq_with_redis):
@@ -343,10 +343,10 @@ class TestPublishSimple:
         mq = mq_with_redis
         mq.create_queue("default_q")
         mq.set_default_queue("default_q")
-        mq._redis.xadd = AsyncMock(return_value=b"msg-3")
+        mq._redis.xadd = AsyncMock(return_value="msg-3")
         msg = create_message("x", {})
         result = await mq.publish_simple(msg)
-        assert result == b"msg-3"
+        assert result == "msg-3"
         assert mq._redis.xadd.call_args.args[0] == "default_q"
 
 

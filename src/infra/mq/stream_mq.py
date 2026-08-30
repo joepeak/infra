@@ -71,6 +71,8 @@ class RedisStreamMQ:
         self._default_queue: Optional[str] = None
         # 动态属性：init_mq 注入——给静态类型一个声明
         self.config: Dict[str, Any] = {}
+        # narrow 时——重连失败时存具体 Exception
+        self._connection_error: Optional[Exception] = None
         self._stats: Dict[str, Any] = {
             'total_processed': 0,
             'total_failed': 0,
@@ -142,7 +144,7 @@ class RedisStreamMQ:
         logger.error(f"Redis 连接失败，已达最大重试次数: {self._connection_error}")
         return False
     
-    def create_queue(self, stream_name: str, group_name: str = None, **kwargs) -> 'RedisStreamMQ':
+    def create_queue(self, stream_name: str, group_name: Optional[str] = None, **kwargs) -> 'RedisStreamMQ':
         """创建/注册一个队列"""
         if group_name is None:
             group_name = f"{stream_name}_group"
@@ -220,8 +222,8 @@ class RedisStreamMQ:
                 data,  # type: ignore[arg-type]
                 maxlen=config.maxlen
             )
-            logger.debug(f"消息已发布: {config.stream_name}/{msg_id}")
-            return msg_id
+            logger.debug(f"消息已发布: {config.stream_name}/{msg_id!r}")
+            return str(msg_id) if msg_id is not None else None
         except Exception as e:
             logger.error(f"发布消息失败: {e}")
             return None
@@ -352,7 +354,8 @@ class RedisStreamMQ:
 
                         if idle_time > config.claim_min_idle_ms:
                             if delivery_count >= config.max_retries:
-                                await self._move_to_dead_letter_by_id(stream_name, config, msg_id, delivery_count)
+                                # msg_id 可能是 bytes/str——cast str 防下游类型错
+                                await self._move_to_dead_letter_by_id(stream_name, config, str(msg_id), delivery_count)
                             else:
                                 claimed = await redis.xclaim(
                                     config.stream_name,
@@ -362,7 +365,7 @@ class RedisStreamMQ:
                                     [msg_id]
                                 )
                                 if claimed:
-                                    logger.info(f"已认领超时消息: {msg_id}, delivery_count={delivery_count + 1}")
+                                    logger.info(f"已认领超时消息: {msg_id!r}, delivery_count={delivery_count + 1}")
                 
                 await asyncio.sleep(config.claim_interval)
                 
@@ -614,7 +617,7 @@ class RedisStreamMQ:
         
         logger.info("消息队列已停止")
     
-    async def get_stats(self, stream_name: str = None) -> Dict[str, Any]:
+    async def get_stats(self, stream_name: Optional[str] = None) -> Dict[str, Any]:
         """获取统计信息"""
         await self.connect()
         
@@ -676,10 +679,12 @@ class RedisStreamMQ:
             if not isinstance(entry, (list, tuple)) or len(entry) < 2:
                 continue
             msg_data = entry[1]
-            original_data = json.loads(msg_data.get('original_data', '{}'))
+            # narrow bytes | str → str（json 字符串）+ fallback {}（防 None 真业务 bug）
+            raw = msg_data.get('original_data', '{}') if msg_data else '{}'
+            original_data = json.loads(raw)
             await redis.xadd(config.stream_name, original_data)
             await redis.xdel(dead_letter_key, msg_id)
-            logger.info(f"消息已从死信队列恢复: {msg_id}")
+            logger.info(f"消息已从死信队列恢复: {msg_id!r}")
             return True
         
         return False
@@ -736,17 +741,22 @@ async def init_mq(
     
     queue_list = queues or _queues_config
     for q in queue_list:
+        # narrow q: Dict[str, Any]——AI 误传非 dict 防御（真业务 bug）
+        if not isinstance(q, dict):
+            logger.warning(f"queue 配置不是 dict，跳过: {q!r}")
+            continue
+        q_dict: Dict[str, Any] = q
         _mq.create_queue(
-            stream_name=q['name'],
-            group_name=q.get('group'),
-            maxlen=q.get('maxlen', 10000),
-            block_ms=q.get('block_ms', 1000),
-            batch_size=q.get('batch_size', 10),
-            max_retries=q.get('max_retries', 3),
-            concurrency=q.get('concurrency', 3),
-            claim_interval=q.get('claim_interval', 30),
-            claim_min_idle_ms=q.get('claim_min_idle_ms', 60000),
-            ttl_seconds=q.get('ttl_seconds', 0)
+            stream_name=q_dict['name'],
+            group_name=q_dict.get('group'),
+            maxlen=q_dict.get('maxlen', 10000),
+            block_ms=q_dict.get('block_ms', 1000),
+            batch_size=q_dict.get('batch_size', 10),
+            max_retries=q_dict.get('max_retries', 3),
+            concurrency=q_dict.get('concurrency', 3),
+            claim_interval=q_dict.get('claim_interval', 30),
+            claim_min_idle_ms=q_dict.get('claim_min_idle_ms', 60000),
+            ttl_seconds=q_dict.get('ttl_seconds', 0)
         )
     
     routing_rules_dict = routing
@@ -759,6 +769,10 @@ async def init_mq(
     if handlers:
         for task_type, handler in handlers.items():
             stream_name = _mq._routing.get(task_type, _mq._default_queue)
+            # narrow 路由结果——若无路由且无默认队列，register 会抛 ValueError
+            if stream_name is None:
+                logger.warning(f"未找到 {task_type} 路由且无默认队列，跳过注册")
+                continue
             _mq.register(stream_name, task_type, handler)
     else:
         logger.warning("没有提供处理器映射，消息队列将不会处理任何消息")
