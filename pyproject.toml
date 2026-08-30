@@ -103,3 +103,9 @@ ignore_errors = true
 [[tool.mypy.overrides]]
 module = "redis"
 ignore_errors = true
+
+# 收窄 ignore_errors 范围——这一轮深度测试覆盖的模块也必须 strict
+# （目前只让 infra.redis.decorators 收窄；其他模块留待后续修老错后逐步收窄）
+[[tool.mypy.overrides]]
+module = "infra.messages"
+ignore_errors = false
