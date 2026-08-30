@@ -7,7 +7,7 @@ Redis 统一客户端
 import json
 import asyncio
 import time
-from typing import Optional, Any, Dict, Set, Callable
+from typing import AsyncIterator, Optional, Any, Dict, Set, Callable
 from contextlib import asynccontextmanager
 
 import redis.asyncio as aioredis
@@ -68,7 +68,7 @@ class RedisClient:
     
     # ========== 基础操作 ==========
     
-    async def get(self, key: str) -> Optional[str]:
+    async def get(self, key: str) -> Any:  # noqa: ANN401  # bytes | str | None
         """获取键值"""
         return await self._get_client().get(key)
     
@@ -81,8 +81,8 @@ class RedisClient:
             value = str(value)
         
         if ttl:
-            return await client.set(key, value, ex=ttl)
-        return await client.set(key, value)
+            return bool(await client.set(key, value, ex=ttl))
+        return bool(await client.set(key, value))
     
     async def delete(self, *keys: str) -> int:
         """删除键"""
@@ -122,13 +122,16 @@ class RedisClient:
             value = str(value)
         return await self._get_client().hset(key, field, value)
     
-    async def hget(self, key: str, field: str) -> Optional[str]:
+    async def hget(self, key: str, field: str) -> Any:  # noqa: ANN401  # bytes | str | None
         """获取 Hash 字段"""
         return await self._get_client().hget(key, field)
     
     async def hgetall(self, key: str) -> Dict[str, str]:
-        """获取整个 Hash"""
-        return await self._get_client().hgetall(key) or {}
+        """获取整个 Hash（redis-py 返 dict[bytes|str, bytes|str]——decode_responses=True 实际是 str）"""
+        raw: Any = await self._get_client().hgetall(key)
+        if not raw:
+            return {}
+        return {str(k): str(v) for k, v in raw.items()}
     
     async def hdel(self, key: str, *fields: str) -> int:
         """删除 Hash 字段"""
@@ -141,12 +144,14 @@ class RedisClient:
         return await self._get_client().sadd(key, *members)
     
     async def sismember(self, key: str, member: str) -> bool:
-        """检查是否为 Set 成员"""
-        return await self._get_client().sismember(key, member)
+        """检查是否为 Set 成员（redis-py 5+ 返 Literal[0, 1]——mypy 期望 bool）"""
+        result = await self._get_client().sismember(key, member)
+        return bool(result)
     
     async def smembers(self, key: str) -> Set[str]:
         """获取 Set 所有成员"""
-        return await self._get_client().smembers(key) or set()
+        raw: Any = await self._get_client().smembers(key)
+        return {str(m) for m in raw} if raw else set()
     
     async def srem(self, key: str, *members: str) -> int:
         """从 Set 移除成员"""
@@ -165,7 +170,8 @@ class RedisClient:
         Returns:
             添加的元素数量
         """
-        return await self._get_client().zadd(key, mapping)
+        result = await self._get_client().zadd(key, mapping)
+        return int(result) if result is not None else 0
     
     async def zremrangebyscore(self, key: str, min_score: float, max_score: float) -> int:
         """
@@ -343,7 +349,9 @@ class RedisClient:
         return await self.delete(lock_key) > 0
     
     @asynccontextmanager
-    async def lock_context(self, key: str, ttl: int = 30, wait: bool = False, timeout: int = 10):
+    async def lock_context(
+        self, key: str, ttl: int = 30, wait: bool = False, timeout: int = 10
+    ) -> "AsyncIterator[bool]":
         """
         分布式锁上下文管理器
         
@@ -439,7 +447,7 @@ def get_redis() -> Optional[RedisClient]:
         logger.warning("Redis 客户端未初始化")
     return _redis_client
 
-async def close_redis():
+async def close_redis() -> None:
     """关闭 Redis 连接"""
     global _redis_client
     if _redis_client:

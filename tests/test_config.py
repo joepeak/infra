@@ -131,9 +131,10 @@ class TestInitAndGet:
 
         assert get_config_path() == config_dir
 
-    def test_get_config_path_before_init_returns_none(self):
-        """configure() 之前调用 get_config_path() 返 None。"""
-        assert get_config_path() is None
+    def test_get_config_path_before_init_raises(self):
+        """configure() 之前调 get_config_path() 抛 RuntimeError（mypy strict 后改）。"""
+        with pytest.raises(RuntimeError, match="请先调用 configure"):
+            get_config_path()
 
     def test_init_config_with_empty_dir(self, config_dir):
         """空目录：没有 yaml 文件时返回空 dict。"""

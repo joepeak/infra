@@ -27,20 +27,23 @@ class ConfigLoader:
     
     _instance = None
     
-    def __new__(cls):
+    def __new__(cls) -> "ConfigLoader":
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
         if cls._instance is None:
             cls._instance = super().__new__(cls)
         return cls._instance
     
-    def __init__(self):
+    def __init__(self) -> None:
         if hasattr(self, '_initialized'):
             return
         
         self._initialized = True
         self._config_dir: Optional[Path] = None
+        self._config: Dict[str, Any] = {}
         logger.info("配置加载器已创建")
     
-    def configure(self, config_dir: Path):
+    def configure(self, config_dir: Path) -> None:
         """
         配置配置目录（由调用方调用）
 
@@ -89,17 +92,17 @@ class ConfigLoader:
     def load_config(self, force_reload: bool = False) -> Dict[str, Any]:
         """加载配置"""
         global  _config_loaded
-        
+
         if _config_loaded and not force_reload:
             return self._config
-        
+
         if self._config_dir is None:
             raise RuntimeError("请先调用 configure() 设置配置目录")
-        
+
         env = self._get_env()
         logger.info(f"加载配置, 目录: {self._config_dir}, 环境: {env}")
-        
-        merged = {}
+
+        merged: Dict[str, Any] = {}
         
         # 加载固定配置文件
         for filename in DEFAULT_CONFIG_FILES:
@@ -180,6 +183,8 @@ class ConfigLoader:
 
     def get_config_path(self) -> Path:
         """获取配置文件目录"""
+        if self._config_dir is None:
+            raise RuntimeError("请先调用 configure() 设置配置目录")
         return self._config_dir
 
 # ========== 便捷函数 ==========

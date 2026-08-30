@@ -125,4 +125,12 @@ ignore_errors = false
 module = "infra.llm"
 ignore_errors = false
 
+[[tool.mypy.overrides]]
+module = "infra.redis"
+ignore_errors = false
+
+[[tool.mypy.overrides]]
+module = "infra.config"
+ignore_errors = false
+
 # 收窄 infra.schedule strict——修真业务 bug（step 38 续）
