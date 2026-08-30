@@ -52,6 +52,73 @@ class TestInfraRoot:
         assert callable(mod.get_db_manager)
         assert callable(mod.get_db_session)
 
+    def test_messages_mq_schedule_reexports(self):
+        """最近迁移的 messages / mq / schedule 在 infra 顶层能直接 import。"""
+        mod = _check_all_defined("infra")
+        # messages
+        from infra.messages import TaskMessage as _TM
+        from infra.messages import create_message as _cm
+        assert mod.TaskMessage is _TM
+        assert mod.create_message is _cm
+        # mq
+        from infra.mq import (
+            RedisStreamMQ as _RSM,
+            init_mq as _im,
+            get_mq as _gm,
+            MessagePriority as _MP,
+            QueueConfig as _QC,
+            QueueName as _QN,
+        )
+        assert mod.RedisStreamMQ is _RSM
+        assert mod.init_mq is _im
+        assert mod.get_mq is _gm
+        assert mod.MessagePriority is _MP
+        assert mod.QueueConfig is _QC
+        assert mod.QueueName is _QN
+        # schedule
+        from infra.schedule import (
+            SchedulerManager as _SM,
+            UnifiedScheduler as _US,
+            TaskRegistry as _TR,
+            JobConfig as _JC,
+            get_scheduler_manager as _gsm,
+            get_unified_scheduler as _gus,
+        )
+        assert mod.SchedulerManager is _SM
+        assert mod.UnifiedScheduler is _US
+        assert mod.TaskRegistry is _TR
+        assert mod.JobConfig is _JC
+        assert mod.get_scheduler_manager is _gsm
+        assert mod.get_unified_scheduler is _gus
+
+    def test_messages_mq_schedule_construct_smoke(self):
+        """re-export 的类可以正常实例化——验证不只是符号。"""
+        mod = _check_all_defined("infra")
+        # TaskMessage
+        msg = mod.TaskMessage(
+            task_id="x", task_type="t", scheduled_time="s", payload={},
+        )
+        assert msg.task_id == "x"
+        # create_message
+        msg2 = mod.create_message("t2", {"k": "v"})
+        assert msg2.task_type == "t2"
+        # QueueConfig
+        from infra.mq import QueueConfig as _QC
+        qc = _QC(stream_name="q", group_name="g")
+        assert qc.stream_name == "q"
+        # RedisStreamMQ
+        mq = mod.RedisStreamMQ(redis_config={"host": "h"})
+        assert mq.redis_config == {"host": "h"}
+        # TaskRegistry
+        reg = mod.TaskRegistry()
+        def f(c): return None
+        reg.register_factory("test", f)
+        assert reg.is_registered("test")
+        # JobConfig
+        def my_task(): pass
+        cfg = mod.JobConfig(func=my_task)
+        assert cfg.func is my_task
+
     def test_bootstrap_aliases(self):
         mod = _check_all_defined("infra")
         assert callable(mod.bootstrap_all)

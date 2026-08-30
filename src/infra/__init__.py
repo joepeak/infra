@@ -1,8 +1,8 @@
 """infra - 通用基础设施类库（自用，不公开）。
 
 模块：
-- infra.db：连接管理/ORM 基类/Repository 基类
-- infra.config：YAML 配置加载
+- infra.db：连接管理/ORM 基类/Repository 基类（按 key Map 化）
+- infra.config：YAML 配置加载（set_config deep merge + replace_config）
 - infra.logger：日志
 - infra.exceptions：异常类
 - infra.time_util：时区转换工具（@deprecated，请用 infra.utils.time_util）
@@ -10,7 +10,9 @@
 - infra.bootstrap：bootstrap_all() 一键启动所有基础设施
 - infra.utils：retry/lark/wechat/async_helpers/executor/trend_analyzer/common/time_util
 - infra.redis：Redis 客户端
-- infra.mq：消息队列（占位）
+- infra.mq：消息队列（基于 Redis Stream）
+- infra.messages：通用消息定义（TaskMessage dataclass）
+- infra.schedule：分布式任务调度（APScheduler + Redis 分布式锁）
 - infra.script_logger：独立脚本日志（控制台+文件）
 """
 # 重新导出常用符号（向后兼容）
@@ -32,6 +34,24 @@ from infra.db import (
     DatabaseRepository, Base, BaseModel, TimeSeriesBaseModel,
 )
 from infra.redis import init_redis, close_redis, get_redis
+# 消息定义 + MQ + 调度器（最近迁移自 crypto-watcher/core，深度测试覆盖）
+from infra.messages import TaskMessage, create_message
+from infra.mq import (
+    init_mq,
+    get_mq,
+    RedisStreamMQ,
+    MessagePriority,
+    QueueConfig,
+    QueueName,
+)
+from infra.schedule import (
+    SchedulerManager,
+    UnifiedScheduler,
+    TaskRegistry,
+    get_scheduler_manager,
+    get_unified_scheduler,
+    JobConfig,
+)
 from infra.bootstrap import bootstrap_all, shutdown_bootstrap, load_config
 from infra.script_logger import get_script_logger
 
@@ -54,6 +74,14 @@ __all__ = [
     "DatabaseRepository", "Base", "BaseModel", "TimeSeriesBaseModel",
     # redis
     "init_redis", "close_redis", "get_redis",
+    # messages（任务消息定义）
+    "TaskMessage", "create_message",
+    # mq（消息队列）
+    "init_mq", "get_mq", "RedisStreamMQ",
+    "MessagePriority", "QueueConfig", "QueueName",
+    # schedule（分布式调度）
+    "SchedulerManager", "UnifiedScheduler", "TaskRegistry",
+    "get_scheduler_manager", "get_unified_scheduler", "JobConfig",
     # bootstrap
     "bootstrap_all", "shutdown_bootstrap", "load_config",
     # script_logger
