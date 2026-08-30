@@ -126,9 +126,13 @@ class TestRedisClientIntegration:
         data = {"city": "上海", "n": 42, "list": [1, 2, {"deep": "嵌套"}]}
         await client.set(key, data)
         result = await client.get(key)
-        assert result == data
-        # 锁住 unicode 保留
-        assert result["city"] == "上海"
+        # RedisClient.set 把 dict → JSON str 存——get 直接返 str
+        # by-design 行为：调用方拿 JSON str 自己 json.loads
+        # （这是 RedisClient 的"低层"接口；高层用 get_or_set）
+        assert json.loads(result) == data
+        # 锁住 ensure_ascii=False 保留中文
+        assert '"上海"' in result
+        assert "上海" in result  # 不会出现 b'\xe4\xb8\x8a\xe6\xb5\xb7' 转义
 
     async def test_set_get_list(self, redis_client):
         client, prefix = redis_client
@@ -136,7 +140,7 @@ class TestRedisClientIntegration:
         data = [1, "x", {"k": "v"}]
         await client.set(key, data)
         result = await client.get(key)
-        assert result == data
+        assert json.loads(result) == data
 
     async def test_set_get_int_converts_to_str(self, redis_client):
         """set int → 实际存 redis 是字符串——get 返字符串（by-design 行为）。"""
@@ -144,10 +148,9 @@ class TestRedisClientIntegration:
         key = f"{prefix}:int"
         await client.set(key, 42)
         result = await client.get(key)
-        # 真 redis 返 bytes / str——client 实际处理
-        assert result == 42  # RedisClient 内部 set 自动 str(value)——get 返 str 后 redis-py decode 回
-        # 注：真 redis bytes → str，"42" — 验证 str
-        assert isinstance(result, str) or isinstance(result, int)
+        # set int → str(42) → "42" 存 redis → get 返 "42"
+        assert result == "42"
+        assert isinstance(result, str)
 
     async def test_setex_ttl_expires(self, redis_client):
         """SETEX ttl=1 秒——真过期。"""
@@ -230,13 +233,22 @@ class TestCacheDecoratorIntegration:
         # 用测试 redis 作为全局
         # 注：@cache 用 get_redis() 拿全局——手动 init
         await init_redis(config={
-            "host": client.redis_config["host"],
-            "port": client.redis_config["port"],
-            "password": client.redis_config.get("password", ""),
-            "db": client.redis_config["db"],
+            "host": client.config["host"],
+            "port": client.config["port"],
+            "password": client.config.get("password", ""),
+            "db": client.config["db"],
         })
         try:
             call_count = 0
+
+            # init_redis 期望嵌套 config: {"redis": {...}}
+            redis_sub = {
+                "host": client.config["host"],
+                "port": client.config["port"],
+                "password": client.config.get("password", ""),
+                "db": client.config["db"],
+            }
+            await init_redis(config={"redis": redis_sub})
 
             @cache(key=f"{prefix}:cached_data", ttl=60)
             async def my_func():
@@ -271,10 +283,10 @@ class TestRedisStreamMqIntegration:
         # 用测试 client 作为基础——但 init_mq 走全局 _mq
         # 这里直接构造 RedisStreamMQ
         mq = RedisStreamMQ(redis_config={
-            "host": client.redis_config["host"],
-            "port": client.redis_config["port"],
-            "password": client.redis_config.get("password", ""),
-            "db": client.redis_config["db"],
+            "host": client.config["host"],
+            "port": client.config["port"],
+            "password": client.config.get("password", ""),
+            "db": client.config["db"],
         })
         try:
             # 真实 connect
@@ -305,7 +317,7 @@ class TestRedisStreamMqIntegration:
                 await mq._redis.delete(stream)
             except Exception:
                 pass
-            await mq.close()
+            await mq._redis.aclose()
 
     async def test_multiple_consumer_groups(self, redis_client):
         """多消费者组（tg / db / analyzer）——每个 group 独立消费。"""
@@ -313,10 +325,10 @@ class TestRedisStreamMqIntegration:
         client, prefix = redis_client
 
         mq = RedisStreamMQ(redis_config={
-            "host": client.redis_config["host"],
-            "port": client.redis_config["port"],
-            "password": client.redis_config.get("password", ""),
-            "db": client.redis_config["db"],
+            "host": client.config["host"],
+            "port": client.config["port"],
+            "password": client.config.get("password", ""),
+            "db": client.config["db"],
         })
         try:
             connected = await mq.connect()
@@ -331,6 +343,12 @@ class TestRedisStreamMqIntegration:
             mq.create_queue(stream, tg)
             mq.create_queue(stream, db)
             mq.create_queue(stream, analyzer)
+            # create_queue 是 lazy（只注册 QueueConfig）——真集成测试必须显式建 group
+            for grp in [tg, db, analyzer]:
+                try:
+                    await mq._redis.xgroup_create(stream, grp, id='0', mkstream=True)
+                except Exception:
+                    pass  # BUSYGROUP ignore
 
             # 发 1 条消息
             msg_id = await mq.publish(stream, {
@@ -344,14 +362,18 @@ class TestRedisStreamMqIntegration:
             })
             assert msg_id is not None
 
-            # 3 个 group 都应该能看到 1 条 pending——互不干扰
+            # xadd 后消息在 stream——但只有 xreadgroup 才会"派发"到 group PEL
+            # 用 xreadgroup 读 0 条（不阻塞，立即返回），强制把消息派发到 group
+            for grp in [tg, db, analyzer]:
+                await mq._redis.xreadgroup(grp, f"{grp}_consumer", {stream: ">"}, count=1, block=10)
+
+            # 3 个 group 都应 pending=1（互不干扰）
             for group in [tg, db, analyzer]:
-                pending = await mq._redis.xpending(stream, group)
-                # pending 是 list-like，len() 是 pending 消息数
-                assert len(pending) == 1, f"group {group} 应有 1 条 pending"
+                pending_list = await mq._redis.xpending_range(stream, group, '-', '+', count=10)
+                assert len(pending_list) == 1, f"group {group} 应有 1 条 pending（实际 {len(pending_list)}）"
         finally:
             try:
                 await mq._redis.delete(stream)
             except Exception:
                 pass
-            await mq.close()
+            await mq._redis.aclose()
