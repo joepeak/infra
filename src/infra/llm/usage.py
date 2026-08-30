@@ -12,7 +12,7 @@ import logging
 import threading
 from collections import defaultdict
 from contextvars import ContextVar
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +24,7 @@ _usage_totals: Dict[str, Dict[str, int]] = defaultdict(
 _current_purpose: ContextVar = ContextVar("_llm_purpose", default="unknown")
 
 
-def set_llm_purpose(purpose: str):
+def set_llm_purpose(purpose: str) -> Any:  # noqa: ANN401  # 返 ContextVar Token
     """设置当前上下文的 LLM 用途标签（如 'write_scene' / 'evaluate_node'）。
 
     用法（with 风格）：
@@ -37,7 +37,7 @@ def set_llm_purpose(purpose: str):
     return _current_purpose.set(purpose)
 
 
-def reset_llm_purpose(token):
+def reset_llm_purpose(token: Any) -> None:
     """恢复用途标签上下文。"""
     if token is not None:
         _current_purpose.reset(token)

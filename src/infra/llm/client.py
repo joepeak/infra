@@ -79,8 +79,8 @@ class OpenAIClient(LLMClient):
         kwargs = {"api_key": self.api_key, "timeout": self.timeout}
         if self.base_url:
             kwargs["base_url"] = self.base_url
-        self._sync_client = OpenAI(**kwargs)
-        self._async_client = AsyncOpenAI(**kwargs)
+        self._sync_client = OpenAI(**kwargs)  # type: ignore[arg-type]
+        self._async_client = AsyncOpenAI(**kwargs)  # type: ignore[arg-type]
 
     @property
     def provider(self) -> str:
@@ -145,6 +145,11 @@ class LLMFactory:
         timeout = config.get("timeout", 120.0)
 
         if provider == "openai":
+            # narrow api_key: Any | None → str（None 时抛错——空 api_key 是真业务 bug）
+            if not api_key:
+                raise ValueError(
+                    "LLM config 缺 api_key——请在 config dict 配 api_key 或环境变量 LLM_API_KEY"
+                )
             return OpenAIClient(
                 api_key=api_key,
                 base_url=base_url,

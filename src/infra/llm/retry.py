@@ -6,9 +6,10 @@
 - 默认 allow_exceptions=限流/超时/网络类——可重试
 """
 from infra.utils.retry import RetryConfig
+from typing import Tuple  # noqa: F811
 
 
-def _build_default_deny_exceptions():
+def _build_default_deny_exceptions() -> Tuple[type, ...]:
     """认证/权限类异常——绝不再试。"""
     deny = []
     try:
@@ -19,9 +20,9 @@ def _build_default_deny_exceptions():
     return tuple(deny)
 
 
-def _build_default_allow_exceptions():
+def _build_default_allow_exceptions() -> Tuple[type, ...]:
     """限流/超时/网络类异常——可重试。"""
-    allow = [ConnectionError, TimeoutError, OSError]
+    allow: list = [ConnectionError, TimeoutError, OSError]
     try:
         from openai import APITimeoutError, RateLimitError, APIError
         allow.extend([APITimeoutError, RateLimitError, APIError])

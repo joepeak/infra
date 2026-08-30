@@ -45,7 +45,7 @@ class LLMResponse(BaseModel):
     def from_openai_response(cls, response: Any) -> "LLMResponse":
         """从 OpenAI 风格响应构造 LLMResponse。"""
         message = response.choices[0].message
-        result = {
+        result: Dict[str, Any] = {
             "content": message.content or "",
             "tool_calls": [],
             "model": getattr(response, "model", None),

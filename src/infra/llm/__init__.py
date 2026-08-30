@@ -41,7 +41,7 @@ from infra.llm.usage import (
 )
 
 
-def _reset_for_test():
+def _reset_for_test() -> None:
     """测试用——重置全局 LLM 单例。"""
     import infra.llm.client as _client_mod
     _client_mod._llm_client = None
