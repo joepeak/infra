@@ -30,6 +30,7 @@ dev = [
     "pytest-cov>=4.0",
     "aiosqlite>=0.19",  # conftest 用 sqlite 临时文件做集成测试
     "tzdata>=2024.1",   # tests/test_time_util.py 的 America/New_York 等非 UTC tz 测试
+    "mypy>=1.10",       # 静态类型检查——AI 写错类型时编译期拦截
 ]
 
 [build-system]
@@ -63,7 +64,42 @@ addopts = [
 ]
 # 自定义 marker
 markers = [
-    "integration: 集成测试（需要真实 PG/Redis）",
+    "integration: 真 redis 集成测试（默认不跑，手动 pytest -m integration）",
     "unit: 单元测试",
     "slow: 慢速测试",
 ]
+
+# ============================================================
+# mypy 静态类型检查（20260830 加入）
+# 目标：AI 写错类型时编译期拦截——避免重复"compute_xxx 返错类型"类 bug。
+#
+# 策略：渐进式——新加的代码必须标类型，老代码分批修。
+# 实施：infra 整体 ignore_errors=true（不阻塞 258 个老错）；
+# 但 disallow_untyped_defs=true 全局生效——AI 写新函数不标 mypy 立刻 warn。
+#
+# 验收：跑 `MYPYPATH=/tmp/mypy_stubs mypy src/infra/redis/decorators.py`
+#      会报 cache() 装饰器 + wrapper 内部函数缺类型（disallow_untyped_defs 触发）
+# ============================================================
+[tool.mypy]
+python_version = "3.11"
+# 关键 strict 子集
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+warn_return_any = true
+warn_unused_configs = true
+warn_unused_ignores = true
+ignore_missing_imports = true
+
+# 老代码 0 增量——分批修
+[[tool.mypy.overrides]]
+module = "infra"
+ignore_errors = true
+
+# 第三方库 stub 兼容问题（numpy / sqlalchemy 用的 dynamic typing 太多，忽略）
+[[tool.mypy.overrides]]
+module = "sqlalchemy"
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = "redis"
+ignore_errors = true
