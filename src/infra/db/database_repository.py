@@ -7,7 +7,7 @@ from sqlalchemy import select, delete, and_, or_, func
 from sqlalchemy.ext.asyncio import AsyncSession
 import asyncpg
 
-from infra.db.connection_manager import get_business_session, get_timeseries_session, get_business_db_manager, get_timeseries_db_manager
+from infra.db.connection_manager import get_db_session, get_db_manager_or_raise
 from infra.db.operations import db_operation
 from infra.logger import get_logger
 from infra.exceptions import DatabaseError
@@ -28,17 +28,17 @@ class PageResult(Generic[ModelType]):
 class DatabaseRepository(Generic[ModelType]):
     """
     异步数据库仓库基类，提供通用的CRUD操作
-    
+
     Args:
         model_class: ORM 模型类
-        db_type: 数据库类型，"business" 或 "timeseries"
+        db_key: db manager key（业务库 "db" / 时序库 "timescaledb" 等）
     """
-    
-    def __init__(self, model_class: ModelType, db_type: str = "business"):
+
+    def __init__(self, model_class: ModelType, db_key: str = "db"):
         self.model_class = model_class
-        self.db_type = db_type
+        self.db_key = db_key
         self.logger = get_logger(self.__class__.__name__)
-    
+
     @asynccontextmanager
     async def get_session(self):
         """获取异步数据库会话。
@@ -52,25 +52,20 @@ class DatabaseRepository(Generic[ModelType]):
         if cur is not None:
             yield cur
             return
-        if self.db_type == "business":
-            async with get_business_session() as session:
-                yield session
-        else:
-            async with get_timeseries_session() as session:
-                yield session
-    
+        async with get_db_session(self.db_key) as session:
+            yield session
+
     @asynccontextmanager
     async def get_direct_connection(self):
         """
         获取一个直接的数据库连接 (AsyncConnection)，用于执行原生SQL
         """
-        if self.db_type == "business":
-            db_manager = get_business_db_manager()
-        else:
-            db_manager = get_timeseries_db_manager()
-            
+        db_manager = get_db_manager_or_raise(self.db_key)
         if not db_manager or not db_manager.engine:
-            raise DatabaseError(f"数据库引擎 ({self.db_type}) 未初始化", operation="get_direct_connection")
+            raise DatabaseError(
+                f"数据库引擎 (key='{self.db_key}') 未初始化",
+                operation="get_direct_connection",
+            )
 
         async with db_manager.engine.connect() as conn:
             yield conn
@@ -584,12 +579,12 @@ class DatabaseRepository(Generic[ModelType]):
 async def execute_query(
     query_func: Callable,
     operation_name: str = "custom_query",
-    db_type: Optional[str] = None,
+    db_key: Optional[str] = None,
 ) -> Any:
     """执行自定义查询函数"""
-    @db_operation(operation_name, db_type=db_type)
+    @db_operation(operation_name, db_key=db_key)
     async def wrapper():
         return await query_func()
-    
+
     return await wrapper()
 

@@ -49,8 +49,8 @@ class TestInfraRoot:
         mod = _check_all_defined("infra")
         # 不重复 import，直接通过 mod 访问
         assert callable(mod.init_db_manager)
-        assert callable(mod.get_business_db_manager)
-        assert callable(mod.get_business_session)
+        assert callable(mod.get_db_manager)
+        assert callable(mod.get_db_session)
 
     def test_bootstrap_aliases(self):
         mod = _check_all_defined("infra")
@@ -84,10 +84,9 @@ class TestInfraDb:
     def test_db_manager_aliases(self):
         mod = _check_all_defined("infra.db")
         assert callable(mod.init_db_manager)
-        assert callable(mod.init_timeseries_db_manager)
-        assert callable(mod.get_business_db_manager)
-        assert callable(mod.get_business_session)
-        assert callable(mod.get_business_health)
+        assert callable(mod.get_db_manager)
+        assert callable(mod.get_db_session)
+        assert callable(mod.get_db_health)
         assert callable(mod.close_all_db_connections)
 
 

@@ -13,7 +13,6 @@ from infra.logger import get_logger, configure_logging_from_dict
 from infra.redis import init_redis, close_redis
 from infra.db.connection_manager import (
     init_db_manager,
-    init_timeseries_db_manager,
     close_all_db_connections,
 )
 from infra.config import init_config
@@ -99,12 +98,18 @@ def setup_logging(config: dict) -> None:
 
 
 async def init_databases() -> None:
-    """初始化所有数据库连接"""
+    """初始化所有数据库连接
+
+    bootstrap 默认接入两个常用 key：
+    - "db" 业务库（PostgreSQL）
+    - "timescaledb" 时序库（TimescaleDB）
+    业务项目可在自己 bootstrap 里调 init_db_manager("xxx") 加更多 key。
+    """
     logger = get_bootstrap_logger()
     try:
-        await init_db_manager()
-        await init_timeseries_db_manager()
-        logger.info("数据库连接管理器初始化完成")
+        init_db_manager("db")
+        init_db_manager("timescaledb")
+        logger.info("数据库连接管理器初始化完成（db, timescaledb）")
     except Exception as e:
         logger.error(f"数据库连接管理器初始化失败: {e}")
         raise

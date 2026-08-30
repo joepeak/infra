@@ -38,7 +38,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column
 
 from infra.db.database_repository import DatabaseRepository, PageResult
-from infra.db import get_business_db_manager
+from infra.db import get_db_manager
 from infra.db.database_model import Base as _InfraBase
 
 
@@ -79,7 +79,7 @@ async def repo(engine):
         await conn.run_sync(_InfraBase.metadata.drop_all)
         await conn.run_sync(_InfraBase.metadata.create_all)
 
-    repo = DatabaseRepository(TestModel, db_type="business")
+    repo = DatabaseRepository(TestModel, db_key="db")
 
     # 清理旧数据（防 drop_all 后还有残留）
     async with repo.get_session() as session:

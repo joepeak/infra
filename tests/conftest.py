@@ -112,8 +112,10 @@ async def _sqlite_bootstrap() -> AsyncIterator[None]:
     with tempfile.TemporaryDirectory(prefix="infra_test_cfg_") as cfg_dir:
         cfg_path = Path(cfg_dir)
         # 写最小 config.yaml：让 init_db_manager 走到 config['db'].url 分支
+        # 显式 type: sqlite——告知 _build_engine_args 走 SQLite 路径（StaticPool）
         (cfg_path / "config.yaml").write_text(
             "db:\n"
+            "  type: sqlite\n"
             "  url: " + test_url + "\n"
             "  engine:\n"
             "    pool_pre_ping: false\n"
@@ -126,15 +128,15 @@ async def _sqlite_bootstrap() -> AsyncIterator[None]:
         init_config(cfg_path)
 
         from infra.db import init_db_manager, close_all_db_connections
-        await init_db_manager(require_db=True)
+        init_db_manager("db", require_db=True)
 
         try:
             yield
         finally:
             # drop_all（如果测试注册了 metadata；这里是 empty——实际表由各测试自己 create）
             try:
-                from infra.db import get_business_db_manager
-                mgr = get_business_db_manager()
+                from infra.db import get_db_manager
+                mgr = get_db_manager("db")
                 if mgr:
                     engine = mgr.get_engine()
                     if engine:
@@ -178,16 +180,16 @@ async def _sqlite_bootstrap() -> AsyncIterator[None]:
 @pytest_asyncio.fixture
 async def engine(_sqlite_bootstrap):
     """function-scoped engine——复用 session 级单例。"""
-    from infra.db import get_business_db_manager
-    return get_business_db_manager().get_engine()
+    from infra.db import get_db_manager
+    return get_db_manager("db").get_engine()
 
 
 @pytest_asyncio.fixture
 async def db_session(_sqlite_bootstrap):
     """Function-scoped fixture: 提供一个干净的 DB session（每个测试一个新 session）。"""
-    from infra.db import get_business_session
+    from infra.db import get_db_session
 
-    async with get_business_session() as session:
+    async with get_db_session("db") as session:
         yield session
 
 
@@ -196,9 +198,9 @@ async def clean_db(_sqlite_bootstrap):
     """Function-scoped: 测试结束后清空所有表数据（保留 schema）。"""
     yield
     # TEARDOWN: 清空所有表数据
-    from infra.db import get_business_db_manager
+    from infra.db import get_db_manager
     from sqlalchemy import text
-    mgr = get_business_db_manager()
+    mgr = get_db_manager("db")
     if not mgr:
         return
     eng = mgr.get_engine()

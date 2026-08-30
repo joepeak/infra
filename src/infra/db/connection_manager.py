@@ -27,7 +27,7 @@ logger = get_logger(__name__)
 # 由 session_scope 统一 commit/rollback，实现跨引擎 ACID 事务。
 # ContextVar 按 asyncio task 隔离 + token reset，不会污染 standalone 调用。
 _current_session: ContextVar[Optional[AsyncSession]] = ContextVar(
-    "macro_monitor_current_session", default=None
+    "current_session", default=None
 )
 
 
@@ -36,43 +36,15 @@ def get_current_session() -> Optional[AsyncSession]:
     return _current_session.get()
 
 
-@asynccontextmanager
-async def session_scope(db_type: str = "timeseries") -> AsyncGenerator[AsyncSession, None]:
-    """Unit of Work 事务边界：开一个 session 设为 ambient，成功 commit / 异常 rollback。
-
-    scope 内所有 DatabaseRepository.create/update/query/find_by 复用此 session；
-    scope 退出时统一提交或回滚。用法：
-        async with session_scope():
-            await repo.create(...)   # 复用 ambient session，不单独 commit
-            await other_repo.create(...)
-        # exit → 统一 commit（原子）；异常 → 统一 rollback
-    """
-    manager = get_timeseries_db_manager() if db_type == "timeseries" else get_business_db_manager()
-    if manager.async_session_factory is None:
-        raise DatabaseError("异步会话工厂未初始化", operation="session_scope")
-
-    session = manager.async_session_factory()
-    token = _current_session.set(session)
-    try:
-        yield session
-        await session.commit()
-    except Exception as e:
-        await session.rollback()
-        logger.error(f"session_scope 事务回滚: {e}")
-        raise
-    finally:
-        _current_session.reset(token)
-        await session.close()
-
-
 class DatabaseConnectionManager:
     """
-    异步数据库连接管理器 - 支持多数据库
+    异步数据库连接管理器 - 支持任意多数据库
 
     Args:
-        db_config_key: 配置键名
-            - "db" 用于业务数据库 (PostgreSQL)
-            - "timescaledb" 用于时序数据库 (TimescaleDB)
+        db_config_key: 配置键名（与 yaml 子配置块同名）
+            - "db" 默认业务库
+            - "timescaledb" 时序库
+            - 业务项目可传任意 key（"analytics" / "cache" 等）
         require_db: 是否强制要求配置存在（默认 True，严格模式）
     """
 
@@ -92,7 +64,6 @@ class DatabaseConnectionManager:
         """加载数据库配置，支持优雅降级或强制报错"""
         full_config = get_config()
         db_config = full_config.get(self.db_config_key)
-        db_type = full_config.get("db_type", "postgresql")
 
         if not db_config:
             if self.require_db:
@@ -102,6 +73,14 @@ class DatabaseConnectionManager:
                 )
             logger.warning(f"数据库配置 {self.db_config_key} 未找到，跳过初始化")
             return {}
+
+        # db_type 优先从子节点读，fallback 到顶层（向后兼容）
+        # 多 db 实例时各自子节点可指定不同 type（PG / SQLite 混合部署）
+        db_type = str(
+            db_config.get("type",
+                          full_config.get("db_type", "postgresql"))
+        ).lower()
+        db_config["type"] = db_type  # 下游 _create_engine 直接读
 
         required_fields = ['host', 'port', 'user', 'password', 'database']
         # 如果使用 URL 直连，则不需要拆分字段
@@ -127,7 +106,7 @@ class DatabaseConnectionManager:
         merged_engine_config.update(engine_config)
         db_config['engine'] = merged_engine_config
         db_config['type'] = db_type
-        
+
         return db_config
 
     def _initialize_engine(self) -> None:
@@ -169,127 +148,209 @@ class DatabaseConnectionManager:
         dialect_name = getattr(getattr(engine, "dialect", None), "name", "")
         return dialect_name.startswith("sqlite")
 
-    def _create_engine(self) -> None:
-        """创建异步数据库引擎，优先使用 url，其次拼接。
+    # 各 db_type 优先查的环境变量（fallback 顺序）
+    _DB_TYPE_ENV_URL_KEYS: Dict[str, tuple] = {
+        "postgresql": ("POSTGRES_URL", "DATABASE_URL"),
+        "mysql": ("MYSQL_URL",),
+        "sqlite": (),
+    }
 
-        URL 解析策略（按优先级）：
-        1. db.url（支持 ${ENV_VAR} 展开）
-        2. db.writer.url（兼容旧结构）
-        3. 环境变量 POSTGRES_URL / DATABASE_URL
-        4. db.host/port/user/password/database 拼接
-
-        SQLite 走 StaticPool——用 _is_sqlite_engine 后续判断（不要靠 URL 字符串解析）。
+    def _resolve_url_and_type(self, db_config: Dict[str, Any]) -> tuple[str, str]:
         """
-        db_config = self.config
-        engine_config = db_config.get('engine', {})
-        db_type = str(db_config.get('type', 'postgresql')).lower()
+        决定 db_type 和最终 url。
 
-        # 1. 从 db.url 取
-        database_url = self._expand_env_vars(db_config.get('url'))
+        URL 优先级：
+        1. db.url 是字面量（不含 ${...}）→ 走字面量，env 不可覆盖
+        2. db.url 含 ${VAR} 语法 → 强制走 env 展开
+        3. db.url 字段不存在 → 按 db_type 查对应 env 变量（POSTGRES_URL / MYSQL_URL 等）
+        4. 兜底：按 host/port/user/password/database 拼接（仅 PG / MySQL 适用）
 
-        # 2. 兼容旧 dev.yaml 的 writer 子结构
-        if not database_url and isinstance(db_config.get('writer'), dict):
-            database_url = self._expand_env_vars(db_config['writer'].get('url'))
+        Returns:
+            (db_type, database_url) 元组
+        """
+        db_type = str(db_config.get("type", "postgresql")).lower()
 
-        # 3. 整体回退：环境变量（来自 .env 或系统）
+        # 1+2: db.url 路径
+        url_value = db_config.get("url")
+        database_url: Optional[str] = None
+
+        if url_value is not None:
+            url_str = str(url_value)
+            has_env_syntax = "${" in url_str
+            database_url = self._expand_env_vars(url_str) if has_env_syntax else url_str
+
+        # 3: yaml 无 url 字段 → 按 type 查环境变量
         if not database_url:
-            for env_key in ("POSTGRES_URL", "DATABASE_URL"):
+            env_keys = self._DB_TYPE_ENV_URL_KEYS.get(db_type, ())
+            for env_key in env_keys:
                 env_url = self._expand_env_vars(os.getenv(env_key))
                 if env_url:
-                    if env_url.startswith("postgres://"):
-                        env_url = env_url.replace("postgres://", "postgresql+asyncpg://", 1)
-                    elif env_url.startswith("postgresql://"):
-                        env_url = env_url.replace("postgresql://", "postgresql+asyncpg://", 1)
                     database_url = env_url
                     logger.info(f"db.url 未配置，使用环境变量 {env_key}")
                     break
 
-        # 4. url 缺驱动前缀时按 type 补齐
+        # 4: 兜底分项拼接
+        if not database_url:
+            database_url = self._build_url_from_components(db_config, db_type)
+
+        # url 缺驱动前缀时按 type 补齐
+        database_url = self._ensure_dialect_prefix(database_url, db_type)
+
+        # 日志脱敏 + 措辞
+        masked_url = re.sub(
+            r"(://[^:/@]+:)[^@]+(@)", r"\1***\2", database_url
+        ) if database_url else ""
         if database_url:
-            has_dialect = "://" in database_url and database_url.split("://", 1)[0].startswith(
-                ("postgresql", "postgres", "sqlite", "mysql")
+            # 简明 log：实际从哪条路径来的在前面已经 log 过
+            logger.info(f"数据库引擎 url: {masked_url} (type={db_type})")
+
+        return db_type, database_url
+
+    def _build_url_from_components(
+        self, db_config: Dict[str, Any], db_type: str
+    ) -> str:
+        """分项拼接 URL；缺字段抛 DatabaseError。"""
+        host = db_config.get("host")
+        port = db_config.get("port")
+        user = self._expand_env_vars(db_config.get("user"))
+        password = self._expand_env_vars(db_config.get("password"))
+        database = db_config.get("database")
+        missing = [
+            k for k, v in (
+                ("host", host), ("user", user),
+                ("password", password), ("database", database),
+            ) if v in (None, "")
+        ]
+        if missing:
+            raise DatabaseError(
+                f"数据库配置不完整：db.url 未提供且分项缺少 {missing}（检查 configs/*.yaml 与 .env）",
+                operation="load_config",
             )
-            if not has_dialect:
-                if db_type == "postgresql":
-                    database_url = f"postgresql+asyncpg://{database_url}"
-                elif db_type == "sqlite":
-                    database_url = f"sqlite+aiosqlite:///{database_url}"
-            # url 含密码——日志脱敏
-            masked_url = re.sub(r"(://[^:/@]+:)[^@]+(@)", r"\1***\2", database_url) if database_url else ""
-            logger.info(f"使用 URL 创建数据库引擎: {masked_url}")
+        if db_type == "sqlite":
+            return f"sqlite+aiosqlite:///{database}"
+        if db_type == "postgresql":
+            return f"postgresql+asyncpg://{user}:{password}@{host}:{port}/{database}"
+        if db_type == "mysql":
+            # MySQL async driver 待定；此处占位
+            return f"mysql+aiomysql://{user}:{password}@{host}:{port}/{database}"
+        raise DatabaseError(
+            f"db_type={db_type} 暂不支持分项拼接，请用 url 字段",
+            operation="load_config",
+        )
+
+    def _ensure_dialect_prefix(self, url: str, db_type: str) -> str:
+        """url 缺驱动前缀时按 db_type 补齐；裸 dialect 升级为 async driver。
+
+        已知 dialect：postgres / postgresql / sqlite / mysql → 升级为 async driver
+        其它 scheme（含 +asyncpg / +aiosqlite / +aiomysql）→ 原样
+        """
+        if "://" in url:
+            scheme = url.split("://", 1)[0]
+            # 已知 dialect 但无 async driver——升级
+            if scheme == "postgres":
+                return url.replace("postgres://", "postgresql+asyncpg://", 1)
+            if scheme == "postgresql":
+                return url.replace("postgresql://", "postgresql+asyncpg://", 1)
+            if scheme == "sqlite":
+                return url.replace("sqlite://", "sqlite+aiosqlite://", 1)
+            if scheme == "mysql":
+                return url.replace("mysql://", "mysql+aiomysql://", 1)
+            # 已是 async driver 或未知 driver（clickhouse / oracle / duckdb / ...）→ 原样
+            return url
+        # 无前缀——按 type 补
+        if db_type == "postgresql":
+            return f"postgresql+asyncpg://{url}"
+        if db_type == "sqlite":
+            return f"sqlite+aiosqlite:///{url}"
+        if db_type == "mysql":
+            return f"mysql+aiomysql://{url}"
+        return url
+
+    def _build_engine_args(
+        self, db_type: str, engine_config: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        按 db_type 返回 create_async_engine 的 kwargs（一次到位，不再重建）。
+
+        关键差异化：
+        - postgresql: 完整连接池 + asyncpg connect_args (server_settings, timeout)
+        - sqlite: StaticPool + check_same_thread=False（多线程兼容）
+        - mysql:   基本池 + 占位 connect_args
+
+        备选：用 create_async_engine 后 engine.dialect.name 二次判断更稳，
+        但 type 是显式声明——业务 yaml 想用 SQLite 时应写 type: sqlite。
+        """
+        # 通用默认值
+        args: Dict[str, Any] = {
+            "echo": engine_config.get("echo", False),
+        }
+
+        if db_type == "sqlite":
+            # SQLite 不支持池参数
+            args["poolclass"] = StaticPool
+            args["connect_args"] = {
+                "check_same_thread": engine_config.get("check_same_thread", False),
+            }
+        elif db_type == "postgresql":
+            # asyncpg 专属 connect_args
+            server_settings: Dict[str, Any] = dict(
+                engine_config.get("server_settings", {})
+            )
+            args.update({
+                "pool_pre_ping": engine_config.get("pool_pre_ping", True),
+                "pool_recycle": engine_config.get("pool_recycle", 3600),
+                "pool_size": engine_config.get("pool_size", 10),
+                "max_overflow": engine_config.get("max_overflow", 20),
+                "pool_timeout": engine_config.get("pool_timeout", 30),
+                "pool_reset_on_return": "commit",
+            })
+            args["connect_args"] = {
+                "timeout": engine_config.get("connect_timeout", 10),
+                "command_timeout": engine_config.get("command_timeout", 60),
+                "server_settings": server_settings,
+            }
+            # 用户 connect_args 覆盖
+            if "connect_args" in engine_config:
+                args["connect_args"].update(engine_config["connect_args"])
+        elif db_type == "mysql":
+            # MySQL async 暂未用上——留接口
+            args.update({
+                "pool_pre_ping": engine_config.get("pool_pre_ping", True),
+                "pool_recycle": engine_config.get("pool_recycle", 3600),
+                "pool_size": engine_config.get("pool_size", 10),
+                "max_overflow": engine_config.get("max_overflow", 20),
+                "pool_timeout": engine_config.get("pool_timeout", 30),
+            })
         else:
-            host = db_config.get('host')
-            port = db_config.get('port')
-            user = self._expand_env_vars(db_config.get('user'))
-            password = self._expand_env_vars(db_config.get('password'))
-            database = db_config.get('database')
-            missing = [k for k, v in (("host", host), ("user", user), ("password", password), ("database", database)) if v in (None, "")]
-            if missing:
-                raise DatabaseError(
-                    f"数据库配置不完整：db.url 未提供且分项缺少 {missing}（检查 configs/*.yaml 与 .env）",
-                    operation="load_config",
-                )
-            if db_type == "sqlite":
-                database_url = f"sqlite+aiosqlite:///{database}"
-            else:
-                database_url = f"postgresql+asyncpg://{user}:{password}@{host}:{port}/{database}"
-            masked_url = re.sub(r"(://[^:/@]+:)[^@]+(@)", r"\1***\2", database_url) if database_url else ""
-            logger.info(f"URL 未提供，按 type={db_type} 拼接: {masked_url}")
+            raise DatabaseError(
+                f"不支持的 db_type: {db_type}（已实现：postgresql/sqlite/mysql）",
+                operation="create_engine",
+            )
 
-        # 基础引擎参数
-        engine_args = {
-            "pool_pre_ping": engine_config.get('pool_pre_ping', True),
-            "pool_recycle": engine_config.get('pool_recycle', 3600),
-            "pool_size": engine_config.get('pool_size', 10),
-            "max_overflow": engine_config.get('max_overflow', 20),
-            "pool_timeout": engine_config.get('pool_timeout', 30),
-            "echo": engine_config.get('echo', False),
-            "pool_reset_on_return": 'commit',
-        }
+        return args
 
-        # application_name 配置化（不再硬编码 'dramacraft'）
-        app_name = engine_config.get('application_name', 'crypto-watcher')
-        server_settings = {
-            'application_name': app_name,
-        }
-        # 允许用户覆盖
-        custom_server_settings = engine_config.get('server_settings', {})
-        server_settings.update(custom_server_settings)
+    def _create_engine(self) -> None:
+        """创建异步数据库引擎（一次创建——按 db_type 走差异化参数）。
 
-        # 通用 connect_args
-        connect_args = {
-            'timeout': engine_config.get('connect_timeout', 10),
-            'command_timeout': 60,
-            'server_settings': server_settings,
-        }
-        if 'connect_args' in engine_config:
-            connect_args.update(engine_config['connect_args'])
+        db_type 决定路径：URL 解析 + 引擎参数构建都用 db_type。
+        若 URL 已显式含 dialect 前缀（如 sqlite+aiosqlite://），但 db_type 未配，
+        走 _resolve_url_and_type 时仍按 db_type 拼（不智能识别）——业务 yaml 应
+        显式写 type: sqlite。"""
+        db_config = self.config
+        engine_config = db_config.get("engine", {})
 
+        # 1. 决定 db_type + url
+        db_type, database_url = self._resolve_url_and_type(db_config)
+
+        # 2. 按 type 返回差异化 engine_args
+        engine_args = self._build_engine_args(db_type, engine_config)
+
+        # 3. 一次创建
         self.engine = create_async_engine(database_url, **engine_args)
-
-        # 5. **创建 engine 后**——用 engine.dialect.name 决定特性（不靠 URL 字符串）
-        # SQLAlchemy 2.0+ create_async_engine 不允许事后改 connect_args——
-        # 重建 engine 一次以应用正确参数（同步 dispose——非 async）
-        if self._is_sqlite_engine(self.engine):
-            logger.info("检测到 SQLite 数据库，移除不支持的连接池参数")
-            engine_args.pop("pool_size", None)
-            engine_args.pop("max_overflow", None)
-            engine_args.pop("pool_timeout", None)
-            engine_args.pop("pool_recycle", None)
-            engine_args["poolclass"] = StaticPool
-            engine_args["connect_args"] = {'check_same_thread': False}
-        else:
-            # PostgreSQL 等标准方言——使用 connect_args（之前默认值是 'dramacraft'）
-            engine_args["connect_args"] = connect_args
-
-        # 重新创建以应用最终参数
-        try:
-            self.engine.sync_engine.dispose()  # 同步 dispose 旧 engine
-        except Exception:
-            pass  # ignore——首次创建时无 sync_engine
-
-        self.engine = create_async_engine(database_url, **engine_args)
-        logger.info(f"异步引擎创建成功 for {self.db_config_key}（dialect={self.engine.dialect.name}）")
+        logger.info(
+            f"异步引擎创建成功 for {self.db_config_key}"
+            f"（dialect={self.engine.dialect.name}, type={db_type}）"
+        )
 
     def _create_session_factory(self) -> None:
         """创建异步会话工厂"""
@@ -375,88 +436,104 @@ class DatabaseConnectionManager:
 
 
 # ============================================================
-# 全局数据库管理器实例
+# 多 db manager 注册表（按 db_config_key 索引）
 # ============================================================
-
-_business_db_manager: Optional[DatabaseConnectionManager] = None
-_timeseries_db_manager: Optional[DatabaseConnectionManager] = None
-
-
-async def init_db_manager(require_db: bool = False) -> DatabaseConnectionManager:
-    """初始化全局业务数据库管理器实例"""
-    global _business_db_manager
-    if _business_db_manager is not None:
-        logger.warning("业务数据库管理器实例已存在，将被替换")
-
-    _business_db_manager = DatabaseConnectionManager("db", require_db=require_db)
-    logger.info("全局业务数据库管理器初始化完成")
-    return _business_db_manager
+# 替代原来的 _business_db_manager / _timeseries_db_manager 双写死 slot。
+# 用 dict 支持任意多个 db 实例——yaml 加一个块、init 时传 key 即可。
+# ============================================================
+_db_managers: Dict[str, DatabaseConnectionManager] = {}
 
 
-async def init_timeseries_db_manager(require_db: bool = False) -> DatabaseConnectionManager:
-    """初始化全局时序数据库管理器实例"""
-    global _timeseries_db_manager
-    if _timeseries_db_manager is not None:
-        logger.warning("时序数据库管理器实例已存在，将被替换")
+def init_db_manager(key: str = "db", require_db: bool = False) -> DatabaseConnectionManager:
+    """
+    按 key 初始化/重建 db manager（同步——__init__ 不涉及网络）。
 
-    _timeseries_db_manager = DatabaseConnectionManager("timescaledb", require_db=require_db)
-    logger.info("全局时序数据库管理器初始化完成")
-    return _timeseries_db_manager
+    key 对应 yaml 配置块名（如 "db" / "timescaledb" / "analytics"）。
+    同一 key 重复 init 会替换并 warn（便于 reload 测试场景）。
+
+    Args:
+        key: db 配置 key（同时作为 manager 标识 + yaml 子配置块名）
+        require_db: 是否强制要求配置存在（False 时优雅降级）
+    """
+    if key in _db_managers:
+        logger.warning(f"db manager '{key}' 已存在，将被替换")
+
+    manager = DatabaseConnectionManager(db_config_key=key, require_db=require_db)
+    _db_managers[key] = manager
+    logger.info(f"db manager '{key}' 初始化完成")
+    return manager
 
 
-def get_business_db_manager() -> DatabaseConnectionManager:
-    """获取业务数据库管理器实例"""
-    global _business_db_manager
-    if _business_db_manager is None:
-        # 兼容旧代码：尝试用默认参数初始化
-        logger.warning("业务数据库管理器未初始化，使用默认配置（降级模式）")
-        _business_db_manager = DatabaseConnectionManager("db", require_db=False)
-    return _business_db_manager
+def get_db_manager(key: str = "db") -> Optional[DatabaseConnectionManager]:
+    """
+    按 key 取 db manager。未初始化返 None（不抛错——便于测试降级场景）。
+
+    想 strict 模式请用 get_db_manager_or_raise。
+    """
+    return _db_managers.get(key)
 
 
-def get_timeseries_db_manager() -> DatabaseConnectionManager:
-    """获取时序数据库管理器实例"""
-    global _timeseries_db_manager
-    if _timeseries_db_manager is None:
-        logger.warning("时序数据库管理器未初始化，使用默认配置（降级模式）")
-        _timeseries_db_manager = DatabaseConnectionManager("timescaledb", require_db=False)
-    return _timeseries_db_manager
+def get_db_manager_or_raise(key: str = "db") -> DatabaseConnectionManager:
+    """取 db manager；未初始化抛 RuntimeError（业务调用首选）。"""
+    mgr = _db_managers.get(key)
+    if mgr is None:
+        raise RuntimeError(
+            f"db manager '{key}' 未初始化——请先调用 init_db_manager('{key}', ...)"
+        )
+    return mgr
 
 
 @asynccontextmanager
-async def get_business_session() -> AsyncGenerator[AsyncSession, None]:
-    """获取业务数据库会话"""
-    async with get_business_db_manager().get_session() as session:
+async def get_db_session(key: str = "db") -> AsyncGenerator[AsyncSession, None]:
+    """按 key 取 db session 上下文管理器。"""
+    async with get_db_manager_or_raise(key).get_session() as session:
         yield session
 
 
 @asynccontextmanager
-async def get_timeseries_session() -> AsyncGenerator[AsyncSession, None]:
-    """获取时序数据库会话"""
-    async with get_timeseries_db_manager().get_session() as session:
+async def session_scope(key: str = "db") -> AsyncGenerator[AsyncSession, None]:
+    """Unit of Work 事务边界（按 key）。
+
+    scope 内所有 DatabaseRepository 调用复用同一 session，由本 scope 统一
+    commit/rollback——实现跨引擎 ACID 事务。ContextVar 隔离，scope 退出后
+    ambient session 自动 reset。
+    """
+    manager = get_db_manager_or_raise(key)
+    if manager.async_session_factory is None:
+        raise DatabaseError(
+            f"异步会话工厂未初始化 (key='{key}')", operation="session_scope"
+        )
+
+    session = manager.async_session_factory()
+    token = _current_session.set(session)
+    try:
         yield session
+        await session.commit()
+    except Exception as e:
+        await session.rollback()
+        logger.error(f"session_scope 事务回滚 (key='{key}'): {e}")
+        raise
+    finally:
+        _current_session.reset(token)
+        await session.close()
 
 
-async def get_business_health() -> Dict[str, Any]:
-    """获取业务数据库健康状态"""
-    return await get_business_db_manager().health_check()
+async def get_db_health(key: str = "db") -> Dict[str, Any]:
+    """按 key 取 db 健康状态。"""
+    return await get_db_manager_or_raise(key).health_check()
 
 
-async def get_timeseries_health() -> Dict[str, Any]:
-    """获取时序数据库健康状态"""
-    return await get_timeseries_db_manager().health_check()
+def list_db_keys() -> list[str]:
+    """列出已初始化的所有 db key（诊断/测试用）。"""
+    return list(_db_managers.keys())
 
 
 async def close_all_db_connections() -> None:
-    """关闭所有数据库连接"""
-    global _business_db_manager, _timeseries_db_manager
-
-    if _business_db_manager:
-        await _business_db_manager.close()
-        _business_db_manager = None
-
-    if _timeseries_db_manager:
-        await _timeseries_db_manager.close()
-        _timeseries_db_manager = None
-
+    """关闭所有 db 连接并清空注册表。"""
+    for key, manager in list(_db_managers.items()):
+        try:
+            await manager.close()
+        except Exception as e:
+            logger.warning(f"关闭 db manager '{key}' 失败: {e}")
+    _db_managers.clear()
     logger.info("所有异步数据库连接已关闭")

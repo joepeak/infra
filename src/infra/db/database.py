@@ -1,63 +1,26 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-数据库配置和连接管理
-使用新的异步连接管理器提供更好的连接池管理和健康检查
+infra.db.database — FastAPI DI shim（仅保留向后兼容）
+
+早期 infra.db.database 是 connection_manager 的 1-to-1 shim 集合
+（get_business_session / get_timeseries_session / get_db_session_dependency 等）。
+激进方案把 6 个 shim 收编为 3 个统一 API（init_db_manager / get_db_session /
+session_scope），database.py 只剩 FastAPI 依赖注入场景常用的两个。
 """
 
-from datetime import datetime, timezone
-from typing import Optional
-from decimal import Decimal
+from typing import AsyncGenerator
+
+from infra.db.connection_manager import get_db_session, get_db_health
+from infra.exceptions import DatabaseError  # noqa: F401  # 兼容旧 import
 
 
-
-# 导入新的异步连接管理器
-from infra.db.connection_manager import (
-    get_business_session,
-    get_timeseries_session,
-    get_business_health,
-    get_timeseries_health,
-    get_business_db_manager,
-    get_timeseries_db_manager,
-)
-
-
-async def get_db_session_dependency():
-    """FastAPI依赖注入的数据库会话（异步）"""
-    async with get_business_session() as db:
-        yield db
-
-
-async def get_timeseries_session_dependency():
-    """FastAPI依赖注入的时序数据库会话（异步）"""
-    async with get_timeseries_session() as db:
-        yield db
-
-
-# ============================================================
-# 向后兼容（保留原有函数名，但改为异步）
-# ============================================================
-
-async def get_db_session_legacy():
-    """获取业务数据库会话（向后兼容）"""
-    async with get_business_session() as session:
-        return session
-
-
-async def get_db_health():
-    """获取业务数据库健康状态（向后兼容）"""
-    return await get_business_health()
+async def get_db_session_dependency() -> AsyncGenerator:
+    """FastAPI 依赖注入：业务库 session（key="db"）。"""
+    async with get_db_session("db") as session:
+        yield session
 
 
 __all__ = [
-    'get_business_session',
-    'get_timeseries_session',
     'get_db_session_dependency',
-    'get_timeseries_session_dependency',
-    'get_db_session_legacy',
-    'get_business_health',
-    'get_timeseries_health',
-    'get_business_db_manager',
-    'get_timeseries_db_manager',
-    'get_db_health',
 ]

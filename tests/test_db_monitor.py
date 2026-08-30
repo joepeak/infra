@@ -125,7 +125,7 @@ class TestResponseTimesTruncation:
         for i in range(105):
             fresh_monitor.response_times.append(float(i))
         # 调一次 _collect_metrics 触发现有截断逻辑
-        with patch("infra.db.monitor.get_business_db_manager") as mock_get:
+        with patch("infra.db.monitor.get_db_manager_or_raise") as mock_get:
             mock_mgr = MagicMock()
             mock_mgr.get_connection_stats.return_value = {
                 "pool_size": 10,

@@ -11,7 +11,7 @@ from typing import Dict, Any, Optional, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from infra.db.connection_manager import get_business_db_manager
+from infra.db.connection_manager import get_db_manager_or_raise
 from infra.logger import get_logger
 from infra.exceptions import DatabaseError
 
@@ -81,7 +81,7 @@ class DatabaseMonitor:
     def _collect_metrics(self) -> None:
         """收集指标"""
         try:
-            manager = get_business_db_manager()
+            manager = get_db_manager_or_raise("db")
             if manager is None:
                 self.logger.error("数据库管理器未初始化")
                 return
@@ -216,7 +216,7 @@ class DatabaseMonitor:
     def get_health_status(self) -> Dict[str, Any]:
         """获取健康状态"""
         try:
-            manager = get_business_db_manager()
+            manager = get_db_manager_or_raise("db")
             if manager is None:
                 return {
                     'overall_status': 'unhealthy',

@@ -10,10 +10,11 @@ infra.db.operations.db_operation 装饰器测试
 4. 无论成败都 record_db_query（finally）
 5. log_performance=False 时不调用 record_db_query
 6. > 1.0s 时记 WARNING
-7. db_type 参数固定 vs 动态从 self.db_type 取
+7. db_key 参数固定 vs 动态从 self.db_key 取
 8. operation_name 出现在 DatabaseError 的 details
 
-注意：装饰器内部用 args[0].db_type——测试需要一个有 db_type 属性的对象当 self。
+注意：装饰器内部用 getattr(args[0], "db_key", "db")——self 无 db_key 时
+fallback 到 "db"（激进方案：db_key 不再是必填属性）。
 """
 
 from __future__ import annotations
@@ -28,13 +29,13 @@ from infra.exceptions import DatabaseError
 
 
 # ============================================================
-# 辅助：一个有 db_type 属性的简单类
+# 辅助：一个有 db_key 属性的简单类
 # ============================================================
 class FakeRepo:
     """假装是 repository 实例。"""
 
-    def __init__(self, db_type: str = "business"):
-        self.db_type = db_type
+    def __init__(self, db_key: str = "db"):
+        self.db_key = db_key
 
 
 # ============================================================
@@ -75,9 +76,9 @@ class TestSQLAlchemyError:
         assert "connection lost" in str(exc_info.value)
         assert exc_info.value.error_code == "DB_ERROR"
         assert exc_info.value.operation == "insert"
-        # details 应含 function name + db_type
+        # details 应含 function name + db_key
         assert exc_info.value.details["function"] == "op"
-        assert exc_info.value.details["db_type"] == "business"
+        assert exc_info.value.details["db_key"] == "db"
 
     async def test_operational_error_wrapped(self):
         """OperationalError 是 SQLAlchemyError 子类。"""
@@ -85,11 +86,11 @@ class TestSQLAlchemyError:
         async def op(self):
             raise OperationalError("SELECT 1", {}, Exception("boom"))
 
-        repo = FakeRepo(db_type="timeseries")
+        repo = FakeRepo(db_key="timescaledb")
         with pytest.raises(DatabaseError) as exc_info:
             await op(repo)
         assert exc_info.value.operation == "query"
-        assert exc_info.value.details["db_type"] == "timeseries"
+        assert exc_info.value.details["db_key"] == "timescaledb"
 
 
 # ============================================================
@@ -144,14 +145,14 @@ class TestRecordQuery:
             mock_record.assert_called_once()
             assert mock_record.call_args[0][1] is False
 
-    async def test_passes_dynamic_db_type(self):
+    async def test_passes_dynamic_db_key(self):
         with patch("infra.db.operations.record_db_query") as mock_record:
             @db_operation("op")
             async def fn(self):
                 return "ok"
 
-            await fn(FakeRepo(db_type="timeseries"))
-            # success 仍记录（db_type 不影响 record）
+            await fn(FakeRepo(db_key="timescaledb"))
+            # success 仍记录（db_key 不影响 record）
             mock_record.assert_called_once()
 
 
@@ -220,52 +221,54 @@ class TestSlowOperationWarning:
 
 
 # ============================================================
-# 7. db_type 参数
+# 7. db_key 参数
 # ============================================================
-class TestDbType:
-    async def test_explicit_db_type_overrides_self(self):
-        """装饰器 db_type 参数优先于 self.db_type。"""
+class TestDbKey:
+    async def test_explicit_db_key_overrides_self(self):
+        """装饰器 db_key 参数优先于 self.db_key。"""
         with patch("infra.db.operations.record_db_query") as mock_record:
-            @db_operation("op", db_type="timeseries")
+            @db_operation("op", db_key="timescaledb")
             async def fn(self):
                 return "ok"
 
-            # self.db_type='business' 但装饰器传 'timeseries'
-            await fn(FakeRepo(db_type="business"))
-            # record 调用不依赖 db_type，只验证调用发生
+            # self.db_key='db' 但装饰器传 'timescaledb'
+            await fn(FakeRepo(db_key="db"))
+            # record 调用不依赖 db_key，只验证调用发生
             mock_record.assert_called_once()
 
-    async def test_db_type_in_database_error_details(self):
-        @db_operation("op", db_type="timeseries")
+    async def test_db_key_in_database_error_details(self):
+        @db_operation("op", db_key="timescaledb")
         async def fn(self):
             raise SQLAlchemyError("x")
 
         with pytest.raises(DatabaseError) as exc_info:
-            await fn(FakeRepo(db_type="business"))  # self 的是 business
+            await fn(FakeRepo(db_key="db"))  # self 的是 db
         # 装饰器参数优先
-        assert exc_info.value.details["db_type"] == "timeseries"
+        assert exc_info.value.details["db_key"] == "timescaledb"
 
-    async def test_dynamic_db_type_from_self(self):
-        """不传 db_type → 从 self.db_type 取。"""
-        @db_operation("op")  # 不传 db_type
+    async def test_dynamic_db_key_from_self(self):
+        """不传 db_key → 从 self.db_key 取。"""
+        @db_operation("op")  # 不传 db_key
         async def fn(self):
             raise SQLAlchemyError("x")
 
         with pytest.raises(DatabaseError) as exc_info:
-            await fn(FakeRepo(db_type="timeseries"))
-        assert exc_info.value.details["db_type"] == "timeseries"
+            await fn(FakeRepo(db_key="timescaledb"))
+        assert exc_info.value.details["db_key"] == "timescaledb"
 
-    async def test_dynamic_db_type_missing_raises(self):
-        """不传 db_type 且 self 没 db_type → AttributeError。"""
+    async def test_dynamic_db_key_missing_falls_back_to_db(self):
+        """激进方案：self 无 db_key 时 fallback 到 "db"，不再抛 AttributeError。"""
         @db_operation("op")
         async def fn(self):
-            return "ok"
+            raise SQLAlchemyError("x")
 
-        class NoDbType:
+        class NoDbKey:
             pass
 
-        with pytest.raises(AttributeError):
-            await fn(NoDbType())
+        with pytest.raises(DatabaseError) as exc_info:
+            await fn(NoDbKey())
+        # fallback 到 "db"
+        assert exc_info.value.details["db_key"] == "db"
 
 
 # ============================================================
