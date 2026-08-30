@@ -93,13 +93,13 @@ class TestBasicStringOps:
         assert result is True
         mock.set.assert_called_once_with("k", "v")
 
-    async def test_set_with_ttl_uses_setex(self, client_with_mock_redis):
-        """set 有 TTL——调 setex。"""
+    async def test_set_with_ttl_uses_set(self, client_with_mock_redis):
+        """set 有 TTL——调 set(key, value, ex=ttl)（redis-py 5.0+ 替代 setex）。"""
         c, mock = client_with_mock_redis
-        mock.setex = AsyncMock(return_value=True)
+        mock.set = AsyncMock(return_value=True)
         result = await c.set("k", "v", ttl=60)
         assert result is True
-        mock.setex.assert_called_once_with("k", 60, "v")
+        mock.set.assert_called_once_with("k", "v", ex=60)
 
     async def test_set_dict_json_encodes(self, client_with_mock_redis):
         """set dict——自动 JSON 序列化。"""
@@ -480,19 +480,19 @@ class TestHealthAndClose:
 
     async def test_close(self, client_with_mock_redis):
         c, mock = client_with_mock_redis
-        mock.close = AsyncMock()
+        mock.aclose = AsyncMock()
         await c.close()
-        mock.close.assert_called_once()
+        mock.aclose.assert_called_once()
 
     async def test_close_with_disconnect_pool(self, client_with_mock_redis):
         """close 调 pool.disconnect（await）。"""
         c, mock = client_with_mock_redis
-        mock.close = AsyncMock()
+        mock.aclose = AsyncMock()
         # pool.disconnect 是 await 调用——必须用 AsyncMock
         c._pool.disconnect = AsyncMock()
         await c.close()
         c._pool.disconnect.assert_called_once()
-        mock.close.assert_called_once()
+        mock.aclose.assert_called_once()
 
 
 # ============================================================

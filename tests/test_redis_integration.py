@@ -317,7 +317,7 @@ class TestRedisStreamMqIntegration:
                 await mq._redis.delete(stream)
             except Exception:
                 pass
-            await mq._redis.aclose()
+            await mq._redis.close()
 
     async def test_multiple_consumer_groups(self, redis_client):
         """多消费者组（tg / db / analyzer）——每个 group 独立消费。"""
@@ -376,4 +376,4 @@ class TestRedisStreamMqIntegration:
                 await mq._redis.delete(stream)
             except Exception:
                 pass
-            await mq._redis.aclose()
+            await mq._redis.close()

@@ -81,7 +81,7 @@ class RedisClient:
             value = str(value)
         
         if ttl:
-            return await client.setex(key, ttl, value)
+            return await client.set(key, value, ex=ttl)
         return await client.set(key, value)
     
     async def delete(self, *keys: str) -> int:
@@ -413,7 +413,7 @@ class RedisClient:
     async def close(self) -> None:
         """关闭连接"""
         if self._client:
-            await self._client.close()
+            await self._client.aclose()
         if self._pool:
             await self._pool.disconnect()
         logger.info("Redis 连接已关闭")
