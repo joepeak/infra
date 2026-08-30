@@ -28,7 +28,10 @@ from infra.db.database_model import (
     Base, BaseModel, ObservationBaseModel, TimeSeriesBaseModel,
     ObservationBase, TimeUtil, JSONBCompatible,
 )
-from infra.time_util import TimeUtil
+
+# infra.time_util.TimeUtil 是旧 class shim——和 infra.db.database_model.TimeUtil 同名冲突
+# 旧路径是 backward compat；infra.db 自己用 database_model.TimeUtil
+# 此处不 import infra.time_util，避免覆盖
 
 __all__ = [
     # 注册表 API

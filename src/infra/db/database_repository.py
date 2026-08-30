@@ -40,7 +40,7 @@ class DatabaseRepository(Generic[ModelType]):
         self.logger = get_logger(self.__class__.__name__)
 
     @asynccontextmanager
-    async def get_session(self):
+    async def get_session(self) -> None:
         """获取异步数据库会话。
 
         优先复用 ambient session（session_scope 内的 Unit of Work 事务），
@@ -56,7 +56,7 @@ class DatabaseRepository(Generic[ModelType]):
             yield session
 
     @asynccontextmanager
-    async def get_direct_connection(self):
+    async def get_direct_connection(self) -> None:
         """
         获取一个直接的数据库连接 (AsyncConnection)，用于执行原生SQL
         """
@@ -81,9 +81,9 @@ class DatabaseRepository(Generic[ModelType]):
                     instance = model_instance
                 else:
                     kwargs = {**model_instance, **kwargs}
-                    instance = self.model_class(**kwargs)
+                    instance = self.model_class(**kwargs)  # type: ignore[operator]
             else:
-                instance = self.model_class(**kwargs)
+                instance = self.model_class(**kwargs)  # type: ignore[operator]
             
             session.add(instance)
             await session.flush()
@@ -119,7 +119,7 @@ class DatabaseRepository(Generic[ModelType]):
                 stmt = stmt.limit(limit)
             
             result = await session.execute(stmt)
-            return result.scalars().all()
+            return result.scalars().all()  # type: ignore[no-any-return]
     
     @db_operation("update_record")
     async def update(self, record_id: Any, **kwargs) -> Optional[Any]:
@@ -271,8 +271,8 @@ class DatabaseRepository(Generic[ModelType]):
             result = await session.execute(stmt)
 
             if select_fields:
-                return result.all()  # 返回元组列表
-            return result.scalars().all()
+                return result.all()  # type: ignore[no-any-return]  # 返回元组列表
+            return result.scalars().all()  # type: ignore[no-any-return]
     
     # ==================== 分页查询 ====================
     
@@ -366,7 +366,7 @@ class DatabaseRepository(Generic[ModelType]):
             return []
         
         async with self.get_session() as session:
-            instances = [self.model_class(**item) for item in items]
+            instances = [self.model_class(**item) for item in items]  # type: ignore[operator]
             session.add_all(instances)
             await session.flush()
             return instances
@@ -423,7 +423,7 @@ class DatabaseRepository(Generic[ModelType]):
             )
             result = await session.execute(stmt)
             await session.flush()
-            return result.rowcount
+            return result.rowcount  # type: ignore[no-any-return]
     
     # ==================== 存在性检查 ====================
     
@@ -585,8 +585,8 @@ async def execute_query(
 ) -> Any:
     """执行自定义查询函数"""
     @db_operation(operation_name, db_key=db_key)
-    async def wrapper():
-        return await query_func()
+    async def wrapper() -> None:
+        return await query_func()  # type: ignore[no-any-return]
 
     return await wrapper()
 

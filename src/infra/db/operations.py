@@ -43,7 +43,7 @@ def db_operation(
                 # 直接执行异步函数
                 result = await func(*args, **kwargs)
                 success = True
-                return result
+                return result  # type: ignore[no-any-return]
 
             except SQLAlchemyError as e:
                 logger.error(f"数据库操作失败 [{operation_name}]: {e}")
