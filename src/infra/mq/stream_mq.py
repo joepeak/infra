@@ -69,6 +69,8 @@ class RedisStreamMQ:
         self._monitor_task: Optional[asyncio.Task] = None
         self._running = False
         self._default_queue: Optional[str] = None
+        # 动态属性：init_mq 注入——给静态类型一个声明
+        self.config: Dict[str, Any] = {}
         self._stats: Dict[str, Any] = {
             'total_processed': 0,
             'total_failed': 0,
@@ -85,11 +87,22 @@ class RedisStreamMQ:
         port = self.redis_config.get('port', 6379)
         db = self.redis_config.get('db', 0)
         password = self.redis_config.get('password')
-        
+
         if password:
             return f"redis://:{password}@{host}:{port}/{db}"
         return f"redis://{host}:{port}/{db}"
-    
+
+    def _r(self) -> "redis.Redis":
+        """narrow self._redis: Optional[Redis] → Redis；未连时抛 DatabaseError。
+
+        业务方法第一行调 `redis = self._r()`，之后 redis 不再是 Optional——
+        mypy 不再 union-attr 报错；运行时若未 connect 也立刻抛错而不是 NoneType。
+        """
+        from infra.exceptions import DatabaseError
+        if self._redis is None:
+            raise DatabaseError("Redis 客户端未初始化", operation="mq")
+        return self._redis
+
     async def connect(self) -> bool:
         """
         连接 Redis，返回是否连接成功
@@ -196,10 +209,15 @@ class RedisStreamMQ:
                 'created_at': str(time.time())
             }
         
+        # narrow self._redis: Optional[Redis] → Redis（避免每行都重写 None 检查）
+        redis = self._redis
+        if redis is None:
+            logger.error(f"Redis 未连接，消息发送失败: {stream_name}")
+            return None
         try:
-            msg_id = await self._redis.xadd(
+            msg_id = await redis.xadd(
                 config.stream_name,
-                data,
+                data,  # type: ignore[arg-type]
                 maxlen=config.maxlen
             )
             logger.debug(f"消息已发布: {config.stream_name}/{msg_id}")
@@ -272,8 +290,9 @@ class RedisStreamMQ:
     
     async def _ensure_consumer_group(self, config: QueueConfig) -> bool:
         """确保消费者组存在"""
+        redis = self._r()
         try:
-            await self._redis.xgroup_create(
+            await redis.xgroup_create(
                 config.stream_name,
                 config.group_name,
                 id='0',
@@ -313,8 +332,9 @@ class RedisStreamMQ:
                 if self._redis is None:
                     await asyncio.sleep(1)
                     continue
-                
-                pending = await self._redis.xpending_range(
+
+                redis = self._redis  # narrow
+                pending = await redis.xpending_range(
                     config.stream_name,
                     config.group_name,
                     '-',
@@ -334,7 +354,7 @@ class RedisStreamMQ:
                             if delivery_count >= config.max_retries:
                                 await self._move_to_dead_letter_by_id(stream_name, config, msg_id, delivery_count)
                             else:
-                                claimed = await self._redis.xclaim(
+                                claimed = await redis.xclaim(
                                     config.stream_name,
                                     config.group_name,
                                     consumer_name,
@@ -359,13 +379,17 @@ class RedisStreamMQ:
     async def _move_to_dead_letter_by_id(self, stream_name: str, config: QueueConfig, 
                                           msg_id: str, delivery_count: int) -> None:
         """根据消息 ID 移动到死信队列"""
-        msgs = await self._redis.xrange(config.stream_name, msg_id, msg_id)
+        redis = self._r()
+        msgs = await redis.xrange(config.stream_name, msg_id, msg_id)
         if not msgs:
             return
         
-        for _, data in msgs:
+        for entry in msgs:
+            if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+                continue
+            data = entry[1]
             dead_letter_key = f"{stream_name}:dead_letter"
-            await self._redis.xadd(
+            await redis.xadd(
                 dead_letter_key,
                 {
                     'original_id': msg_id,
@@ -375,40 +399,41 @@ class RedisStreamMQ:
                 },
                 maxlen=1000
             )
-            await self._redis.xack(config.stream_name, config.group_name, msg_id)
+            await redis.xack(config.stream_name, config.group_name, msg_id)
             logger.warning(f"消息已移至死信队列: {stream_name}/{msg_id}, delivery_count={delivery_count}")
     
     async def _process_message(self, stream_name: str, config: QueueConfig, 
                                 msg_id: str, data: Dict[str, str]) -> Tuple[bool, Optional[str]]:
         """处理单条消息"""
+        redis = self._r()  # narrow
         task_type = data.get('task_type', 'unknown')
         created_at = data.get('created_at', '0')
-        
+
         # 时效性检查
         if self._is_message_expired(created_at, config.ttl_seconds):
             logger.warning(f"⏰ 消息已过期，丢弃: {stream_name}/{msg_id}, type={task_type}")
-            await self._redis.xack(config.stream_name, config.group_name, msg_id)
+            await redis.xack(config.stream_name, config.group_name, msg_id)
             self._stats['total_expired'] += 1
             return True, None
-        
+
         try:
             # 自动反序列化为 TaskMessage 对象
             message = TaskMessage.from_mq(data)
-            
+
             logger.info(f"📨 处理消息: {stream_name}/{msg_id}, type={task_type}")
-            
+
             handlers = self._handlers.get(stream_name, {})
             handler = handlers.get(task_type)
-            
+
             if handler:
                 await handler(message)
-                await self._redis.xack(config.stream_name, config.group_name, msg_id)
+                await redis.xack(config.stream_name, config.group_name, msg_id)
                 self._stats['total_processed'] += 1
                 logger.debug(f"✅ 消息处理完成: {msg_id}")
                 return True, None
             else:
                 logger.warning(f"⚠️ 未找到处理器: {stream_name}/{task_type}")
-                await self._redis.xack(config.stream_name, config.group_name, msg_id)
+                await redis.xack(config.stream_name, config.group_name, msg_id)
                 return True, None
                 
         except Exception as e:
@@ -438,8 +463,9 @@ class RedisStreamMQ:
                         logger.warning(f"Redis 连接不存在，等待重连...")
                         await asyncio.sleep(1)
                         continue
-                    
-                    result = await self._redis.xreadgroup(
+
+                    redis = self._redis  # narrow
+                    result = await redis.xreadgroup(
                         groupname=config.group_name,
                         consumername=consumer_name,
                         streams={config.stream_name: '>'},
@@ -449,8 +475,12 @@ class RedisStreamMQ:
                     
                     if not result:
                         continue
-                    
-                    for _, messages in result:
+
+                    # result: List[Tuple[Any, List[Tuple[Any, Any]]]]——mypy 看不到解构
+                    for entry in result:
+                        if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+                            continue
+                        messages = entry[1]
                         tasks = [
                             self._process_message(stream_name, config, msg_id, data)
                             for msg_id, data in messages
@@ -488,7 +518,7 @@ class RedisStreamMQ:
                            f"expired={self._stats['total_expired']}, "
                            f"queues={list(stats.keys())}")
     
-    async def start(self, stream_names: list = None) -> None:
+    async def start(self, stream_names: Optional[List[str]] = None) -> None:
         """启动消费者"""
         # 1. 先建立 Redis 连接
         if not await self.connect():
@@ -497,7 +527,8 @@ class RedisStreamMQ:
         
         # 2. 验证连接
         try:
-            await self._redis.ping()
+            redis = self._r()
+            await redis.ping()
             logger.info("Redis 连接验证成功")
         except Exception as e:
             logger.error(f"Redis 连接验证失败: {e}")
@@ -605,14 +636,15 @@ class RedisStreamMQ:
         """获取单个队列统计"""
         if stream_name not in self._queues:
             return {'error': f'queue not found: {stream_name}'}
-        
+
         config = self._queues[stream_name]
-        
-        stream_len = await self._redis.xlen(config.stream_name)
-        dead_len = await self._redis.xlen(f"{config.stream_name}:dead_letter")
-        
+        redis = self._r()  # narrow
+
+        stream_len = await redis.xlen(config.stream_name)
+        dead_len = await redis.xlen(f"{config.stream_name}:dead_letter")
+
         try:
-            pending = await self._redis.xpending(config.stream_name, config.group_name)
+            pending = await redis.xpending(config.stream_name, config.group_name)
             pending_count = pending.get('pending', 0) if pending else 0
         except Exception as e:
             logger.warning(f"查询 pending 失败(按0处理): {e}")
@@ -632,17 +664,21 @@ class RedisStreamMQ:
     
     async def retry_dead_letter(self, stream_name: str, msg_id: str) -> bool:
         """从死信队列重新处理消息"""
+        redis = self._r()  # narrow
         dead_letter_key = f"{stream_name}:dead_letter"
-        data = await self._redis.xrange(dead_letter_key, msg_id, msg_id)
-        
+        data = await redis.xrange(dead_letter_key, msg_id, msg_id)
+
         if not data:
             return False
-        
+
         config = self._queues[stream_name]
-        for _, msg_data in data:
+        for entry in data:
+            if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+                continue
+            msg_data = entry[1]
             original_data = json.loads(msg_data.get('original_data', '{}'))
-            await self._redis.xadd(config.stream_name, original_data)
-            await self._redis.xdel(dead_letter_key, msg_id)
+            await redis.xadd(config.stream_name, original_data)
+            await redis.xdel(dead_letter_key, msg_id)
             logger.info(f"消息已从死信队列恢复: {msg_id}")
             return True
         
@@ -686,10 +722,10 @@ _mq: Optional[RedisStreamMQ] = None
 
 
 async def init_mq(
-    config: Dict[str, Any], 
-    routing: dict,
-    queues: list = None,
-    handlers: dict = None,
+    config: Dict[str, Any],
+    routing: Dict[str, str],
+    queues: Optional[List[Dict[str, Any]]] = None,
+    handlers: Optional[Dict[str, Callable]] = None,
 ) -> RedisStreamMQ:
     """初始化全局消息队列"""
     global _mq

@@ -76,11 +76,12 @@ def _env_config() -> Optional[Dict[str, Any]]:
     }
 
 
-# 集成测试 module-level skip——REDIS_INTEGRATION_HOST 未设就全 skip
+# 集成测试 module-level skip——必须 REDIS_INTEGRATION_HOST + PASSWORD 都设才跑
+# 避免 .env.test 给了空密码时还试图连（连接错、auth 错、假阴性 fail）
 _INTEGRATION_CONFIG = _env_config()
-if _INTEGRATION_CONFIG is None:
+if _INTEGRATION_CONFIG is None or not _INTEGRATION_CONFIG.get("password"):
     pytest.skip(
-        "REDIS_INTEGRATION_HOST 未设——跳过集成测试（手动设环境变量或创建 .env.test 触发）",
+        "REDIS_INTEGRATION_HOST / PASSWORD 未设——跳过集成测试（手动设环境变量或 .env.test 触发）",
         allow_module_level=True,
     )
 
