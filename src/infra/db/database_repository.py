@@ -542,6 +542,8 @@ class DatabaseRepository(Generic[ModelType]):
             return raw_conn.driver_connection
         except (AttributeError, NotImplementedError):
             sync_conn = async_conn.sync_connection
+            if sync_conn is None:
+                raise RuntimeError("无法获取同步连接")
             return sync_conn.connection.driver_connection
     
     async def copy_records_to_table(

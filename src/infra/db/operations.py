@@ -32,7 +32,7 @@ def db_operation(
     """
     def decorator(func: Callable) -> Callable:
         @functools.wraps(func)
-        async def wrapper(*args, **kwargs):
+        async def wrapper(*args, **kwargs) -> None:
             start_time = time.time()
             success = False
 

@@ -107,7 +107,7 @@ class DatabaseConnectionManager:
         db_config['engine'] = merged_engine_config
         db_config['type'] = db_type
 
-        return db_config
+        return db_config  # type: ignore[no-any-return]
 
     def _initialize_engine(self) -> None:
         """初始化异步数据库引擎"""
@@ -135,7 +135,7 @@ class DatabaseConnectionManager:
             val = os.getenv(var)
             if val is None:
                 logger.warning(f"环境变量 {var} 未定义（.env 或系统环境），保留占位符")
-                return m.group(0)
+                return m.group(0)  # type: ignore[no-any-return]
             return val
 
         return pattern.sub(_sub, value)
@@ -380,7 +380,7 @@ class DatabaseConnectionManager:
 
     async def health_check(self) -> Dict[str, Any]:
         """数据库健康检查"""
-        health_status = {
+        health_status: Dict[str, Any] = {
             'status': 'healthy',
             'db_config_key': self.db_config_key,
             'errors': []
@@ -395,7 +395,7 @@ class DatabaseConnectionManager:
             async with self.engine.connect() as conn:
                 result = await conn.execute(text("SELECT 1 as health_check"))
                 row = result.fetchone()
-                if row[0] != 1:
+                if row is None or row[0] != 1:  # type: ignore[index]
                     health_status['status'] = 'unhealthy'
                     health_status['errors'].append('健康检查查询失败')
 
@@ -423,11 +423,12 @@ class DatabaseConnectionManager:
             return {'error': '数据库引擎未初始化'}
 
         pool = self.engine.pool
+        # mypy 推断 Pool 是 sync 版（AsyncAdaptedQueuePool）——调方法用 type ignore
         return {
-            'pool_size': pool.size(),
-            'checked_in': pool.checkedin(),
-            'checked_out': pool.checkedout(),
-            'overflow': pool.overflow(),
+            'pool_size': pool.size(),  # type: ignore[attr-defined]
+            'checked_in': pool.checkedin(),  # type: ignore[attr-defined]
+            'checked_out': pool.checkedout(),  # type: ignore[attr-defined]
+            'overflow': pool.overflow(),  # type: ignore[attr-defined]
         }
 
     def get_engine(self) -> Optional[AsyncEngine]:
