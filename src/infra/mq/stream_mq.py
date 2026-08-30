@@ -10,7 +10,7 @@ import json
 import uuid
 import time
 from datetime import datetime
-from typing import Dict, Any, Optional, Callable, Awaitable, List, Tuple
+from typing import Dict, Any, Optional, Callable, Awaitable, List, Tuple, Union
 from dataclasses import dataclass
 
 import redis.asyncio as redis
@@ -144,7 +144,7 @@ class RedisStreamMQ:
         logger.error(f"Redis 连接失败，已达最大重试次数: {self._connection_error}")
         return False
     
-    def create_queue(self, stream_name: str, group_name: Optional[str] = None, **kwargs) -> 'RedisStreamMQ':
+    def create_queue(self, stream_name: str, group_name: Optional[str] = None, **kwargs: Any) -> 'RedisStreamMQ':
         """创建/注册一个队列"""
         if group_name is None:
             group_name = f"{stream_name}_group"
@@ -168,12 +168,12 @@ class RedisStreamMQ:
         logger.info(f"队列已注册: {stream_name} (concurrency={config.concurrency}, ttl={config.ttl_seconds}s)")
         return self
     
-    def set_routing(self, routing: Dict[str, str]):
+    def set_routing(self, routing: Dict[str, str]) -> None:
         """设置消息路由规则"""
         self._routing.update(routing)
         logger.info(f"路由规则已更新: {list(self._routing.keys())}")
     
-    def register(self, stream_name: str, msg_type: str, handler: Callable[[Dict], Awaitable[Any]]):
+    def register(self, stream_name: str, msg_type: str, handler: Callable[[Dict[str, str]], Awaitable[Any]]) -> None:
         """注册消息处理器"""
         if stream_name not in self._handlers:
             raise ValueError(f"队列不存在: {stream_name}，请先调用 create_queue")
@@ -181,7 +181,7 @@ class RedisStreamMQ:
         self._handlers[stream_name][msg_type] = handler
         logger.info(f"注册处理器: {stream_name}/{msg_type}")
     
-    async def publish(self, stream_name: str, message) -> Optional[str]:
+    async def publish(self, stream_name: str, message: Union[TaskMessage, Dict[str, Any]]) -> Optional[str]:
         """
         发布消息到指定队列
         支持 TaskMessage 对象或普通字典
@@ -228,30 +228,31 @@ class RedisStreamMQ:
             logger.error(f"发布消息失败: {e}")
             return None
     
-    async def publish_by_routing(self, message) -> Optional[str]:
+    async def publish_by_routing(self, message: Union[TaskMessage, Dict[str, Any]]) -> Optional[str]:
         """根据路由规则自动发布消息"""
-        # 获取 task_type
+        # 获取 task_type——narrow Any | None → str
+        # 真业务 bug：缺 task_type 时下面会抛 ValueError——已处理
         if isinstance(message, TaskMessage):
             task_type = message.task_type
         else:
-            task_type = message.get('task_type')
-        
+            task_type = message.get('task_type', "")
+
         if not task_type:
             raise ValueError("消息缺少 task_type 字段")
-        
+
         stream_name = self._routing.get(task_type, self._default_queue)
         if not stream_name:
             raise ValueError(f"未找到 {task_type} 的路由规则，且未设置默认队列")
         
         return await self.publish(stream_name, message)
     
-    async def publish_simple(self, message) -> Optional[str]:
+    async def publish_simple(self, message: Union[TaskMessage, Dict[str, Any]]) -> Optional[str]:
         """发布消息到默认队列"""
         if not self._default_queue:
             raise ValueError("未设置默认队列")
         return await self.publish(self._default_queue, message)
     
-    def set_default_queue(self, stream_name: str):
+    def set_default_queue(self, stream_name: str) -> None:
         """设置默认队列"""
         if stream_name not in self._queues:
             raise ValueError(f"队列不存在: {stream_name}")

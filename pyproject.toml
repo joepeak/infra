@@ -110,3 +110,11 @@ ignore_errors = true
 [[tool.mypy.overrides]]
 module = "infra.messages"
 ignore_errors = false
+
+# 收窄 mq / schedule 的 strict 检查——这次 mq 0 错，schedule 36 错（仅 no-untyped-def 风格）
+# 先收窄 mq（已 0 错）——schedule 继续修真错后收窄
+[[tool.mypy.overrides]]
+module = "infra.mq"
+ignore_errors = false
+
+# 收窄 infra.schedule strict——修真业务 bug（step 38 续）
