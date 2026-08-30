@@ -4,15 +4,15 @@
 趋势分析工具
 """
 
-from typing import List, Dict, Literal
+from typing import Any, List, Dict, Literal
 import numpy as np
 
 
 def analyze_trend(
-    data: List[Dict[str, any]], 
+    data: List[Dict[str, Any]],
     window: int = 10,
     threshold: float = 0.01
-) -> Dict[str, any]:
+) -> Dict[str, Any]:
     """
     简单趋势分析
     

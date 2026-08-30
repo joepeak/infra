@@ -182,7 +182,7 @@ async def retry_async(
     **kwargs,
 ) -> T:
     """异步函数重试（函数式调用）——失败 raise 原始异常。"""
-    return await RetryExecutor(config).execute_async(func, *args, **kwargs)
+    return await RetryExecutor(config).execute_async(func, *args, **kwargs)  # type: ignore[no-any-return]
 
 
 # ==================== 装饰器 ====================

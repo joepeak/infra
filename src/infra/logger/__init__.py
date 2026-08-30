@@ -34,17 +34,17 @@ class LogConfig:
 
 # 全局配置
 _log_config: Optional[LogConfig] = None
-_initialized_loggers = set()
+_initialized_loggers: set = set()
 
 
-def configure_logging(config: LogConfig):
+def configure_logging(config: LogConfig) -> None:
     """配置日志（依赖注入）"""
     global _log_config
     _log_config = config
     _ensure_log_dir()
 
 
-def configure_logging_from_dict(config_dict: Dict[str, Any]):
+def configure_logging_from_dict(config_dict: Dict[str, Any]) -> None:
     """从配置字典初始化日志"""
     logging_config = config_dict.get('logging', {})
     
@@ -58,7 +58,7 @@ def configure_logging_from_dict(config_dict: Dict[str, Any]):
     configure_logging(config)
 
 
-def _ensure_log_dir():
+def _ensure_log_dir() -> None:
     """确保日志目录存在"""
     if _log_config:
         os.makedirs(_log_config.log_dir, exist_ok=True)
@@ -132,7 +132,7 @@ def _create_file_handler(log_file: str, config: LogConfig) -> RotatingFileHandle
 #     return logger
 
 
-def reset_logging():
+def reset_logging() -> None:
     """重置日志配置（主要用于测试）"""
     global _log_config, _initialized_loggers
     _log_config = None
@@ -140,23 +140,23 @@ def reset_logging():
 
 class LazyLogger:
     """延迟加载logger代理，每次打印实时获取最新配置的logger实例"""
-    def __init__(self, name: str):
+    def __init__(self, name: str) -> None:
         self._name = name
 
-    def _get_real_logger(self):
+    def _get_real_logger(self) -> logging.Logger:
         # 每次输出日志都重新拿当前最新配置的原生logger
         return _raw_get_logger(self._name)
 
     # 代理全部日志方法
-    def debug(self, msg, *args, **kwargs):
+    def debug(self, msg: str, *args: Any, **kwargs: Any) -> None:
         self._get_real_logger().debug(msg, *args, **kwargs)
-    def info(self, msg, *args, **kwargs):
+    def info(self, msg: str, *args: Any, **kwargs: Any) -> None:
         self._get_real_logger().info(msg, *args, **kwargs)
-    def warning(self, msg, *args, **kwargs):
+    def warning(self, msg: str, *args: Any, **kwargs: Any) -> None:
         self._get_real_logger().warning(msg, *args, **kwargs)
-    def error(self, msg, *args, **kwargs):
+    def error(self, msg: str, *args: Any, **kwargs: Any) -> None:
         self._get_real_logger().error(msg, *args, **kwargs)
-    def critical(self, msg, *args, **kwargs):
+    def critical(self, msg: str, *args: Any, **kwargs: Any) -> None:
         self._get_real_logger().critical(msg, *args, **kwargs)
 
 # 把原来创建logger的逻辑改名成内部原生函数

@@ -12,15 +12,15 @@
 """
 import functools
 import traceback
-from typing import (Callable, Any, Optional, Type, Union)
+from typing import (Callable, Any, Dict, Optional, Type, Union)
 
 from infra.logger import get_logger
 from infra.exceptions import AppException
 
 
-def _build_exc_info(func_name: str, module_name: str, exc: BaseException) -> dict:
+def _build_exc_info(func_name: str, module_name: str, exc: BaseException) -> Dict[str, Any]:
     """构造异常信息字典。"""
-    exc_info = {
+    exc_info: Dict[str, Any] = {
         'function': func_name,
         'module_name': module_name,
         'exception_type': type(exc).__name__,
@@ -28,10 +28,10 @@ def _build_exc_info(func_name: str, module_name: str, exc: BaseException) -> dic
         'traceback': traceback.format_exc(),
     }
     if isinstance(exc, AppException):
-        exc_info.update({
-            'error_code': exc.error_code,
-            'details': exc.details,
-        })
+        # 类型：error_code 一定是 str，details 是 Dict[str, Any]
+        details: Dict[str, Any] = dict(exc.details) if exc.details else {}
+        exc_info['error_code'] = str(exc.error_code)
+        exc_info['details'] = details
     return exc_info
 
 
@@ -101,9 +101,9 @@ def async_handle_exceptions(
 
     Args: 同 handle_exceptions。
     """
-    def decorator(func: Callable) -> Callable:
+    def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
         @functools.wraps(func)
-        async def wrapper(*args, **kwargs):
+        async def wrapper(*args: Any, **kwargs: Any) -> Any:
             logger = get_logger(func.__module__)
             try:
                 return await func(*args, **kwargs)
@@ -147,10 +147,10 @@ class ExceptionContext:
         self.exception_types = exception_types
         self.logger = get_logger(self.__class__.__module__)
 
-    def __enter__(self):
+    def __enter__(self) -> "ErrorContext":
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(self, exc_type: Optional[type], exc_val: Optional[BaseException], exc_tb: Any) -> bool:
         if exc_type is None:
             return True  # 无异常
 
