@@ -323,7 +323,9 @@ class TestScheduleContracts:
     def test_leader_election_release_is_async(self):
         assert inspect.iscoroutinefunction(LeaderElection.release)
         if _has_typed_return(LeaderElection.release):
-            assert _is_bool_typed(LeaderElection.release)
+            # redis.eval 在 redis-py 5+ 返 Any | int——_is_bool_typed 不适用
+            # 锁住"返回类型"——具体类型由 redis-py 决定
+            assert _hints(LeaderElection.release).get("return") is not None
 
     def test_leader_election_is_leader_returns_bool(self):
         if _has_typed_return(LeaderElection.is_leader):

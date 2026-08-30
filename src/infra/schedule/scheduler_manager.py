@@ -4,7 +4,7 @@ from __future__ import annotations
 import traceback
 from datetime import datetime
 import threading
-from typing import Callable, Dict, Any, Optional
+from typing import Callable, Dict, Any, List, Optional
 from dataclasses import dataclass
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -41,14 +41,17 @@ class SchedulerManager:
     _lock = threading.Lock()
     _initialized = False
 
-    def __new__(cls):
+    def __new__(cls) -> "SchedulerManager":
         if not cls._instance:
             with cls._lock:
                 if not cls._instance:
                     cls._instance = super().__new__(cls)
+        # 显式 fallback（避免 mypy 推断 None）
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
         return cls._instance
 
-    def __init__(self):
+    def __init__(self) -> None:
         if not self._initialized:
             self.scheduler: Optional[AsyncIOScheduler] = None
             self._job_configs: Dict[str, JobConfig] = {}
@@ -56,7 +59,7 @@ class SchedulerManager:
             self._is_leader: bool = False
             self._initialized = True
 
-    def init_scheduler(self, is_leader: bool):
+    def init_scheduler(self, is_leader: bool) -> None:
         """初始化调度器（由 lifespan 调用，传入是否 leader）"""
         self._is_leader = is_leader
         logger.info(f"init_scheduler: is_leader={is_leader}")
@@ -69,7 +72,7 @@ class SchedulerManager:
         )
         logger.info("Scheduler 已初始化（Leader 模式）")
 
-    def start(self):
+    def start(self) -> None:
         """启动调度器（仅 leader 执行）"""
         if not self._is_leader:
             logger.debug("非 Leader 实例，跳过 Scheduler 启动")
@@ -80,7 +83,7 @@ class SchedulerManager:
         else:
             logger.warning("Scheduler 未初始化，无法启动")
 
-    def shutdown(self):
+    def shutdown(self) -> None:
         """关闭调度器（可重复调用，安全）"""
         if self.scheduler is None:
             logger.debug("Scheduler 未初始化，跳过关闭")
@@ -130,7 +133,7 @@ class SchedulerManager:
             return None
 
     @staticmethod
-    def _wrap_execution_result(result) -> dict:
+    def _wrap_execution_result(result: Any) -> Dict[str, Any]:
         """统一包装任务执行返回值（20260822 失败语义修复）。
 
         - False（任务明确报告失败）→ status="error"，不再误报 success
@@ -148,8 +151,8 @@ class SchedulerManager:
         else:
             return {"status": "success", "result": result}
 
-    def _execute_immediately(self, config: JobConfig):
-        async def wrapper():
+    def _execute_immediately(self, config: JobConfig) -> None:
+        async def wrapper() -> Any:
             try:
                 result = await config.func(*config.args, **(config.kwargs or {}))
                 return self._wrap_execution_result(result)
@@ -160,7 +163,7 @@ class SchedulerManager:
         logger.debug(f"🚀 提交立即执行任务: {config.job_id}")
         submit_task(wrapper())
 
-    def _add_scheduled_job(self, config: JobConfig):
+    def _add_scheduled_job(self, config: JobConfig) -> None:
         from apscheduler.triggers.cron import CronTrigger
         from apscheduler.triggers.interval import IntervalTrigger
         from apscheduler.triggers.date import DateTrigger
@@ -177,10 +180,10 @@ class SchedulerManager:
         else:
             raise ValueError(f"不支持的触发器类型: {config.trigger}")
 
-        async def wrapper(): 
+        async def wrapper() -> Any:
             return await config.func(*config.args, **(config.kwargs or {}))
 
-        def scheduled_job():
+        def scheduled_job() -> None:
             logger.debug(f"⚠️ scheduled_job 被触发: {config.job_id}, 时间: {datetime.now()}")
             submit_task(wrapper())
 
@@ -203,7 +206,7 @@ class SchedulerManager:
         logger.debug(f"定时任务 {config.job_id} 添加成功")
         logger.debug(f"📌 _add_scheduled_job 完成: {config.job_id}")
 
-    def remove_job(self, job_id: str):
+    def remove_job(self, job_id: str) -> None:
         if self.scheduler:
             try:
                 self.scheduler.remove_job(job_id)

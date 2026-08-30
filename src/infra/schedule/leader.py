@@ -6,7 +6,7 @@ Leader Election 模块
 
 import asyncio
 import uuid
-from typing import Optional
+from typing import AsyncIterator, Optional
 from contextlib import asynccontextmanager
 
 import redis.asyncio as redis
@@ -19,7 +19,7 @@ logger = get_logger(__name__)
 class LeaderElection:
     """基于 Redis 的 Leader Election"""
 
-    def __init__(self, redis_config: dict):
+    def __init__(self, redis_config: dict) -> None:
         self.redis_config = redis_config
         self._redis: Optional[redis.Redis] = None
         self._lock_key = "scheduler:leader:lock"
@@ -58,7 +58,7 @@ class LeaderElection:
             logger.debug("未能成为 Leader，等待其他实例执行")
         return acquired
 
-    async def _heartbeat_loop(self):
+    async def _heartbeat_loop(self) -> None:
         """心跳循环：定期续期锁"""
         while self._is_leader:
             await asyncio.sleep(self._heartbeat_interval)
@@ -84,7 +84,7 @@ class LeaderElection:
             except Exception as e:
                 logger.error(f"心跳续期异常: {e}")
 
-    async def release(self):
+    async def release(self) -> None:
         """释放 leader 锁"""
         if self._heartbeat_task:
             self._heartbeat_task.cancel()
@@ -111,7 +111,7 @@ class LeaderElection:
         return self._is_leader
 
     @asynccontextmanager
-    async def leader_context(self):
+    async def leader_context(self) -> "AsyncIterator[bool]":
         acquired = await self.try_acquire()
         try:
             yield acquired

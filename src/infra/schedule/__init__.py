@@ -21,7 +21,7 @@ scheduler_manager = None
 unified_scheduler = None
 
 
-def get_scheduler_manager():
+def get_scheduler_manager() -> "SchedulerManager":
     """获取全局调度器管理器实例"""
     global scheduler_manager
     if scheduler_manager is None:
@@ -29,7 +29,7 @@ def get_scheduler_manager():
     return scheduler_manager
 
 
-def get_unified_scheduler():
+def get_unified_scheduler() -> "UnifiedScheduler":
     """获取全局统一调度器实例"""
     global unified_scheduler
     if unified_scheduler is None:

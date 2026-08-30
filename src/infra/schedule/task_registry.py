@@ -14,21 +14,21 @@ logger = get_logger(__name__)
 class TaskRegistry:
     """任务注册中心"""
     
-    def __init__(self):
+    def __init__(self) -> None:
         self._task_factories: Dict[str, Callable] = {}
         self._task_classes: Dict[str, Type] = {}
     
-    def register_factory(self, name: str, factory: Callable):
+    def register_factory(self, name: str, factory: Callable) -> None:
         """注册任务工厂函数"""
         self._task_factories[name] = factory
         logger.info(f"注册任务工厂: {name}")
     
-    def register_class(self, name: str, task_class: Type):
+    def register_class(self, name: str, task_class: Type) -> None:
         """注册任务类"""
         self._task_classes[name] = task_class
         logger.info(f"注册任务类: {name}")
     
-    def create_task(self, task_type: str, config: Dict[str, Any]):
+    def create_task(self, task_type: str, config: Dict[str, Any]) -> Any:
         """创建任务实例"""
         if task_type in self._task_factories:
             return self._task_factories[task_type](config)

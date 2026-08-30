@@ -415,11 +415,12 @@ class TestUnifiedScheduler:
         s.scheduler.get_jobs.return_value = []
         s.start()  # 不抛
 
-    def test_stop_calls_scheduler_stop(self):
+    def test_stop_calls_scheduler_shutdown(self):
+        """stop() 内部调 scheduler.shutdown（stop() 是 noop）。"""
         s = UnifiedScheduler()
         s.scheduler = MagicMock()
         s.stop()
-        s.scheduler.stop.assert_called_once()
+        s.scheduler.shutdown.assert_called_once()
 
     def test_shutdown_calls_scheduler_shutdown(self):
         s = UnifiedScheduler()

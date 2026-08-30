@@ -13,7 +13,7 @@ _task_queue: Optional[asyncio.Queue] = None
 _main_loop: Optional[asyncio.AbstractEventLoop] = None
 
 
-def init_task_queue(loop: asyncio.AbstractEventLoop, queue: asyncio.Queue):
+def init_task_queue(loop: asyncio.AbstractEventLoop, queue: asyncio.Queue) -> None:
     """初始化任务队列（必须在 worker 启动前调用）"""
     global _task_queue, _main_loop
     _task_queue = queue
@@ -33,13 +33,13 @@ def get_main_loop() -> asyncio.AbstractEventLoop:
     return _main_loop
 
 
-def submit_task(coro) -> "concurrent.futures.Future[Any]":
+def submit_task(coro: Any) -> "concurrent.futures.Future[Any]":
     """线程安全地提交协程到主事件循环的任务队列"""
     logger.debug(f"📤 submit_task 被调用, coro={coro}")
     queue = get_task_queue()
     loop = get_main_loop()
 
-    async def _enqueue():
+    async def _enqueue() -> None:
         await queue.put(coro)
 
     future = asyncio.run_coroutine_threadsafe(_enqueue(), loop)
