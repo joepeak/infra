@@ -325,9 +325,11 @@ class RedisStreamMQ:
                 if pending:
                     for item in pending:
                         msg_id = item['message_id']
-                        idle_time = item.get('idle', 0)
-                        delivery_count = item.get('times_delivered', 0)
-                        
+                        # redis 返回 bytes / str / int——强制 int 转换
+                        # 避免 bytes > int 在 Python 3 抛 TypeError
+                        idle_time = int(item.get('idle', 0))
+                        delivery_count = int(item.get('times_delivered', 0))
+
                         if idle_time > config.claim_min_idle_ms:
                             if delivery_count >= config.max_retries:
                                 await self._move_to_dead_letter_by_id(stream_name, config, msg_id, delivery_count)
