@@ -235,8 +235,8 @@ class DatabaseMonitor:
                 }
             
             current_metrics = self.get_current_metrics()
-            
-            status = {
+
+            status: Dict[str, Any] = {
                 'overall_status': 'healthy',
                 'connection_stats': stats,
                 'monitoring_metrics': {
@@ -246,7 +246,7 @@ class DatabaseMonitor:
                 },
                 'alerts': []
             }
-            
+
             if stats.get('pool_size', 0) == 0:
                 status['overall_status'] = 'unhealthy'
                 status['alerts'].append("连接池大小为0")
