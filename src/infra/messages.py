@@ -3,13 +3,18 @@
 # -*- coding: utf-8 -*-
 """
 消息定义模块 - 使用 dataclass 实现类型安全
+
+beartype 用 `beartype.typing.Dict` 避免 PEP 585 弃用警告（dict[str, Any] 在 Python 3.9+ 合法，
+但 typing.Dict 已 deprecated）。
 """
 
 import json
 import uuid
+from beartype import beartype
+from beartype.typing import Dict
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 
 
 @dataclass
@@ -100,6 +105,7 @@ class TaskMessage:
         return f"TaskMessage(task_id={self.task_id}, task_type={self.task_type})"
 
 
+@beartype
 def create_message(
     task_type: str,
     payload: Dict[str, Any],

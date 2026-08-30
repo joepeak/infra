@@ -31,6 +31,7 @@ dev = [
     "aiosqlite>=0.19",  # conftest 用 sqlite 临时文件做集成测试
     "tzdata>=2024.1",   # tests/test_time_util.py 的 America/New_York 等非 UTC tz 测试
     "mypy>=1.10",       # 静态类型检查——AI 写错类型时编译期拦截
+    "beartype>=0.18",   # 运行时类型检查——beartype + mypy + 契约测试三道防线
 ]
 
 [build-system]
