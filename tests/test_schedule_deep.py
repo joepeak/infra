@@ -479,14 +479,14 @@ class TestLeaderElection:
         assert call_kwargs.get("ex") == 30
 
     async def test_try_acquire_failure(self):
-        """SET NX 失败（锁已被占）——try_acquire 返 None（redis.set 的 by-design 返回值）。"""
+        """SET NX 失败（锁已被占）——try_acquire 返 False（源码 bool() 收窄 by-design）。"""
         leader = LeaderElection(redis_config={})
         fake_redis = AsyncMock()
         fake_redis.set = AsyncMock(return_value=None)  # NX 失败
         leader._redis = fake_redis
         result = await leader.try_acquire()
-        # redis.set 在 NX 失败时返 None（不是 False）——源码直接 return 这个值
-        assert result is None
+        # redis-py 5+ 在 NX 失败时返 None——源码 bool() 收窄为 False
+        assert result is False
         assert leader.is_leader() is False
 
     async def test_try_acquire_redis_error_propagates(self):

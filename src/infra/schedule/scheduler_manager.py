@@ -20,7 +20,7 @@ logger = get_logger(__name__)
 class JobConfig:
     """任务配置"""
     func: Callable
-    trigger: Optional[str] = None
+    trigger: Optional[str] = None  # add_job 时 narrow truthy → str；_add_scheduled_job 内部 .lower() 安全
     trigger_args: Optional[Dict[str, Any]] = None
     job_id: Optional[str] = None
     name: Optional[str] = None
@@ -29,7 +29,7 @@ class JobConfig:
     coalesce: bool = True
     replace_existing: bool = False
     args: tuple = ()
-    kwargs: dict = None
+    kwargs: Optional[Dict[str, Any]] = None
     run_immediately: bool = False
     enabled: bool = True
 
@@ -52,7 +52,8 @@ class SchedulerManager:
         if not self._initialized:
             self.scheduler: Optional[AsyncIOScheduler] = None
             self._job_configs: Dict[str, JobConfig] = {}
-            self._is_leader = False
+            # 类属性显式标 bool（否则 mypy 推断 Any → is_leader 返 Any）
+            self._is_leader: bool = False
             self._initialized = True
 
     def init_scheduler(self, is_leader: bool):
@@ -165,11 +166,13 @@ class SchedulerManager:
         from apscheduler.triggers.date import DateTrigger
         logger.debug(f"📌 _add_scheduled_job 开始: {config.job_id}")
         trigger_args = config.trigger_args or {}
-        if config.trigger.lower() == 'cron':
+        # narrow trigger Optional[str] → str（调用方 add_job 已 truthy 校验）
+        trigger_type = (config.trigger or "").lower()
+        if trigger_type == 'cron':
             trigger = CronTrigger(**trigger_args)
-        elif config.trigger.lower() == 'interval':
+        elif trigger_type == 'interval':
             trigger = IntervalTrigger(**trigger_args)
-        elif config.trigger.lower() == 'date':
+        elif trigger_type == 'date':
             trigger = DateTrigger(**trigger_args)
         else:
             raise ValueError(f"不支持的触发器类型: {config.trigger}")
@@ -183,7 +186,11 @@ class SchedulerManager:
 
         logger.debug(f"添加定时任务 {config.job_id}, max_instances={config.max_instances}")
 
-        self.scheduler.add_job(
+        scheduler = self.scheduler
+        if scheduler is None:
+            logger.warning(f"scheduler 未初始化，无法添加 {config.job_id}")
+            return
+        scheduler.add_job(
             func=scheduled_job,
             trigger=trigger,
             id=config.job_id,
@@ -209,7 +216,7 @@ class SchedulerManager:
         if not self.scheduler:
             return []
         jobs = self.scheduler.get_jobs()
-        return [
+        result: List[Dict[str, Any]] = [
             {
                 'id': job.id,
                 'name': job.name,
@@ -218,6 +225,7 @@ class SchedulerManager:
             }
             for job in jobs
         ]
+        return result
 
     def is_leader(self) -> bool:
         return self._is_leader

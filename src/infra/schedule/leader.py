@@ -42,12 +42,14 @@ class LeaderElection:
     async def try_acquire(self) -> bool:
         """尝试获取 leader 锁"""
         redis_client = await self._get_redis()
-        acquired = await redis_client.set(
+        # redis.set 在 redis-py 5+ 返 bool | str | bytes | None
+        # 我们只关心 truthy——是否成功拿到锁
+        acquired = bool(await redis_client.set(
             self._lock_key,
             self._lock_value,
             nx=True,
             ex=self._lock_ttl
-        )
+        ))
         if acquired:
             self._is_leader = True
             logger.info("✅ 成为 Leader，将启动 Scheduler")

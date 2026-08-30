@@ -1,7 +1,8 @@
 # infra/schedule/helpers.py
 
 import asyncio
-from typing import Optional
+import concurrent.futures
+from typing import Any, Optional
 
 from infra.logger import get_logger
 
@@ -32,7 +33,7 @@ def get_main_loop() -> asyncio.AbstractEventLoop:
     return _main_loop
 
 
-def submit_task(coro) -> asyncio.Future:
+def submit_task(coro) -> "concurrent.futures.Future[Any]":
     """线程安全地提交协程到主事件循环的任务队列"""
     logger.debug(f"📤 submit_task 被调用, coro={coro}")
     queue = get_task_queue()
