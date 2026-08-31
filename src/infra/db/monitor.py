@@ -271,31 +271,31 @@ db_monitor = DatabaseMonitor()
 
 
 # 便捷函数
-def start_db_monitoring():
+def start_db_monitoring() -> None:
     """启动数据库监控"""
     db_monitor.start_monitoring()
 
 
-def stop_db_monitoring():
+def stop_db_monitoring() -> None:
     """停止数据库监控"""
     db_monitor.stop_monitoring()
 
 
-def get_db_metrics():
+def get_db_metrics() -> Any:
     """获取数据库指标"""
     return db_monitor.get_current_metrics()
 
 
-def get_db_health_status():
+def get_db_health_status() -> Any:
     """获取数据库健康状态"""
     return db_monitor.get_health_status()
 
 
-def record_db_query(response_time: float, success: bool = True):
+def record_db_query(response_time: float, success: bool = True) -> None:
     """记录数据库查询"""
     db_monitor.record_query(response_time, success)
 
 
-def add_db_alert_callback(callback):
+def add_db_alert_callback(callback: Callable) -> None:
     """添加数据库告警回调"""
     db_monitor.add_alert_callback(callback)

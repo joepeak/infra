@@ -3,7 +3,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.dialects.postgresql import TIMESTAMP, JSONB
 from sqlalchemy.types import TypeDecorator
 from datetime import datetime, timezone, timedelta, date
-from typing import Optional
+from typing import Any, Optional
 from zoneinfo import ZoneInfo
 from infra.data_quality import DataQuality
 
@@ -12,13 +12,13 @@ class JSONBCompatible(TypeDecorator):
     impl = JSON
     cache_ok = True
     
-    def load_dialect_impl(self, dialect):
+    def load_dialect_impl(self, dialect: Any) -> Any:
         if dialect.name == 'postgresql':
             return dialect.type_descriptor(JSONB())
         return dialect.type_descriptor(JSON())
-    
-    def _coerce_compared_value(self, op, value):
-        return self.impl._coerce_compared_value(op, value)
+
+    def _coerce_compared_value(self, op: Any, value: Any) -> Any:
+        return self.impl._coerce_compared_value(op, value)  # type: ignore[attr-defined]
 
 # 1. ORM 根基类
 class Base(DeclarativeBase):

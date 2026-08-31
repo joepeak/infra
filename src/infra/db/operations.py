@@ -6,7 +6,7 @@
 
 import time
 import functools
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 from sqlalchemy.exc import SQLAlchemyError
 
 from infra.db.monitor import record_db_query
@@ -20,7 +20,7 @@ def db_operation(
     operation_name: str = "database_operation",
     log_performance: bool = True,
     db_key: Optional[str] = None,
-):
+) -> Callable:
     """
     异步数据库操作装饰器
 
@@ -32,7 +32,7 @@ def db_operation(
     """
     def decorator(func: Callable) -> Callable:
         @functools.wraps(func)
-        async def wrapper(*args, **kwargs) -> None:
+        async def wrapper(*args: Any, **kwargs: Any) -> None:
             start_time = time.time()
             success = False
 

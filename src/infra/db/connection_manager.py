@@ -395,7 +395,7 @@ class DatabaseConnectionManager:
             async with self.engine.connect() as conn:
                 result = await conn.execute(text("SELECT 1 as health_check"))
                 row = result.fetchone()
-                if row is None or row[0] != 1:  # type: ignore[index]
+                if row is None or row[0] != 1:
                     health_status['status'] = 'unhealthy'
                     health_status['errors'].append('健康检查查询失败')
 

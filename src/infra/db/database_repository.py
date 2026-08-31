@@ -1,5 +1,5 @@
 
-from typing import Any, Callable, Dict, Generic, List, Optional, TypeVar, Union
+from typing import Any, AsyncGenerator, Callable, Dict, Generic, List, Optional, TypeVar, Union
 from dataclasses import dataclass
 from contextlib import asynccontextmanager
 
@@ -40,7 +40,7 @@ class DatabaseRepository(Generic[ModelType]):
         self.logger = get_logger(self.__class__.__name__)
 
     @asynccontextmanager
-    async def get_session(self) -> None:
+    async def get_session(self) -> AsyncGenerator[Any, None]:
         """获取异步数据库会话。
 
         优先复用 ambient session（session_scope 内的 Unit of Work 事务），
@@ -56,7 +56,7 @@ class DatabaseRepository(Generic[ModelType]):
             yield session
 
     @asynccontextmanager
-    async def get_direct_connection(self) -> None:
+    async def get_direct_connection(self) -> AsyncGenerator[Any, None]:
         """
         获取一个直接的数据库连接 (AsyncConnection)，用于执行原生SQL
         """
@@ -73,11 +73,11 @@ class DatabaseRepository(Generic[ModelType]):
     # ==================== 基础 CRUD 操作 ====================
     
     @db_operation("create_record")
-    async def create(self, model_instance=None, **kwargs) -> Any:
+    async def create(self, model_instance: Optional[Any] = None, **kwargs: Any) -> Any:
         """创建记录，支持对象或字典参数"""
         async with self.get_session() as session:
             if model_instance is not None:
-                if isinstance(model_instance, self.model_class):
+                if isinstance(model_instance, self.model_class):  # type: ignore[arg-type]
                     instance = model_instance
                 else:
                     kwargs = {**model_instance, **kwargs}
@@ -101,15 +101,17 @@ class DatabaseRepository(Generic[ModelType]):
                 pass
         async with self.get_session() as session:
             result = await session.execute(
-                select(self.model_class).where(self.model_class.id == record_id)
+                select(self.model_class).where(  # type: ignore[call-overload]
+                    self.model_class.id == record_id  # type: ignore[attr-defined]
+                )
             )
             return result.scalar_one_or_none()
     
     @db_operation("get_all")
-    async def get_all(self, limit: Optional[int] = None, **filters) -> List[Any]:
+    async def get_all(self, limit: Optional[int] = None, **filters: Any) -> List[Any]:
         """获取所有记录"""
         async with self.get_session() as session:
-            stmt = select(self.model_class)
+            stmt = select(self.model_class)  # type: ignore[call-overload]
             
             for key, value in filters.items():
                 if hasattr(self.model_class, key):
@@ -122,7 +124,7 @@ class DatabaseRepository(Generic[ModelType]):
             return result.scalars().all()  # type: ignore[no-any-return]
     
     @db_operation("update_record")
-    async def update(self, record_id: Any, **kwargs) -> Optional[Any]:
+    async def update(self, record_id: Any, **kwargs: Any) -> Optional[Any]:
         """更新记录"""
         async with self.get_session() as session:
             instance = await session.get(self.model_class, record_id)
@@ -150,10 +152,10 @@ class DatabaseRepository(Generic[ModelType]):
             return False
     
     @db_operation("count_records")
-    async def count(self, **filters) -> int:
+    async def count(self, **filters: Any) -> int:
         """统计记录数"""
         async with self.get_session() as session:
-            stmt = select(func.count()).select_from(self.model_class)
+            stmt = select(func.count()).select_from(self.model_class)  # type: ignore[arg-type]
             
             for key, value in filters.items():
                 if hasattr(self.model_class, key):
@@ -175,7 +177,7 @@ class DatabaseRepository(Generic[ModelType]):
         order_by: Optional[Union[str, List[str], Dict[str, str]]] = None,
         select_fields: Optional[List[str]] = None,
         distinct: bool = False,
-        **filters
+        **filters: Any
     ) -> List[Any]:
         """
         统一查询方法（合并原 query + find_by）
@@ -204,7 +206,7 @@ class DatabaseRepository(Generic[ModelType]):
                     cols = [self.model_class]
                 stmt = select(*cols)
             else:
-                stmt = select(self.model_class)
+                stmt = select(self.model_class)  # type: ignore[call-overload]
 
             filter_exprs = []
 
@@ -285,7 +287,7 @@ class DatabaseRepository(Generic[ModelType]):
         conditions: Optional[List[tuple]] = None,
         logic: str = "AND",
         order_by: Optional[Union[str, List[str], Dict[str, str]]] = None,
-        **filters
+        **filters: Any
     ) -> PageResult[ModelType]:
         """
         分页查询
@@ -323,7 +325,7 @@ class DatabaseRepository(Generic[ModelType]):
                             filter_exprs.append(expr)
 
             # 查询总数
-            count_stmt = select(func.count()).select_from(self.model_class)
+            count_stmt = select(func.count()).select_from(self.model_class)  # type: ignore[arg-type]
             if filter_exprs:
                 if logic.upper() == "OR":
                     count_stmt = count_stmt.where(or_(*filter_exprs))
@@ -334,7 +336,7 @@ class DatabaseRepository(Generic[ModelType]):
             total = total_result.scalar() or 0
 
             # 查询分页数据
-            stmt = select(self.model_class)
+            stmt = select(self.model_class)  # type: ignore[call-overload]
             if filter_exprs:
                 if logic.upper() == "OR":
                     stmt = stmt.where(or_(*filter_exprs))
@@ -395,8 +397,8 @@ class DatabaseRepository(Generic[ModelType]):
             for i in range(0, len(ids), batch_size):
                 batch_ids = ids[i:i+batch_size]
                 
-                stmt = select(self.model_class).where(
-                    self.model_class.id.in_(batch_ids)
+                stmt = select(self.model_class).where(  # type: ignore[call-overload]
+                    self.model_class.id.in_(batch_ids)  # type: ignore[attr-defined]
                 )
                 result = await session.execute(stmt)
                 instances = result.scalars().all()
@@ -418,8 +420,8 @@ class DatabaseRepository(Generic[ModelType]):
             return 0
         
         async with self.get_session() as session:
-            stmt = delete(self.model_class).where(
-                self.model_class.id.in_(ids)
+            stmt = delete(self.model_class).where(  # type: ignore[arg-type]
+                self.model_class.id.in_(ids)  # type: ignore[attr-defined]
             )
             result = await session.execute(stmt)
             await session.flush()
@@ -428,10 +430,10 @@ class DatabaseRepository(Generic[ModelType]):
     # ==================== 存在性检查 ====================
     
     @db_operation("exists")
-    async def exists(self, **filters) -> bool:
+    async def exists(self, **filters: Any) -> bool:
         """检查记录是否存在"""
         async with self.get_session() as session:
-            stmt = select(self.model_class)
+            stmt = select(self.model_class)  # type: ignore[call-overload]
             
             for key, value in filters.items():
                 if hasattr(self.model_class, key):
@@ -443,7 +445,7 @@ class DatabaseRepository(Generic[ModelType]):
     
     # ==================== 工具方法 ====================
     
-    def _apply_order_by(self, stmt, order_by):
+    def _apply_order_by(self, stmt: Any, order_by: Any) -> Any:
         """应用排序条件"""
         if isinstance(order_by, str):
             # 支持 "created_at desc" 格式
@@ -473,7 +475,7 @@ class DatabaseRepository(Generic[ModelType]):
                 stmt = self._apply_order_by(stmt, item)
         return stmt
     
-    def _build_filter_expr(self, column, operator: str, value):
+    def _build_filter_expr(self, column: Any, operator: str, value: Any) -> Any:
         # ===== 1. 处理 value is None =====
         if value is None:
             if operator in ("eq", "is"):
