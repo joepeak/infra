@@ -132,5 +132,10 @@ ignore_errors = false
 module = "infra.config"
 ignore_errors = false
 
+# 收窄 infra.db strict——修完 50 错后（step 53）——整体 0 错收窄
+[[tool.mypy.overrides]]
+module = "infra.db"
+ignore_errors = false
+
 # 收窄 infra.schedule strict——修真业务 bug（step 38 续）
 
