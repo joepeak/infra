@@ -163,5 +163,12 @@ ignore_errors = false
 module = "infra.logger"
 ignore_errors = false
 
+# 收窄 infra.utils 整体 strict——step 53 修完 50+ 错后（utils 全 0 错）
+# utils 包下 9 个子模块全 strict：async_helpers / common / error_handler /
+# executor / lark / retry / time_util / wechat + __init__
+[[tool.mypy.overrides]]
+module = "infra.utils"
+ignore_errors = false
+
 # 收窄 infra.schedule strict——修真业务 bug（step 38 续）
 
