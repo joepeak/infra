@@ -137,5 +137,31 @@ ignore_errors = false
 module = "infra.db"
 ignore_errors = false
 
+# 收窄剩余 infra 子模块 strict——本轮（step 53 后）整体 0 错收窄
+# （7 + 6 = 13 模块 strict 全覆盖；其余 infra 子模块如 utils.* 仍 ignore_errors = true）
+[[tool.mypy.overrides]]
+module = "infra.time_util"
+ignore_errors = false
+
+[[tool.mypy.overrides]]
+module = "infra.script_logger"
+ignore_errors = false
+
+[[tool.mypy.overrides]]
+module = "infra.bootstrap"
+ignore_errors = false
+
+[[tool.mypy.overrides]]
+module = "infra.exceptions"
+ignore_errors = false
+
+[[tool.mypy.overrides]]
+module = "infra.data_quality"
+ignore_errors = false
+
+[[tool.mypy.overrides]]
+module = "infra.logger"
+ignore_errors = false
+
 # 收窄 infra.schedule strict——修真业务 bug（step 38 续）
 
