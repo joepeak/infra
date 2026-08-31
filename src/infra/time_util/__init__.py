@@ -7,6 +7,7 @@
 未来某版本可删此文件——主项目全部 import 改完即可。
 """
 import warnings
+from typing import Any, Optional
 
 # Re-export 新位置符号
 from infra.utils.time_util import to_utc_event_time  # noqa: F401
@@ -16,7 +17,7 @@ class TimeUtil:
     """@deprecated：保留为兼容——请用 `to_utc_event_time()` 函数。"""
 
     @staticmethod
-    def to_utc_event_time(val, source_tz: str = "UTC"):
+    def to_utc_event_time(val: Any, source_tz: str = "UTC") -> "datetime":  # type: ignore[name-defined]
         """@deprecated：函数式版本更 Pythonic——用 `infra.utils.time_util.to_utc_event_time`。"""
         warnings.warn(
             "TimeUtil.to_utc_event_time is deprecated; use infra.utils.time_util.to_utc_event_time instead",

@@ -18,7 +18,7 @@ DEFAULT_MAX_BYTES = 50 * 1024 * 1024  # 50MB
 DEFAULT_BACKUP_COUNT = 5
 
 
-def _ensure_log_dir(log_dir: str):
+def _ensure_log_dir(log_dir: str) -> None:
     """确保日志目录存在"""
     Path(log_dir).mkdir(parents=True, exist_ok=True)
 

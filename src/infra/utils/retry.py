@@ -125,7 +125,7 @@ class RetryExecutor:
         assert last_exc is not None
         raise last_exc
 
-    async def execute_async(self, func: Callable, *args, **kwargs) -> Any:
+    async def execute_async(self, func: Callable[..., T], *args: Any, **kwargs: Any) -> T:
         """异步执行带重试——失败 raise 原始异常。
 
         支持同步函数（在线程池中运行，避免阻塞事件循环）。
@@ -145,7 +145,7 @@ class RetryExecutor:
                 import inspect
                 if inspect.iscoroutine(result):
                     result = await result
-                return result
+                return result  # type: ignore[no-any-return]
             except Exception as e:
                 last_exc = e
                 if not self._should_retry(e) or attempt >= cfg.max_retries:
@@ -169,7 +169,7 @@ def retry_sync(
     func: Callable[..., T],
     *args: Any,
     config: Optional[RetryConfig] = None,
-    **kwargs,
+    **kwargs: Any,
 ) -> T:
     """同步函数重试（函数式调用）——失败 raise 原始异常。"""
     return RetryExecutor(config).execute_sync(func, *args, **kwargs)
@@ -179,10 +179,10 @@ async def retry_async(
     func: Callable[..., T],
     *args: Any,
     config: Optional[RetryConfig] = None,
-    **kwargs,
+    **kwargs: Any,
 ) -> T:
     """异步函数重试（函数式调用）——失败 raise 原始异常。"""
-    return await RetryExecutor(config).execute_async(func, *args, **kwargs)  # type: ignore[no-any-return]
+    return await RetryExecutor(config).execute_async(func, *args, **kwargs)
 
 
 # ==================== 装饰器 ====================
@@ -208,7 +208,7 @@ def retry_async_deco(config: Optional[RetryConfig] = None) -> Callable:
     def decorator(func: Callable[..., T]) -> Callable[..., T]:
         @wraps(func)
         async def wrapper(*args: Any, **kwargs: Any) -> T:
-            return await exe.execute_async(func, *args, **kwargs)  # type: ignore[no-any-return]
+            return await exe.execute_async(func, *args, **kwargs)
         return cast(Callable[..., T], wrapper)
     return decorator
 

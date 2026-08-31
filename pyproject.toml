@@ -17,7 +17,6 @@ dependencies = [
     "python-dateutil>=2.8",
     "pytz>=2023.3",
     "lark-oapi>=1.2",
-    "numpy>=1.24",
     "python-dotenv>=1.0",  # infra.bootstrap 自动加载 .env
     "pydantic>=2.0",  # infra.llm models
     "openai>=1.30",  # infra.llm OpenAI provider
@@ -96,7 +95,7 @@ ignore_missing_imports = true
 module = "infra"
 ignore_errors = true
 
-# 第三方库 stub 兼容问题（numpy / sqlalchemy 用的 dynamic typing 太多，忽略）
+# 第三方库 stub 兼容问题（sqlalchemy 用的 dynamic typing 太多，忽略）
 [[tool.mypy.overrides]]
 module = "sqlalchemy"
 ignore_errors = true
@@ -134,3 +133,4 @@ module = "infra.config"
 ignore_errors = false
 
 # 收窄 infra.schedule strict——修真业务 bug（step 38 续）
+

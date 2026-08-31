@@ -19,10 +19,10 @@ T = TypeVar('T')
 class TaskExecutor:
     """统一的异步任务执行器"""
     
-    def __init__(self, default_retry_config: Optional[RetryConfig] = None):
+    def __init__(self, default_retry_config: Optional[RetryConfig] = None) -> None:
         self.default_retry_config = default_retry_config or RetryConfig.default()
     
-    async def execute(self, func: Callable, *args, retry_config: Optional[RetryConfig] = None, **kwargs):
+    async def execute(self, func: Callable, *args: Any, retry_config: Optional[RetryConfig] = None, **kwargs: Any) -> Any:
         retry_config = retry_config or self.default_retry_config
         retry_executor = RetryExecutor(retry_config)
         
@@ -35,6 +35,6 @@ class TaskExecutor:
             )
 
 
-async def execute_task(func, *args, retry_config=None, **kwargs):
+async def execute_task(func: Callable, *args: Any, retry_config: Optional[RetryConfig] = None, **kwargs: Any) -> Any:
     executor = TaskExecutor(retry_config)
     return await executor.execute(func, *args, **kwargs)

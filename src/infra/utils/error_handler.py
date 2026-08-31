@@ -172,8 +172,8 @@ class ExceptionContext:
             'traceback': ''.join(traceback.format_exception(exc_type, exc_val, exc_tb)),
         }
         if isinstance(exc_val, AppException):
-            exc_info['error_code'] = str(exc_val.error_code)  # type: ignore[union-attr]
-            exc_info['details'] = dict(exc_val.details) if exc_val.details else {}  # type: ignore[union-attr]
+            exc_info['error_code'] = str(exc_val.error_code)
+            exc_info['details'] = dict(exc_val.details) if exc_val.details else {}
         _log_exception(self.logger, self.log_level, self.operation_name, exc_val, exc_info)
 
         if self.reraise:

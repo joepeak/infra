@@ -16,7 +16,7 @@ class AppException(Exception):
         self.details = details or {}
         super().__init__(self.message)
     
-    def __str__(self):
+    def __str__(self) -> str:
         error_msg = f"[{self.error_code}] {self.message}" if self.error_code else self.message
         if self.details:
             error_msg += f" | Details: {self.details}"

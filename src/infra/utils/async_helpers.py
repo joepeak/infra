@@ -12,7 +12,7 @@ from infra.logger import get_logger
 logger = get_logger(__name__)
 
 
-def sync_retry(func, max_retries=5, base_delay=2.0, max_delay=30.0):
+def sync_retry(func: Callable, max_retries: int = 5, base_delay: float = 2.0, max_delay: float = 30.0) -> Any:
     """同步重试装饰器（在线程中执行）"""
     for attempt in range(max_retries + 1):
         try:
@@ -55,7 +55,7 @@ async def merge_sync_results(
     if not functions:
         return None
     
-    async def run_one(func):
+    async def run_one(func: Callable) -> Any:
         """运行单个函数"""
         try:
             return await asyncio.wait_for(

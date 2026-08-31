@@ -7,7 +7,7 @@
 
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from infra.logger import get_logger, configure_logging_from_dict
 from infra.redis import init_redis, close_redis
@@ -20,7 +20,7 @@ from infra.config import init_config
 _logger = None
 
 
-def get_bootstrap_logger():
+def get_bootstrap_logger() -> Any:
     """获取引导模块的日志器"""
     global _logger
     if _logger is None:

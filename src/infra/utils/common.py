@@ -1,7 +1,6 @@
 import json
-from typing import Any
 from datetime import datetime
-from typing import Optional
+from typing import Any, Callable, Dict, Optional
 
 def parse_json_string(s: Any) -> Any:
     """
@@ -14,17 +13,13 @@ def parse_json_string(s: Any) -> Any:
         # 如果解析失败，说明它不是有效的 JSON 字符串
         return s  # 返回原始字符串
     
-def merge_results(*functions):
+def merge_results(*functions: Callable) -> Optional[Dict[str, Any]]:
     merged_result = {}
     
     for func in functions:
         result = func()  # 调用函数并获取返回值
-        
-        # 如果返回值不是 None，合并字典
         if result is not None:
             merged_result.update(result)
-    
-    # 如果合并后的字典为空，则返回 None
     return merged_result if merged_result else None
 
 

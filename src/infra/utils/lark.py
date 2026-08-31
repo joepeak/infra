@@ -19,8 +19,8 @@ from infra.config import get_config
 logger = get_logger(__name__)
 
 # Lark Webhook 配置（启动时加载一次）
-_webhook = None
-_retry_config = None
+_webhook: Optional[str] = None
+_retry_config: Optional[Dict[str, Any]] = None
 
 
 def _get_webhook() -> Optional[str]:
@@ -115,7 +115,7 @@ def _build_message_data(
     msg_type: str = "text",
     title: Optional[str] = None,
     template: str = "blue",
-    fields: Optional[List[Union[str, tuple]]] = None,
+    fields: Optional[List[Dict[str, Any]]] = None,
     is_raw: bool = False
 ) -> Dict[str, Any]:
     """
@@ -165,7 +165,7 @@ def _build_message_data(
                 })
             elements.append({
                 "tag": "div",
-                "fields": lark_fields
+                "fields": lark_fields  # type: ignore[dict-item]
             })
         
         data = {
@@ -177,7 +177,7 @@ def _build_message_data(
         }
         
         if title:
-            data["card"]["header"] = {
+            data["card"]["header"] = {  # type: ignore[index]
                 "title": {
                     "tag": "plain_text",
                     "content": title
@@ -222,7 +222,7 @@ async def send_to_lark(
     msg_type: str = "text",
     title: Optional[str] = None,
     template: str = "blue",
-    fields: Optional[List[Union[str, tuple]]] = None,
+    fields: Optional[List[Dict[str, Any]]] = None,
     is_raw: bool = False,
     max_retries: Optional[int] = None,
     base_delay: Optional[float] = None,
@@ -390,7 +390,7 @@ async def send_card(
 
 # 测试代码
 if __name__ == "__main__":
-    async def test():
+    async def test() -> None:
         # 测试发送文本
         result = await send_text("Hello, Lark!")
         print(f"文本消息: {result}")
