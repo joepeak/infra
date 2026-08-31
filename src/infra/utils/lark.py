@@ -23,7 +23,7 @@ _webhook = None
 _retry_config = None
 
 
-def _get_webhook() -> str:
+def _get_webhook() -> Optional[str]:
     """获取 Lark Webhook URL（懒加载）"""
     global _webhook
     if _webhook is None:
@@ -133,7 +133,7 @@ def _build_message_data(
         Lark 消息数据
     """
     if is_raw:
-        return content
+        return content  # type: ignore[return-value]  # is_raw: content 本身是 dict（上游约定）
     
     if msg_type == "interactive":
         # 构建卡片元素
@@ -201,7 +201,7 @@ def _build_message_data(
             }
         }
         if title:
-            data["card"]["header"] = {
+            data["card"]["header"] = {  # type: ignore[index]
                 "title": {
                     "tag": "plain_text",
                     "content": title

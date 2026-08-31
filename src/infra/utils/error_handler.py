@@ -35,7 +35,7 @@ def _build_exc_info(func_name: str, module_name: str, exc: BaseException) -> Dic
     return exc_info
 
 
-def _log_exception(logger, log_level: str, func_name: str, exc: BaseException, exc_info: dict) -> None:
+def _log_exception(logger: Any, log_level: str, func_name: str, exc: BaseException, exc_info: Dict[str, Any]) -> None:
     """按 log_level 等级记录异常。"""
     log_method = getattr(logger, log_level.lower(), logger.error)
     log_method(f"Exception in {func_name}: {str(exc)}", extra=exc_info)
@@ -53,7 +53,7 @@ def handle_exceptions(
     log_level: str = "ERROR",
     reraise: bool = False,
     exception_types: Optional[Union[Type[Exception], tuple]] = None,
-):
+) -> Callable:  # noqa: F811
     """
     同步异常处理装饰器。
 
@@ -69,7 +69,7 @@ def handle_exceptions(
     """
     def decorator(func: Callable) -> Callable:
         @functools.wraps(func)
-        def wrapper(*args, **kwargs):
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
             logger = get_logger(func.__module__)
             try:
                 return func(*args, **kwargs)
@@ -95,7 +95,7 @@ def async_handle_exceptions(
     log_level: str = "ERROR",
     reraise: bool = False,
     exception_types: Optional[Union[Type[Exception], tuple]] = None,
-):
+) -> Callable:  # noqa: F811
     """
     异步异常处理装饰器。
 
@@ -139,7 +139,7 @@ class ExceptionContext:
         log_level: str = "ERROR",
         reraise: bool = False,
         exception_types: Optional[Union[Type[Exception], tuple]] = None,
-    ):
+    ) -> None:
         self.operation_name = operation_name
         self.default_return = default_return
         self.log_level = log_level
@@ -147,13 +147,17 @@ class ExceptionContext:
         self.exception_types = exception_types
         self.logger = get_logger(self.__class__.__module__)
 
-    def __enter__(self) -> "ErrorContext":
+    def __enter__(self) -> "ErrorContext":  # type: ignore[name-defined]
         return self
 
-    def __exit__(self, exc_type: Optional[type], exc_val: Optional[BaseException], exc_tb: Any) -> bool:
+    def __exit__(
+        self, exc_type: Optional[Type[BaseException]], exc_val: Optional[BaseException], exc_tb: Any
+    ) -> bool:
         if exc_type is None:
             return True  # 无异常
 
+        # narrow Optional[BaseException] -> BaseException
+        assert exc_val is not None
         # 判断是否捕获
         if not _should_capture(exc_val, self.exception_types):
             if self.reraise:
@@ -161,17 +165,15 @@ class ExceptionContext:
             return True  # 抑制
 
         # 记录异常
-        exc_info = {
+        exc_info: Dict[str, Any] = {
             'operation': self.operation_name,
-            'exception_type': exc_type.__name__,
+            'exception_type': exc_type.__name__ if exc_type else "Unknown",
             'exception_message': str(exc_val),
             'traceback': ''.join(traceback.format_exception(exc_type, exc_val, exc_tb)),
         }
         if isinstance(exc_val, AppException):
-            exc_info.update({
-                'error_code': exc_val.error_code,
-                'details': exc_val.details,
-            })
+            exc_info['error_code'] = str(exc_val.error_code)  # type: ignore[union-attr]
+            exc_info['details'] = dict(exc_val.details) if exc_val.details else {}  # type: ignore[union-attr]
         _log_exception(self.logger, self.log_level, self.operation_name, exc_val, exc_info)
 
         if self.reraise:

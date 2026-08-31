@@ -10,6 +10,7 @@ import aiohttp
 import random
 import json
 import re
+from typing import Optional
 
 from infra.logger import get_logger
 from .retry import retry_async_deco, RetryConfig
@@ -58,7 +59,7 @@ def _send_wechat_sync(message: str, timeout: int = 10, max_length: int = 2000) -
         return False
 
 # 从错误信息中提取冷却时间
-def _extract_cooldown(error_msg: str) -> float:
+def _extract_cooldown(error_msg: str) -> Optional[float]:
     """从错误信息中提取冷却时间，若提取失败返回 None"""
     match = re.search(r'cooldown active for ([\d.]+)s', error_msg)
     if match:

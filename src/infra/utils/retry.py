@@ -22,7 +22,7 @@ import random
 import time
 from dataclasses import dataclass, field
 from functools import wraps
-from typing import (Callable, TypeVar, Any, Optional, Tuple, Type, Dict)
+from typing import (Callable, TypeVar, Any, Optional, Tuple, Type, Dict, cast)
 
 from infra.logger import get_logger
 
@@ -47,7 +47,7 @@ class RetryConfig:
     allow_exceptions: Tuple[Type[Exception], ...] = _DEFAULT_RETRY_EXCEPTIONS
     deny_exceptions: Tuple[Type[Exception], ...] = ()
 
-    def copy(self, **override) -> "RetryConfig":
+    def copy(self, **override: Any) -> "RetryConfig":
         """拷贝并局部覆盖参数——方便单次调用修改配置。"""
         data = {k: v for k, v in self.__dict__.items()}
         data.update(override)
@@ -102,7 +102,7 @@ class RetryExecutor:
         """公开方法——判断异常是否应被重试（暴露给业务使用）。"""
         return self._should_retry(exc)
 
-    def execute_sync(self, func: Callable[..., T], *args, **kwargs) -> T:
+    def execute_sync(self, func: Callable[..., T], *args: Any, **kwargs: Any) -> T:
         """同步执行带重试——失败 raise 原始异常。"""
         last_exc: Optional[Exception] = None
         cfg = self.config
@@ -167,7 +167,7 @@ class RetryExecutor:
 
 def retry_sync(
     func: Callable[..., T],
-    *args,
+    *args: Any,
     config: Optional[RetryConfig] = None,
     **kwargs,
 ) -> T:
@@ -177,7 +177,7 @@ def retry_sync(
 
 async def retry_async(
     func: Callable[..., T],
-    *args,
+    *args: Any,
     config: Optional[RetryConfig] = None,
     **kwargs,
 ) -> T:
@@ -187,29 +187,29 @@ async def retry_async(
 
 # ==================== 装饰器 ====================
 
-def retry_sync_deco(config: Optional[RetryConfig] = None):
+def retry_sync_deco(config: Optional[RetryConfig] = None) -> Callable:
     """同步函数重试装饰器。"""
     cfg = config or RetryConfig.default()
     exe = RetryExecutor(cfg)
 
     def decorator(func: Callable[..., T]) -> Callable[..., T]:
         @wraps(func)
-        def wrapper(*args, **kwargs) -> T:
+        def wrapper(*args: Any, **kwargs: Any) -> T:
             return exe.execute_sync(func, *args, **kwargs)
-        return wrapper
+        return cast(Callable[..., T], wrapper)
     return decorator
 
 
-def retry_async_deco(config: Optional[RetryConfig] = None):
+def retry_async_deco(config: Optional[RetryConfig] = None) -> Callable:
     """异步函数重试装饰器。"""
     cfg = config or RetryConfig.default()
     exe = RetryExecutor(cfg)
 
     def decorator(func: Callable[..., T]) -> Callable[..., T]:
         @wraps(func)
-        async def wrapper(*args, **kwargs) -> T:
-            return await exe.execute_async(func, *args, **kwargs)
-        return wrapper
+        async def wrapper(*args: Any, **kwargs: Any) -> T:
+            return await exe.execute_async(func, *args, **kwargs)  # type: ignore[no-any-return]
+        return cast(Callable[..., T], wrapper)
     return decorator
 
 
