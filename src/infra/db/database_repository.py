@@ -275,7 +275,139 @@ class DatabaseRepository(Generic[ModelType]):
             if select_fields:
                 return result.all()  # type: ignore[no-any-return]  # 返回元组列表
             return result.scalars().all()  # type: ignore[no-any-return]
-    
+
+    # ==================== 分组取最新记录 ====================
+    @db_operation("get_latest_per_group")
+    async def get_latest_per_group(
+        self,
+        group_column: str,
+        order_column: str,
+        limit: int = 1,
+        where: Optional[Dict[str, Any]] = None,
+        conditions: Optional[List[tuple]] = None,
+        logic: str = "AND",
+        extra_order: Optional[Union[str, List[str], Dict[str, str]]] = None,
+        **filters: Any
+    ) -> List[Any]:
+        """
+        按分组取最新（或最旧）的 N 条记录
+        
+        Args:
+            group_column: 分组字段名
+            order_column: 排序字段名（通常为 created_at 等时间字段）
+            limit: 每个分组取几条（默认 1）
+            where: 等值条件字典
+            conditions: 操作符条件列表
+            logic: 条件逻辑
+            extra_order: 额外的排序（在窗口函数内使用）
+            **filters: 简单等值过滤条件
+            
+        Returns:
+            每个分组最新的 N 条记录列表
+        """
+        from sqlalchemy import func, select, and_, or_
+        
+        # 验证字段是否存在
+        if not hasattr(self.model_class, group_column):
+            raise ValueError(f"字段 '{group_column}' 不存在于模型 {self.model_class.__name__}")
+        if not hasattr(self.model_class, order_column):
+            raise ValueError(f"字段 '{order_column}' 不存在于模型 {self.model_class.__name__}")
+        
+        async with self.get_session() as session:
+            # 构建过滤条件
+            filter_exprs = []
+            
+            if where:
+                for key, value in where.items():
+                    if hasattr(self.model_class, key):
+                        filter_exprs.append(getattr(self.model_class, key) == value)
+            
+            for key, value in filters.items():
+                if hasattr(self.model_class, key):
+                    filter_exprs.append(getattr(self.model_class, key) == value)
+            
+            if conditions:
+                for field, operator, value in conditions:
+                    if hasattr(self.model_class, field):
+                        column = getattr(self.model_class, field)
+                        expr = self._build_filter_expr(column, operator, value)
+                        if expr is not None:
+                            filter_exprs.append(expr)
+            
+            # 构建窗口函数
+            group_attr = getattr(self.model_class, group_column)
+            order_attr = getattr(self.model_class, order_column)
+            
+            # 构建排序表达式
+            order_exprs = [order_attr.desc()]
+            
+            # 如果有额外排序
+            if extra_order:
+                if isinstance(extra_order, str):
+                    parts = extra_order.strip().split()
+                    if len(parts) == 2 and parts[1].upper() in ["ASC", "DESC"]:
+                        if hasattr(self.model_class, parts[0]):
+                            col = getattr(self.model_class, parts[0])
+                            order_exprs.append(col.desc() if parts[1].upper() == "DESC" else col)
+                    else:
+                        if hasattr(self.model_class, extra_order):
+                            order_exprs.append(getattr(self.model_class, extra_order))
+                elif isinstance(extra_order, dict):
+                    for field, direction in extra_order.items():
+                        if hasattr(self.model_class, field):
+                            col = getattr(self.model_class, field)
+                            order_exprs.append(col.desc() if direction.upper() == "DESC" else col)
+                elif isinstance(extra_order, list):
+                    for item in extra_order:
+                        if isinstance(item, str):
+                            parts = item.strip().split()
+                            if len(parts) == 2 and parts[1].upper() in ["ASC", "DESC"]:
+                                if hasattr(self.model_class, parts[0]):
+                                    col = getattr(self.model_class, parts[0])
+                                    order_exprs.append(col.desc() if parts[1].upper() == "DESC" else col)
+                            else:
+                                if hasattr(self.model_class, item):
+                                    order_exprs.append(getattr(self.model_class, item))
+                        elif isinstance(item, dict):
+                            for field, direction in item.items():
+                                if hasattr(self.model_class, field):
+                                    col = getattr(self.model_class, field)
+                                    order_exprs.append(col.desc() if direction.upper() == "DESC" else col)
+            
+            # 关键修复：使用 CTE 方式，并确保 SELECT 子句正确
+            # 第一步：创建带窗口函数的子查询
+            # 选择所有列 + 窗口函数
+            cols = [getattr(self.model_class, c.name) for c in self.model_class.__table__.columns]
+            
+            # 构建子查询
+            subq = select(
+                *cols,
+                func.row_number().over(
+                    partition_by=group_attr,
+                    order_by=order_exprs
+                ).label("rn")
+            ).select_from(self.model_class)
+            
+            # 应用过滤条件
+            if filter_exprs:
+                if logic.upper() == "OR":
+                    subq = subq.where(or_(*filter_exprs))
+                else:
+                    subq = subq.where(and_(*filter_exprs))
+            
+            subq = subq.subquery("ranked")
+            
+            # 第二步：从子查询中选择 rn <= limit 的记录
+            # 使用子查询的所有列，并映射回 ORM 对象
+            stmt = select(self.model_class).from_statement(
+                select(*[subq.c[col.name] for col in self.model_class.__table__.columns])
+                .select_from(subq)
+                .where(subq.c.rn <= limit)
+            )
+            
+            result = await session.execute(stmt)
+            return result.scalars().all()  # type: ignore[no-any-return]
+
     # ==================== 分页查询 ====================
     
     @db_operation("paginate")

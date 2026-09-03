@@ -889,11 +889,297 @@ async def test_decimal_to_float_conversion(repo):
     assert isinstance(float(found.value), float)
     assert round(float(found.value), 6) == 123.456789
 
-
 # ============================================================
-# 运行说明
+# 12. 分组取最新记录测试 (get_latest_per_group)
 # ============================================================
 
-if __name__ == "__main__":
-    print("请使用 pytest 运行此测试文件:")
-    print("  pytest tests/test_database_repository.py -v")
+class TestGetLatestPerGroup:
+    """测试 get_latest_per_group 方法"""
+
+    async def test_get_latest_per_group_basic(self, repo):
+        """测试基本的分组取最新记录"""
+        # 每个 series_id 取最新的 1 条
+        records = await repo.get_latest_per_group(
+            group_column="series_id",
+            order_column="stat_date",
+            limit=1
+        )
+        
+        # VIXCLS: 最新 1 条 (stat_date = today)
+        # RRPONTTLD: 最新 1 条 (stat_date = today)
+        # WALCL: 最新 1 条 (stat_date = today, value=7220)
+        # TEST_NULL: 最新 1 条 (stat_date = today, value=None)
+        # 应该有 4 个分组
+        assert len(records) == 4
+        
+        # 验证每个分组最新日期是 today
+        now = date.today()
+        for r in records:
+            assert r.stat_date == now
+
+    async def test_get_latest_per_group_limit_2(self, repo):
+        """测试每个分组取最新的 2 条"""
+        records = await repo.get_latest_per_group(
+            group_column="series_id",
+            order_column="stat_date",
+            limit=2
+        )
+        
+        # 验证 VIXCLS 有 2 条（今天和昨天）
+        vix_records = [r for r in records if r.series_id == "VIXCLS"]
+        assert len(vix_records) == 2
+        # 排序应该是 descending
+        if len(vix_records) >= 2:
+            assert vix_records[0].stat_date >= vix_records[1].stat_date
+        
+        # RRPONTTLD 有 2 条
+        rrp_records = [r for r in records if r.series_id == "RRPONTTLD"]
+        assert len(rrp_records) == 2
+
+    async def test_get_latest_per_group_with_where(self, repo):
+        """测试带 where 条件的分组取最新"""
+        # 只取 active 的记录
+        records = await repo.get_latest_per_group(
+            group_column="series_id",
+            order_column="stat_date",
+            limit=2,
+            where={"is_active": True}
+        )
+        
+        # WALCL 有 4 条 active（其中 1 条 value=None）
+        walcl_records = [r for r in records if r.series_id == "WALCL"]
+        # WALCL 有 4 条 active，取最新 2 条
+        assert len(walcl_records) == 2
+        for r in walcl_records:
+            assert r.is_active is True
+
+    async def test_get_latest_per_group_with_conditions(self, repo):
+        """测试带 conditions 条件的分组取最新"""
+        # 只取 value > 16 的记录
+        records = await repo.get_latest_per_group(
+            group_column="series_id",
+            order_column="stat_date",
+            limit=2,
+            conditions=[("value", "gt", 16.0)]
+        )
+        
+        # VIXCLS: 值 > 16 的有 3 条，取最新 2 条
+        vix_records = [r for r in records if r.series_id == "VIXCLS"]
+        assert len(vix_records) == 2
+        for r in vix_records:
+            assert float(r.value) > 16.0
+
+    async def test_get_latest_per_group_with_logic_or(self, repo):
+        """测试 OR 逻辑的分组取最新"""
+        records = await repo.get_latest_per_group(
+            group_column="series_id",
+            order_column="stat_date",
+            limit=1,
+            conditions=[
+                ("series_id", "eq", "VIXCLS"),
+                ("series_id", "eq", "WALCL")
+            ],
+            logic="OR"
+        )
+        
+        # 应该返回 VIXCLS 和 WALCL 各最新 1 条
+        series_ids = {r.series_id for r in records}
+        assert "VIXCLS" in series_ids
+        assert "WALCL" in series_ids
+        assert len(records) == 2
+
+    async def test_get_latest_per_group_with_extra_order(self, repo):
+        """测试带额外排序的分组取最新"""
+        # 在同一天的数据中，按 value 降序排列
+        now = date.today()
+        await repo.create(
+            series_id="TEST_EXTRA_ORDER",
+            stat_date=now,
+            value=10.0,
+            category="test"
+        )
+        await repo.create(
+            series_id="TEST_EXTRA_ORDER",
+            stat_date=now,
+            value=30.0,
+            category="test"
+        )
+        await repo.create(
+            series_id="TEST_EXTRA_ORDER",
+            stat_date=now,
+            value=20.0,
+            category="test"
+        )
+        
+        records = await repo.get_latest_per_group(
+            group_column="series_id",
+            order_column="stat_date",
+            limit=3,
+            extra_order={"value": "desc"},
+            where={"series_id": "TEST_EXTRA_ORDER"}
+        )
+        
+        # 应该按 value 降序排列: 30, 20, 10
+        assert len(records) == 3
+        values = [float(r.value) for r in records]
+        assert values == [30.0, 20.0, 10.0]
+
+    async def test_get_latest_per_group_handle_null_values(self, repo):
+        """测试处理 null 值的情况"""
+        # TEST_NULL 分组有 2 条，都是 value=None
+        records = await repo.get_latest_per_group(
+            group_column="series_id",
+            order_column="stat_date",
+            limit=1,
+            where={"series_id": "TEST_NULL"}
+        )
+        
+        assert len(records) == 1
+        assert records[0].series_id == "TEST_NULL"
+        assert records[0].stat_date == date.today()
+        assert records[0].value is None
+
+    async def test_get_latest_per_group_with_filters_kwargs(self, repo):
+        """测试使用 **filters 参数"""
+        # 使用关键字参数过滤
+        records = await repo.get_latest_per_group(
+            group_column="series_id",
+            order_column="stat_date",
+            limit=1,
+            category="fred",  # 只取 category='fred' 的记录
+            is_active=True
+        )
+        
+        # 应该返回所有 active 的 fred 分组的最新记录
+        # VIXCLS, RRPONTTLD, WALCL (active 的)
+        assert len(records) >= 3
+        for r in records:
+            assert r.category == "fred"
+            assert r.is_active is True
+
+    async def test_get_latest_per_group_nonexistent_column(self, repo):
+        """测试不存在的列名"""
+        with pytest.raises(ValueError, match="字段 'nonexistent_column' 不存在"):
+            await repo.get_latest_per_group(
+                group_column="nonexistent_column",
+                order_column="stat_date",
+                limit=1
+            )
+
+    async def test_get_latest_per_group_all_series(self, repo):
+        """测试所有分组各取最新 1 条"""
+        # 获取所有 series_id 的最新记录
+        records = await repo.get_latest_per_group(
+            group_column="series_id",
+            order_column="stat_date",
+            limit=1
+        )
+        
+        # 验证每个 series_id 只出现一次
+        series_ids = [r.series_id for r in records]
+        assert len(series_ids) == len(set(series_ids))
+        
+        # 验证包含所有预期的分组
+        expected_series = {"VIXCLS", "RRPONTTLD", "WALCL", "TEST_NULL"}
+        assert set(series_ids) == expected_series
+
+    # ==================== 综合场景测试（在类内部） ====================
+
+    async def test_get_latest_per_group_comprehensive(self, repo):
+        """综合测试：模拟 FredRepository 中所有 series 的最新值获取"""
+        now = date.today()
+        
+        # 场景：获取所有 FRED 系列的最新值（类似 dashboard 展示）
+        records = await repo.get_latest_per_group(
+            group_column="series_id",
+            order_column="stat_date",
+            limit=1,
+            where={"category": "fred"},
+            is_active=True
+        )
+        
+        # 验证结果
+        # 应该返回 3 个分组：VIXCLS, RRPONTTLD, WALCL
+        assert len(records) == 3
+        
+        # 构建 series_id 到值的映射
+        value_map = {r.series_id: float(r.value) for r in records}
+        
+        # VIXCLS 最新值应该是 15.8
+        assert "VIXCLS" in value_map
+        assert value_map["VIXCLS"] == 15.8
+        
+        # RRPONTTLD 最新值应该是 2080.0
+        assert "RRPONTTLD" in value_map
+        assert value_map["RRPONTTLD"] == 2080.0
+        
+        # WALCL 最新值应该是 7220.0
+        assert "WALCL" in value_map
+        assert value_map["WALCL"] == 7220.0
+        
+        # 验证所有记录都是最新日期
+        for r in records:
+            assert r.stat_date == now
+
+    async def test_get_latest_per_group_with_date_filter(self, repo):
+        """测试带日期过滤的分组取最新"""
+        now = date.today()
+        # 只取 3 天前的数据（取每个分组在该日期或之前的最新值）
+        
+        # 这里我们直接用 conditions 过滤日期范围
+        records = await repo.get_latest_per_group(
+            group_column="series_id",
+            order_column="stat_date",
+            limit=1,
+            conditions=[
+                ("stat_date", "lte", now - timedelta(days=1)),
+                ("value", "is_not", None)
+            ]
+        )
+        
+        # 对于 VIXCLS，日期 <= yesterday 的最新数据是 16.5
+        vix_records = [r for r in records if r.series_id == "VIXCLS"]
+        if vix_records:
+            assert len(vix_records) == 1
+            assert float(vix_records[0].value) == 16.5
+
+    async def test_get_latest_per_group_large_dataset(self, repo):
+        """测试大数据量下的分组取最新（使用批量创建）"""
+        now = date.today()
+        # 创建多个分组，每个分组多条数据
+        items = []
+        for i in range(10):  # 10个分组
+            series_id = f"PERF_{i}"
+            for day in range(30):  # 每个分组 30 条
+                items.append({
+                    "series_id": series_id,
+                    "stat_date": now - timedelta(days=day),
+                    "value": float(day * 10 + i),  # 使用 i 作为分组标识
+                    "category": "perf_test",
+                    "is_active": True
+                })
+        
+        await repo.bulk_create(items)
+        
+        # 获取所有分组的最新 5 条
+        records = await repo.get_latest_per_group(
+            group_column="series_id",
+            order_column="stat_date",
+            limit=5,
+            where={"category": "perf_test"}
+        )
+        
+        # 应该有 10 * 5 = 50 条记录
+        assert len(records) == 50
+        
+        # 验证每个分组有 5 条
+        for i in range(10):
+            series_id = f"PERF_{i}"
+            group_records = [r for r in records if r.series_id == series_id]
+            assert len(group_records) == 5
+            # 验证日期是最近的 5 天
+            dates = sorted([r.stat_date for r in group_records], reverse=True)
+            assert dates[0] == now  # 最新的是今天
+            assert len(dates) == 5
+
+
