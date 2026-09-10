@@ -3,7 +3,7 @@ from typing import Any, AsyncGenerator, Callable, Dict, Generic, List, Optional,
 from dataclasses import dataclass
 from contextlib import asynccontextmanager
 
-from sqlalchemy import select, delete, and_, or_, func
+from sqlalchemy import select, delete, and_, or_, func, text
 from sqlalchemy.ext.asyncio import AsyncSession
 import asyncpg
 
@@ -69,6 +69,29 @@ class DatabaseRepository(Generic[ModelType]):
 
         async with db_manager.engine.connect() as conn:
             yield conn
+    
+    # ==================== 原生 SQL 查询 ====================
+    
+    @db_operation("query_raw")
+    async def query_raw(
+        self,
+        sql: str,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """执行原生 SQL，返回 dict 列表（列名 -> 值）。
+        
+        用于复杂查询（如透视/聚合）绕过 ORM 逐字段查询的限制。
+        对于 SELECT 返回行数据；对于 INSERT/UPDATE/DELETE 提交事务并返回空列表。
+        """
+        async with self.get_session() as session:
+            result = await session.execute(text(sql), params or {})
+            # INSERT/UPDATE/DELETE 不返回行 —— 提交并返回空列表
+            if not result.returns_rows:
+                await session.commit()
+                return []
+            rows = [dict(row._mapping) for row in result]
+            await session.commit()
+            return rows
     
     # ==================== 基础 CRUD 操作 ====================
     

@@ -7,7 +7,6 @@ infra 是下游项目的基础设施类库——database_model 是 ORM 基类，
 本测试覆盖：
 - JSONBCompatible 类型适配
 - 4 个抽象基类的字段定义（不需要连 DB）
-- TimeUtil 时区转换（纯函数）
 
 注意：基类是 __abstract__ = True，测试用 SQLite + create_all 建临时表验证 metadata。
 """
@@ -28,8 +27,8 @@ from infra.db.database_model import (
     ObservationBase,
     ObservationBaseModel,
     TimeSeriesBaseModel,
-    TimeUtil,
 )
+from infra.utils.time_util import to_utc_event_time
 from infra.data_quality import DataQuality
 
 
@@ -203,12 +202,12 @@ class TestObservationBase:
 
 
 # ============================================================
-# 6. TimeUtil.to_utc_event_time 时区转换
+# 6. to_utc_event_time 时区转换
 # ============================================================
-class TestTimeUtilToUtcEventTime:
+class TestToUtcEventTime:
     def test_string_10_chars_parsed_as_date(self):
         """10 字符 "2026-08-01" 解析为 date（无时间部分）。"""
-        result = TimeUtil.to_utc_event_time("2026-08-01")
+        result = to_utc_event_time("2026-08-01")
         assert result.year == 2026
         assert result.month == 8
         assert result.day == 1
@@ -219,7 +218,7 @@ class TestTimeUtilToUtcEventTime:
 
     def test_string_with_time(self):
         """带时间的字符串解析。"""
-        result = TimeUtil.to_utc_event_time("2026-08-01 14:30:00")
+        result = to_utc_event_time("2026-08-01 14:30:00")
         assert result.hour == 14
         assert result.minute == 30
         assert result.tzinfo == timezone.utc
@@ -227,7 +226,7 @@ class TestTimeUtilToUtcEventTime:
     def test_date_object_converted_to_datetime(self):
         """date 对象（无时间）转 datetime 00:00:00。"""
         d = date(2026, 8, 1)
-        result = TimeUtil.to_utc_event_time(d)
+        result = to_utc_event_time(d)
         assert result.year == 2026
         assert result.hour == 0
         assert result.tzinfo == timezone.utc
@@ -235,14 +234,14 @@ class TestTimeUtilToUtcEventTime:
     def test_naive_datetime_assumes_utc(self):
         """naive datetime——加 UTC 时区。"""
         dt = datetime(2026, 8, 1, 14, 30, 0)  # 无 tzinfo
-        result = TimeUtil.to_utc_event_time(dt)
+        result = to_utc_event_time(dt)
         assert result.tzinfo == timezone.utc
 
     def test_aware_datetime_converted_to_utc(self):
         """带时区的 datetime——转换到 UTC。"""
         shanghai = timezone(timedelta(hours=8))
         dt = datetime(2026, 8, 1, 14, 30, 0, tzinfo=shanghai)
-        result = TimeUtil.to_utc_event_time(dt)
+        result = to_utc_event_time(dt)
         assert result.tzinfo == timezone.utc
         # 14:30 上海时间 → 06:30 UTC
         assert result.hour == 6
@@ -252,21 +251,21 @@ class TestTimeUtilToUtcEventTime:
         """美东时间（UTC-5/-4）转 UTC。"""
         ny = timezone(timedelta(hours=-5))
         dt = datetime(2026, 8, 1, 14, 30, 0, tzinfo=ny)
-        result = TimeUtil.to_utc_event_time(dt)
+        result = to_utc_event_time(dt)
         assert result.tzinfo == timezone.utc
         # 14:30 NY → 19:30 UTC
         assert result.hour == 19
 
     def test_source_tz_shanghai(self):
         """source_tz='Asia/Shanghai' 字符串——加 +8 时区。"""
-        result = TimeUtil.to_utc_event_time("2026-08-01 22:00:00", source_tz="Asia/Shanghai")
+        result = to_utc_event_time("2026-08-01 22:00:00", source_tz="Asia/Shanghai")
         # 22:00 上海 → 14:00 UTC
         assert result.hour == 14
         assert result.tzinfo == timezone.utc
 
     def test_source_tz_zoneinfo_lookup(self):
         """source_tz='America/New_York'——用 zoneinfo 查 tz。"""
-        result = TimeUtil.to_utc_event_time("2026-08-01 10:00:00", source_tz="America/New_York")
+        result = to_utc_event_time("2026-08-01 10:00:00", source_tz="America/New_York")
         # 10:00 NY (-4 夏令时) → 14:00 UTC
         assert result.hour == 14
         assert result.tzinfo == timezone.utc

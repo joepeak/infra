@@ -1,10 +1,5 @@
 """infra.utils.time_util：时区转换工具（函数式）。
 
-20260829 refactor：从 infra.time_util.TimeUtil 类（静态方法）改为函数式 API。
-- 更 Pythonic（PEP 8 推荐小工具用函数）
-- 命名空间更干净（无需 `TimeUtil.` 前缀）
-- 行为完全兼容
-
 用法：
     from infra.utils.time_util import to_utc_event_time
     utc_dt = to_utc_event_time("2026-08-29", "Asia/Shanghai")

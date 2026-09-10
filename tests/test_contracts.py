@@ -48,10 +48,10 @@ from infra.db.database_model import (
     ObservationBaseModel,
     TimeSeriesBaseModel,
     ObservationBase,
-    TimeUtil,
     JSONBCompatible,
 )
 from infra.exceptions import DatabaseError
+from infra.utils.time_util import to_utc_event_time
 from infra.llm import (
     LLMClient,
     OpenAIClient,
@@ -452,12 +452,12 @@ class TestDatabaseModelContracts:
     def test_observationbase_abstract(self):
         assert ObservationBase.__abstract__ is True
 
-    def test_timeutil_to_utc_event_time_params(self):
-        params = _params(TimeUtil.to_utc_event_time)
+    def test_utc_event_time_params(self):
+        params = _params(to_utc_event_time)
         assert "val" in params
         assert "source_tz" in params
         # 锁默认时区
-        assert inspect.signature(TimeUtil.to_utc_event_time).parameters["source_tz"].default == "UTC"
+        assert inspect.signature(to_utc_event_time).parameters["source_tz"].default == "UTC"
 
     def test_jsonbcompatible_is_type_decorator(self):
         from sqlalchemy.types import TypeDecorator

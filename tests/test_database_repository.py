@@ -1183,3 +1183,72 @@ class TestGetLatestPerGroup:
             assert len(dates) == 5
 
 
+
+# ============================================================
+# query_raw 原生 SQL 查询
+# ============================================================
+class TestQueryRaw:
+    """测试 query_raw 方法"""
+
+    async def test_simple_select(self, repo):
+        """测试基本 SELECT 查询返回 dict 列表"""
+        rows = await repo.query_raw(
+            "SELECT series_id, value FROM test_repository_model WHERE series_id = 'VIXCLS'"
+        )
+        assert len(rows) == 6
+        assert all(isinstance(r, dict) for r in rows)
+        assert all("series_id" in r and "value" in r for r in rows)
+        assert rows[0]["series_id"] == "VIXCLS"
+
+    async def test_params_binding(self, repo):
+        """测试参数绑定防止 SQL 注入"""
+        rows = await repo.query_raw(
+            "SELECT value FROM test_repository_model WHERE series_id = :sid AND value > :threshold",
+            {"sid": "VIXCLS", "threshold": 16.0}
+        )
+        assert len(rows) == 3  # 16.1, 17.3, 16.5
+
+    async def test_aggregate_query(self, repo):
+        """测试聚合查询（GROUP BY + 聚合函数）"""
+        rows = await repo.query_raw(
+            "SELECT series_id, COUNT(*) as cnt, MAX(value) as max_val FROM test_repository_model "
+            "WHERE category = 'fred' GROUP BY series_id ORDER BY series_id"
+        )
+        assert len(rows) == 3
+        cnts = sorted(int(r["cnt"]) for r in rows)
+        assert cnts == [4, 5, 6]
+
+    async def test_pivot_with_case_when(self, repo):
+        """测试 CASE WHEN 条件聚合透视（长表转宽表）"""
+        now = date.today()
+        rows = await repo.query_raw(
+            "SELECT "
+            "MAX(CASE WHEN stat_date = :d1 THEN value END) AS v1, "
+            "MAX(CASE WHEN stat_date = :d2 THEN value END) AS v2 "
+            "FROM test_repository_model WHERE series_id = :sid",
+            {"sid": "VIXCLS", "d1": (now - timedelta(days=1)), "d2": (now - timedelta(days=2))}
+        )
+        assert len(rows) == 1
+        assert "v1" in rows[0]
+        assert "v2" in rows[0]
+
+    async def test_empty_result(self, repo):
+        """测试无结果返回空列表"""
+        rows = await repo.query_raw(
+            "SELECT value FROM test_repository_model WHERE series_id = 'NONEXISTENT'"
+        )
+        assert rows == []
+
+    async def test_insert_via_raw_sql(self, repo):
+        """测试通过原生 SQL 插入数据"""
+        now = date.today()
+        await repo.query_raw(
+            "INSERT INTO test_repository_model (series_id, stat_date, value, category, is_active) "
+            "VALUES (:sid, :sd, :val, :cat, :active)",
+            {"sid": "RAW_INSERT", "sd": now, "val": 999.0, "cat": "test", "active": True}
+        )
+        rows = await repo.query_raw(
+            "SELECT value FROM test_repository_model WHERE series_id = 'RAW_INSERT'"
+        )
+        assert len(rows) == 1
+        assert float(rows[0]["value"]) == 999.0
