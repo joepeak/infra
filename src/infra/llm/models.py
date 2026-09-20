@@ -29,9 +29,8 @@ class LLMRequest(BaseModel):
     retry_config: Optional[Any] = Field(default=None, description="Override retry config for this request (defaults to LLMRetryConfig)")
 
     def to_openai_kwargs(self) -> Dict[str, Any]:
-        """转为 OpenAI 风格 kwargs（messages 必须在最前）。"""
-        kwargs = self.model_dump(exclude_none=True, exclude={"retry_config"})
-        # 显式提取 messages 到最前
+        """转为 OpenAI 风格 kwargs（messages + model 在外层处理，避免重复传参）。"""
+        kwargs = self.model_dump(exclude_none=True, exclude={"retry_config", "model"})
         msgs = kwargs.pop("messages", None)
         if msgs is not None:
             kwargs["messages"] = msgs
