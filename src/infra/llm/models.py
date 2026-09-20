@@ -41,17 +41,47 @@ class LLMRequest(BaseModel):
 class LLMResponse(BaseModel):
     """LLM 响应（统一格式）。"""
     content: str = Field(default="", description="文本内容")
+    reasoning_content: Optional[str] = Field(default=None, description="OpenAI reasoning 字段内容")
     tool_calls: List[Dict[str, Any]] = Field(default_factory=list, description="工具调用列表")
     usage: Dict[str, int] = Field(default_factory=dict, description="token 用量")
     model: Optional[str] = Field(None, description="实际使用的模型名")
     finish_reason: Optional[str] = Field(None)
 
+    @staticmethod
+    def _get_value(source: Any, name: str) -> Any:
+        if isinstance(source, dict):
+            return source.get(name)
+        return getattr(source, name, None)
+
+    @classmethod
+    def _extract_reasoning_content(cls, message: Any) -> Optional[str]:
+        reasoning = cls._get_value(message, "reasoning_content") or cls._get_value(message, "reasoning")
+        if isinstance(reasoning, str) and reasoning.strip():
+            return reasoning
+
+        reasoning_details = cls._get_value(message, "reasoning_details") or []
+        if not reasoning_details:
+            return None
+
+        parts = []
+        for detail in reasoning_details:
+            text = cls._get_value(detail, "text")
+            if isinstance(text, str) and text.strip():
+                parts.append(text)
+        return "\n".join(parts) if parts else None
+
     @classmethod
     def from_openai_response(cls, response: Any) -> "LLMResponse":
         """从 OpenAI 风格响应构造 LLMResponse。"""
         message = response.choices[0].message
+        reasoning_content = cls._extract_reasoning_content(message)
+        content = cls._get_value(message, "content") or ""
+        if not content and reasoning_content:
+            content = reasoning_content
+
         result: Dict[str, Any] = {
-            "content": message.content or "",
+            "content": content,
+            "reasoning_content": reasoning_content,
             "tool_calls": [],
             "model": getattr(response, "model", None),
             "finish_reason": getattr(response.choices[0], "finish_reason", None),

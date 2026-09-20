@@ -150,9 +150,11 @@ class _FakeToolCall:
 
 
 class _FakeMessage:
-    def __init__(self, content=None, tool_calls=None):
+    def __init__(self, content=None, tool_calls=None, reasoning=None, reasoning_details=None):
         self.content = content
         self.tool_calls = tool_calls or []
+        self.reasoning = reasoning
+        self.reasoning_details = reasoning_details or []
 
 
 class _FakeChoice:
@@ -170,8 +172,9 @@ class _FakeUsage:
 
 class _FakeOpenAIResponse:
     def __init__(self, content=None, tool_calls=None, model="gpt-4",
-                 finish_reason="stop", usage=None):
-        self.choices = [_FakeChoice(_FakeMessage(content, tool_calls), finish_reason)]
+                 finish_reason="stop", usage=None, reasoning=None,
+                 reasoning_details=None):
+        self.choices = [_FakeChoice(_FakeMessage(content, tool_calls, reasoning, reasoning_details), finish_reason)]
         self.model = model
         self.usage = usage
 
@@ -196,6 +199,36 @@ class TestFromOpenAIResponse:
         resp = _FakeOpenAIResponse(content=None)
         r = LLMResponse.from_openai_response(resp)
         assert r.content == ""
+
+    def test_reasoning_content_becomes_content_when_content_is_empty(self):
+        resp = _FakeOpenAIResponse(
+            content=None,
+            reasoning="这是正文",
+        )
+        r = LLMResponse.from_openai_response(resp)
+        assert r.content == "这是正文"
+        assert r.reasoning_content == "这是正文"
+
+    def test_reasoning_details_become_content_when_content_is_empty(self):
+        resp = _FakeOpenAIResponse(
+            content=None,
+            reasoning_details=[
+                {"type": "reasoning.text", "text": "第一部分"},
+                {"type": "reasoning.text", "text": "第二部分"},
+            ],
+        )
+        r = LLMResponse.from_openai_response(resp)
+        assert r.content == "第一部分\n第二部分"
+        assert r.reasoning_content == "第一部分\n第二部分"
+
+    def test_text_content_takes_precedence_over_reasoning(self):
+        resp = _FakeOpenAIResponse(
+            content="最终正文",
+            reasoning="推理内容",
+        )
+        r = LLMResponse.from_openai_response(resp)
+        assert r.content == "最终正文"
+        assert r.reasoning_content == "推理内容"
 
     def test_response_without_usage(self):
         """response.usage = None → usage = {}。"""
