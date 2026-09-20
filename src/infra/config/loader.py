@@ -57,12 +57,22 @@ class ConfigLoader:
         logger.info(f"配置目录已设置: {self._config_dir}")
     
     def _get_env(self) -> str:
-        """获取当前环境"""
-        env = os.getenv('MACRO_MONITOR_ENV', '')
-        if not env:
-            env = os.getenv('ENVIRONMENT', '')
-        if not env:
-            env = 'dev'
+        """获取当前环境。
+
+        优先级（高→低）：
+          1. MACRO_MONITOR_ENV（历史遗留）
+          2. DRAMACRAFT_ENV（dramacraft 项目专用）
+          3. INFRA_ENV（通用）
+          4. ENVIRONMENT（常见约定）
+          5. 'dev'（默认）
+        """
+        env = (
+            os.getenv("MACRO_MONITOR_ENV", "")
+            or os.getenv("DRAMACRAFT_ENV", "")
+            or os.getenv("INFRA_ENV", "")
+            or os.getenv("ENVIRONMENT", "")
+            or "dev"
+        )
         return env.lower()
     
     def _load_yaml(self, file_path: Path) -> Dict[str, Any]:
@@ -125,6 +135,19 @@ class ConfigLoader:
         
         self._config = merged
         _config_loaded = True
+
+        # DB URL 环境变量覆盖（采纳 dramacraft 设计）：
+        # 允许通过环境变量（如 INFRA_DB_URL / DRAMACRAFT_DB_URL）覆盖 db.url，
+        # 便于测试场景或多项目隔离使用独立 sqlite 文件等。
+        # 优先级：环境变量 > yaml。未配置时不修改。
+        _db_url_override = (
+            os.getenv("INFRA_DB_URL")
+            or os.getenv("DRAMACRAFT_DB_URL")
+            or os.getenv("DB_URL_OVERRIDE")
+        )
+        if _db_url_override:
+            self._config.setdefault("db", {})["url"] = _db_url_override
+            logger.info(f"db.url 已被环境变量覆盖: {_db_url_override}")
 
         logger.info(f"配置加载完成: {list(merged.keys())}")
         return self._config

@@ -5,10 +5,10 @@
 - infra.llm.models：LLMRequest / LLMResponse pydantic
 - infra.llm.retry：LLMRetryConfig（LLM 专用重试配置）
 - infra.llm.usage：进程内 Token 用量聚合（ContextVar + Lock + defaultdict）
+- infra.llm.capabilities：Provider 能力注册表（自动学习 + 主动探测）
 
 用法：
     from infra.llm import init_llm_client, get_llm_client, LLMRequest
-    from pathlib import Path
 
     # 启动时（由 infra.bootstrap 调）
     await init_llm_client(config)
@@ -39,6 +39,12 @@ from infra.llm.usage import (
     set_llm_purpose,
     reset_llm_purpose,
 )
+from infra.llm.capabilities import (
+    ProviderCapabilities,
+    ProviderCapabilityRegistry,
+    get_registry,
+    reset_registry,
+)
 
 
 def _reset_for_test() -> None:
@@ -46,6 +52,7 @@ def _reset_for_test() -> None:
     import infra.llm.client as _client_mod
     _client_mod._llm_client = None
     reset_usage_summary()
+    reset_registry()
 
 
 __all__ = [
@@ -59,4 +66,7 @@ __all__ = [
     # usage
     "record_usage", "get_usage_summary", "reset_usage_summary",
     "log_usage_summary", "set_llm_purpose", "reset_llm_purpose",
+    # capabilities
+    "ProviderCapabilities", "ProviderCapabilityRegistry",
+    "get_registry", "reset_registry",
 ]

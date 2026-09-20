@@ -6,9 +6,12 @@
 - from_openai_response 适配器：OpenAI 响应 → LLMResponse
 - from_anthropic_response：待实现（如果未来要支持）
 """
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union, TYPE_CHECKING
 
 from pydantic import BaseModel, Field
+
+if TYPE_CHECKING:
+    from infra.utils.retry import RetryConfig
 
 
 class LLMRequest(BaseModel):
@@ -22,10 +25,12 @@ class LLMRequest(BaseModel):
     tool_choice: Optional[Union[str, Dict[str, Any]]] = Field(None)
     response_format: Optional[Dict[str, str]] = Field(None, description="response_format（如 OpenAI 的 json_object）")
     timeout: Optional[float] = Field(None, description="单次调用超时（秒）")
+    extra_body: Optional[Dict[str, Any]] = Field(default=None, description="Extra parameters passed to the LLM API (e.g. thinking control for DeepSeek)")
+    retry_config: Optional[Any] = Field(default=None, description="Override retry config for this request (defaults to LLMRetryConfig)")
 
     def to_openai_kwargs(self) -> Dict[str, Any]:
         """转为 OpenAI 风格 kwargs（messages 必须在最前）。"""
-        kwargs = self.model_dump(exclude_none=True)
+        kwargs = self.model_dump(exclude_none=True, exclude={"retry_config"})
         # 显式提取 messages 到最前
         msgs = kwargs.pop("messages", None)
         if msgs is not None:
