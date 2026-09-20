@@ -46,8 +46,10 @@ class LLMClient(ABC):
         self.fallback_model = fallback_model
         self.timeout = timeout
         self.capability_probe = capability_probe
-        # fallback 的 base_url 缺省回落到主 base_url（同端点不同模型）
+        # fallback 的 base_url 缺省回落到主 base_url（同端点不同 key 或同 key 不同模型）
         self.fallback_base_url = fallback_base_url or base_url
+        # fallback 的 API key 缺省使用主 key（同端点不同 key 或同 key 不同模型）
+        self.fallback_api_key = fallback_api_key or api_key
         if retry_config is None:
             retry_config = LLMRetryConfig.default().retry_config.copy(max_retries=max_retries)
         self.retry_config = retry_config
