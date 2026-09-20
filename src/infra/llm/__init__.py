@@ -45,6 +45,14 @@ from infra.llm.client import (
 )
 from infra.llm.models import LLMRequest, LLMResponse
 from infra.llm.retry import LLMRetryConfig
+from infra.llm.postprocess import (
+    is_likely_cot,
+    strip_cot_after_answer,
+    strip_cot_with_fallback,
+    make_cot_aware_processor,
+    default_cot_processor,
+    aggressive_cot_processor,
+)
 from infra.llm.usage import (
     record_usage,
     get_usage_summary,
@@ -77,6 +85,13 @@ __all__ = [
     "LLMRequest", "LLMResponse",
     # retry
     "LLMRetryConfig",
+    # postprocess
+    "is_likely_cot",
+    "strip_cot_after_answer",
+    "strip_cot_with_fallback",
+    "make_cot_aware_processor",
+    "default_cot_processor",
+    "aggressive_cot_processor",
     # usage
     "record_usage", "get_usage_summary", "reset_usage_summary",
     "log_usage_summary", "set_llm_purpose", "reset_llm_purpose",

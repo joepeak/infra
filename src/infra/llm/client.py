@@ -276,8 +276,12 @@ class OpenAIClient(LLMClient):
             f"[OpenAIClient] ainvoke 返回（耗时 {_time.monotonic()-t0:.0f}s, "
             f"model={effective_model}, use_fallback={use_fallback}）"
         )
-        result = LLMResponse.from_openai_response(response)
+        result = LLMResponse.from_openai_response(response, post_processor=request.post_processor)
         self._record_usage_from_response(result)
+        if result.content:
+            get_registry().learn_from_successful_response(
+                provider_base, effective_model, result.content, result.reasoning_content
+            )
         return result
 
     def invoke(self, request: LLMRequest, use_fallback: bool = False) -> LLMResponse:
@@ -321,8 +325,14 @@ class OpenAIClient(LLMClient):
                     f"[OpenAIClient] invoke 失败（耗时 {_time.monotonic()-t0:.0f}s）: {type(e).__name__}: {e}"
                 )
             raise
-        result = LLMResponse.from_openai_response(response)
+        result = LLMResponse.from_openai_response(
+            response, post_processor=request.post_processor
+        )
         self._record_usage_from_response(result)
+        if result.content:
+            get_registry().learn_from_successful_response(
+                provider_base, effective_model, result.content, result.reasoning_content
+            )
         return result
 
     async def astream(self, request: LLMRequest, use_fallback: bool = False) -> Any:
@@ -368,7 +378,7 @@ class OpenAIClient(LLMClient):
                     aggregated_prompt += getattr(chunk.usage, "prompt_tokens", 0) or 0
                     aggregated_completion += getattr(chunk.usage, "completion_tokens", 0) or 0
                     aggregated_total += getattr(chunk.usage, "total_tokens", 0) or 0
-                yield LLMResponse.from_openai_chunk(chunk)
+                yield LLMResponse.from_openai_chunk(chunk, post_processor=request.post_processor)
         finally:
             if stream is not None and hasattr(stream, "aclose"):
                 try:
@@ -424,7 +434,7 @@ class OpenAIClient(LLMClient):
                     aggregated_prompt += getattr(chunk.usage, "prompt_tokens", 0) or 0
                     aggregated_completion += getattr(chunk.usage, "completion_tokens", 0) or 0
                     aggregated_total += getattr(chunk.usage, "total_tokens", 0) or 0
-                yield LLMResponse.from_openai_chunk(chunk)
+                yield LLMResponse.from_openai_chunk(chunk, post_processor=request.post_processor)
             if aggregated_total > 0:
                 self._record_usage_from_response(LLMResponse(
                     usage={

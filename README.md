@@ -97,6 +97,48 @@ async for chunk in client.astream(
 
 支持 OpenAI / DeepSeek / OpenRouter 等任何 OpenAI 兼容 API。
 
+#### Post-processor（链式思考泄露过滤）
+
+通过 `openrouter/free` 等动态路由时，可能命中 `cohere/north-mini-code:free` 这样直接在
+`content` 输出 CoT 的非推理模型。`infra.llm.postprocess` 提供**启发式**检测 + 清洗钩子：
+
+```python
+from infra.llm import LLMRequest, init_llm_client, get_llm_client
+from infra.llm.postprocess import strip_cot_after_answer, is_likely_cot
+
+client = get_llm_client()
+
+# 方式1：在请求时绑定后处理器 —— 自动提取 "Final answer:" 后的内容
+resp = client.invoke(
+    LLMRequest(
+        messages=[{"role": "user", "content": "Generate a post"}],
+        post_processor=strip_cot_after_answer,
+    )
+)
+
+# 方式2：手动检测
+resp = client.invoke(
+    LLMRequest(messages=[{"role": "user", "content": "Hello"}])
+)
+if is_likely_cot(resp.content, resp.reasoning_content):
+    # 触发降级：重试备用模型，或使用确定性模板
+    ...
+```
+
+可用工具：
+
+| 工具 | 策略 | 说明 |
+|---|---|---|
+| `is_likely_cot(content, reasoning_content)` | 检测 | 启发式判断 content 是否含 CoT |
+| `strip_cot_after_answer(content, reasoning)` | 保守 | 仅当检测到 CoT 时，提取 "final answer:" 后内容 |
+| `strip_cot_with_fallback(content, reasoning)` | 激进 | CoT 但无 final answer 标记时，回退到 reasoning_content |
+| `make_cot_aware_processor(aggressive=True, min_length=400)` | 工厂 | 创建自定义后处理器 |
+| `default_cot_processor` | 默认 | `strip_cot_after_answer` 的别名 |
+| `aggressive_cot_processor` | 激进 | `strip_cot_with_fallback` 的别名 |
+
+> ⚠️ 这些检测为**启发式**，不能 100% 可靠。建议与业务层验证 + 降级链搭配使用。
+> `ProviderCapabilityRegistry` 会自动记录 `leaks_cot=True` 的模型，供日志/诊断查看。
+
 ## 设计原则
 
 - **零业务依赖**——`infra` 不引用任何业务包（macro_monitor 等）

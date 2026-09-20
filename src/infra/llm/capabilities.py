@@ -47,6 +47,9 @@ class ProviderCapabilities:
     thinking_param_rejected: Optional[bool] = None
     #: 是否不接受强制 tool_choice（与 thinking 无关的端点限制）。None=未知
     tool_choice_unsupported: Optional[bool] = None
+    #: 模型是否会将 chain-of-thought 文本直接输出到 content 字段（非推理模型常见）。
+    #: None=未知；True=已观测到 CoT 泄露。
+    leaks_cot: Optional[bool] = None
     #: 最近一次学习到的错误摘要（仅供排查用，不参与判定）
     last_error: Optional[str] = None
     #: 数据来源标记：'probe' | 'learn' | None
@@ -62,6 +65,7 @@ class ProviderCapabilities:
         "thinking_conflicts_with_tools",
         "thinking_param_rejected",
         "tool_choice_unsupported",
+        "leaks_cot",
     )
 
 
@@ -138,6 +142,34 @@ class ProviderCapabilityRegistry:
                 caps.supports_tools = False
 
             caps.last_error = (error_message or "")[:200]
+            caps.source = "learn"
+            self._caps[k] = caps
+            return ProviderCapabilities(**caps.as_dict())
+
+    def learn_from_successful_response(
+        self,
+        base_url: Optional[str],
+        model: Optional[str],
+        content: str,
+        reasoning_content: Optional[str] = None,
+    ) -> ProviderCapabilities:
+        """从一次**成功**的 API 响应中学习 —— 若 content 含 CoT，则标记 leaks_cot。
+
+        不同于 learn_from_error（处理 400），此方法处理"请求成功返回但内容不可用"的情况。
+
+        判定依据：
+        - content 非空 + 推测为 CoT → leaks_cot=True
+        - content 清晰（非 CoT）→ leaks_cot 保持原值（不覆盖 False）
+
+        使用 postprocess.is_likely_cot 作为启发式检测器。
+        """
+        from infra.llm.postprocess import is_likely_cot
+
+        with self._lock:
+            k = self.key(base_url, model)
+            caps = self._caps.get(k) or ProviderCapabilities()
+            if is_likely_cot(content, reasoning_content):
+                caps.leaks_cot = True
             caps.source = "learn"
             self._caps[k] = caps
             return ProviderCapabilities(**caps.as_dict())

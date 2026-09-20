@@ -6,9 +6,9 @@
 - from_openai_response 适配器：OpenAI 响应 → LLMResponse
 - from_anthropic_response：待实现（如果未来要支持）
 """
-from typing import Any, Dict, List, Optional, Union, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, Optional, Union, TYPE_CHECKING
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 if TYPE_CHECKING:
     from infra.utils.retry import RetryConfig
@@ -16,6 +16,8 @@ if TYPE_CHECKING:
 
 class LLMRequest(BaseModel):
     """LLM 请求参数（跨 provider 通用）。"""
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     messages: List[Dict[str, Any]] = Field(..., description="消息列表（role + content）")
     model: Optional[str] = Field(None, description="模型名（覆盖默认）")
     temperature: float = Field(default=0.7, ge=0, le=2)
@@ -27,10 +29,14 @@ class LLMRequest(BaseModel):
     timeout: Optional[float] = Field(None, description="单次调用超时（秒）")
     extra_body: Optional[Dict[str, Any]] = Field(default=None, description="Extra parameters passed to the LLM API (e.g. thinking control for DeepSeek)")
     retry_config: Optional[Any] = Field(default=None, description="Override retry config for this request (defaults to LLMRetryConfig)")
+    post_processor: Optional[Callable[[str, Optional[str]], str]] = Field(
+        default=None,
+        description="内容后处理器：接收 (content, reasoning_content)，返回清洗后的字符串，用于过滤 CoT 等",
+    )
 
     def to_openai_kwargs(self) -> Dict[str, Any]:
         """转为 OpenAI 风格 kwargs（messages + model 在外层处理，避免重复传参）。"""
-        kwargs = self.model_dump(exclude_none=True, exclude={"retry_config", "model"})
+        kwargs = self.model_dump(exclude_none=True, exclude={"retry_config", "model", "post_processor"})
         msgs = kwargs.pop("messages", None)
         if msgs is not None:
             kwargs["messages"] = msgs
@@ -69,14 +75,20 @@ class LLMResponse(BaseModel):
                 parts.append(text)
         return "\n".join(parts) if parts else None
 
+
     @classmethod
-    def from_openai_response(cls, response: Any) -> "LLMResponse":
+    def from_openai_response(
+        cls, response: Any, post_processor: Optional[Callable[[str, Optional[str]], str]] = None
+    ) -> "LLMResponse":
         """从 OpenAI 风格响应构造 LLMResponse（完整响应，非流式）。"""
         message = response.choices[0].message
         reasoning_content = cls._extract_reasoning_content(message)
         content = cls._get_value(message, "content") or ""
         if not content and reasoning_content:
             content = reasoning_content
+
+        if post_processor is not None:
+            content = post_processor(content, reasoning_content)
 
         result: Dict[str, Any] = {
             "content": content,
@@ -110,8 +122,13 @@ class LLMResponse(BaseModel):
             ]
         return cls(**result)
 
+
     @classmethod
-    def from_openai_chunk(cls, chunk: Any) -> "LLMResponse":
+    def from_openai_chunk(
+        cls,
+        chunk: Any,
+        post_processor: Optional[Callable[[str, Optional[str]], str]] = None,
+    ) -> "LLMResponse":
         """从 OpenAI 流式响应的单个 chunk 构造 LLMResponse。
 
         流式 chunk 结构不同于完整响应：
@@ -145,6 +162,9 @@ class LLMResponse(BaseModel):
                         },
                     }
                     tool_calls.append(tool_call_data)
+
+        if post_processor is not None:
+            content = post_processor(content, reasoning_content)
 
         result: Dict[str, Any] = {
             "content": content,
