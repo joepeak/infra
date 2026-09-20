@@ -74,13 +74,13 @@ class DatabaseConnectionManager:
             logger.warning(f"数据库配置 {self.db_config_key} 未找到，跳过初始化")
             return {}
 
-        # db_type 优先从子节点读，fallback 到顶层（向后兼容）
-        # 多 db 实例时各自子节点可指定不同 type（PG / SQLite 混合部署）
+        # db_type 优先从 config 子节点的 type 字段读；
+        # 若 type 未显式配置（空字符串""），推迟到 _resolve_url_and_type 从 URL dialect 推断
         db_type = str(
             db_config.get("type",
-                          full_config.get("db_type", "postgresql"))
+                          full_config.get("db_type", ""))
         ).lower()
-        db_config["type"] = db_type  # 下游 _create_engine 直接读
+        db_config["type"] = db_type  # 下游 _resolve_url_and_type/_create_engine 直接读
 
         required_fields = ['host', 'port', 'user', 'password', 'database']
         # 如果使用 URL 直连，则不需要拆分字段
@@ -168,7 +168,7 @@ class DatabaseConnectionManager:
         Returns:
             (db_type, database_url) 元组
         """
-        db_type = str(db_config.get("type", "postgresql")).lower()
+        db_type = str(db_config.get("type", "")).lower()
 
         # 1+2: db.url 路径
         url_value = db_config.get("url")
@@ -178,6 +178,16 @@ class DatabaseConnectionManager:
             url_str = str(url_value)
             has_env_syntax = "${" in url_str
             database_url = self._expand_env_vars(url_str) if has_env_syntax else url_str
+
+        # 若 type 未显式指定（空字符串），从 URL dialect 推断
+        if not db_type and database_url:
+            scheme = database_url.split("://", 1)[0] if "://" in database_url else ""
+            if scheme.startswith("sqlite"):
+                db_type = "sqlite"
+            elif scheme in ("postgres", "postgresql"):
+                db_type = "postgresql"
+            elif scheme in ("mysql", "mysql+aiomysql"):
+                db_type = "mysql"
 
         # 3: yaml 无 url 字段 → 按 type 查环境变量
         if not database_url:
@@ -333,9 +343,8 @@ class DatabaseConnectionManager:
         """创建异步数据库引擎（一次创建——按 db_type 走差异化参数）。
 
         db_type 决定路径：URL 解析 + 引擎参数构建都用 db_type。
-        若 URL 已显式含 dialect 前缀（如 sqlite+aiosqlite://），但 db_type 未配，
-        走 _resolve_url_and_type 时仍按 db_type 拼（不智能识别）——业务 yaml 应
-        显式写 type: sqlite。"""
+        若 type 未显式配置，自 URL dialect 推断（sqlite+aiosqlite → sqlite）。
+        """
         db_config = self.config
         engine_config = db_config.get("engine", {})
 
