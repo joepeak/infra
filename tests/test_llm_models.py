@@ -87,7 +87,8 @@ class TestToOpenAIKwargs:
         )
         kwargs = r.to_openai_kwargs()
         assert kwargs["messages"] == [{"role": "user", "content": "hi"}]
-        assert kwargs["model"] == "gpt-4"
+        # model 由 client 在外层指定（partial(..., model=...)），不进入 kwargs
+        assert "model" not in kwargs
         assert kwargs["temperature"] == 0.5
 
     def test_excludes_none(self):

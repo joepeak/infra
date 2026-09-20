@@ -71,7 +71,7 @@ class LLMResponse(BaseModel):
 
     @classmethod
     def from_openai_response(cls, response: Any) -> "LLMResponse":
-        """从 OpenAI 风格响应构造 LLMResponse。"""
+        """从 OpenAI 风格响应构造 LLMResponse（完整响应，非流式）。"""
         message = response.choices[0].message
         reasoning_content = cls._extract_reasoning_content(message)
         content = cls._get_value(message, "content") or ""
@@ -108,4 +108,59 @@ class LLMResponse(BaseModel):
                 }
                 for tc in message.tool_calls
             ]
+        return cls(**result)
+
+    @classmethod
+    def from_openai_chunk(cls, chunk: Any) -> "LLMResponse":
+        """从 OpenAI 流式响应的单个 chunk 构造 LLMResponse。
+
+        流式 chunk 结构不同于完整响应：
+        - choices[0].delta（而非 .message）
+        - delta 可能只有部分字段（content、role、tool_calls、reasoning_content 等）
+        - usage 通常在最后一个 chunk 中
+        """
+        choice = chunk.choices[0] if chunk.choices else None
+        delta = getattr(choice, "delta", None) if choice else None
+
+        content = ""
+        reasoning_content = None
+        tool_calls = []
+
+        if delta is not None:
+            content = cls._get_value(delta, "content") or ""
+            reasoning_content = cls._extract_reasoning_content(delta)
+            if not content and reasoning_content:
+                content = reasoning_content
+
+            # 流式 tool_calls 增量累加
+            if hasattr(delta, "tool_calls") and delta.tool_calls:
+                for tc in delta.tool_calls:
+                    tool_call_data = {
+                        "index": getattr(tc, "index", 0),
+                        "id": getattr(tc, "id", None),
+                        "type": getattr(tc, "type", "function"),
+                        "function": {
+                            "name": getattr(getattr(tc, "function", None), "name", "") or "",
+                            "arguments": getattr(getattr(tc, "function", None), "arguments", "") or "",
+                        },
+                    }
+                    tool_calls.append(tool_call_data)
+
+        result: Dict[str, Any] = {
+            "content": content,
+            "reasoning_content": reasoning_content,
+            "tool_calls": tool_calls,
+            "model": getattr(chunk, "model", None),
+            "finish_reason": getattr(choice, "finish_reason", None) if choice else None,
+        }
+
+        # token 用量（通常在最后一个 chunk）
+        usage = getattr(chunk, "usage", None)
+        if usage is not None:
+            result["usage"] = {
+                "prompt_tokens": getattr(usage, "prompt_tokens", 0) or 0,
+                "completion_tokens": getattr(usage, "completion_tokens", 0) or 0,
+                "total_tokens": getattr(usage, "total_tokens", 0) or 0,
+            }
+
         return cls(**result)

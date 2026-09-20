@@ -11,6 +11,7 @@
 | `infra.logger` | 日志系统（控制台+文件） |
 | `infra.exceptions` | 异常类（DatabaseError 等）|
 | `infra.data_quality` | `DataQuality` 枚举（8 状态）|
+| `infra.llm` | 通用 LLM 客户端（OpenAI 兼容协议 + fallback + streaming） |
 | `infra.bootstrap` | `bootstrap_all(config_dir)` 一键启动 |
 | `infra.utils` | `retry` / `lark` / `wechat` / `async_helpers` / `executor` / `trend_analyzer` / `common` |
 | `infra.redis` | Redis 客户端（同步/异步）|
@@ -46,6 +47,55 @@ async def main():
 
 asyncio.run(main())
 ```
+
+### LLM 调用
+
+```python
+import asyncio
+from infra.llm import init_llm_client, get_llm_client, LLMRequest
+
+# 方式1：从环境变量/yaml .env 初始化
+config = {
+    "llm": {
+        "api_key": "sk-...",
+        "base_url": "https://api.openai.com/v1",
+        "default_model": "gpt-4o",
+        # 可选 fallback（独立 endpoint/key）
+        "fallback_model": "gpt-3.5-turbo",
+        "fallback_base_url": "https://api.openai.com/v1",
+    }
+}
+await init_llm_client(config)
+
+client = get_llm_client()
+if client is None:
+    raise RuntimeError("LLM 未配置")
+
+# 同步调用
+resp = client.invoke(
+    LLMRequest(messages=[{"role": "user", "content": "Hello"}])
+)
+print(resp.content)
+
+# 异步调用
+resp = await client.ainvoke(
+    LLMRequest(messages=[{"role": "user", "content": "Hello"}])
+)
+
+# 流式调用（同步）
+for chunk in client.stream(
+    LLMRequest(messages=[{"role": "user", "content": "Hello"}], max_tokens=100)
+):
+    print(chunk.content, end="", flush=True)
+
+# 流式调用（异步）
+async for chunk in client.astream(
+    LLMRequest(messages=[{"role": "user", "content": "Hello"}], max_tokens=100)
+):
+    print(chunk.content, end="", flush=True)
+```
+
+支持 OpenAI / DeepSeek / OpenRouter 等任何 OpenAI 兼容 API。
 
 ## 设计原则
 

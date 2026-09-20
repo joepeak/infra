@@ -235,7 +235,8 @@ class TestLLMRequestConversion:
             tool_choice="auto",
         )
         kw = req.to_openai_kwargs()
-        assert kw["model"] == "gpt-4o"
+        # model 由 client 在外层指定（partial(..., model=...)），不进入 kwargs
+        assert "model" not in kw
         assert kw["temperature"] == 0.2
         assert kw["max_tokens"] == 128
         assert kw["response_format"] == {"type": "json_object"}
@@ -397,6 +398,90 @@ class TestOpenAIClientRealAPI:
 
 
 # ============================================================
+# 5b. OpenAIClient 真实 astream / stream（走 .env 真 API）
+# ============================================================
+class TestOpenAIClientStreaming:
+    def _make_client(self, llm_env) -> OpenAIClient:
+        return OpenAIClient(
+            api_key=llm_env["LLM_API_KEY"],
+            base_url=llm_env["LLM_BASE_URL"],
+            model=llm_env["LLM_MODEL"],
+            max_retries=1,
+            timeout=60.0,
+        )
+
+    def _skip_on_billing_error(self, exc: Exception) -> None:
+        from openai import APIStatusError
+        if isinstance(exc, APIStatusError):
+            code = getattr(exc, "status_code", None)
+            if code in (402, 429):
+                pytest.skip(
+                    f"真 LLM 流式调用受限于账户/限流（HTTP {code}）"
+                    f"，请充值或稍后重试。错误：{str(exc)[:120]}"
+                )
+
+    @pytest.mark.asyncio
+    async def test_astream_simple(self, llm_env):
+        """验证 astream 返回 async iterator，逐块产出 LLMResponse。"""
+        if not _has_real_credentials(llm_env):
+            pytest.skip("缺真 LLM_API_KEY / LLM_BASE_URL")
+        client = self._make_client(llm_env)
+        req = LLMRequest(
+            messages=[{"role": "user", "content": "Reply with the word: pong"}],
+            max_tokens=20,
+            temperature=0.0,
+        )
+        try:
+            chunks = []
+            async for chunk in client.astream(req):
+                chunks.append(chunk)
+            assert len(chunks) > 0
+            # 最后一个或多个 chunk 应有内容
+            assert any(c.content for c in chunks) or any(c.reasoning_content for c in chunks)
+        except Exception as e:
+            self._skip_on_billing_error(e)
+            raise
+
+    @pytest.mark.asyncio
+    async def test_astream_yields_llmresponse_type(self, llm_env):
+        """stream 的每个 chunk 都是 LLMResponse 类型。"""
+        if not _has_real_credentials(llm_env):
+            pytest.skip("缺真 LLM_API_KEY / LLM_BASE_URL")
+        client = self._make_client(llm_env)
+        req = LLMRequest(
+            messages=[{"role": "user", "content": "say hi"}],
+            max_tokens=10,
+            temperature=0.0,
+        )
+        try:
+            async for chunk in client.astream(req):
+                assert isinstance(chunk, LLMResponse)
+            # 如果没报错就说明类型正确
+        except Exception as e:
+            self._skip_on_billing_error(e)
+            raise
+
+    def test_stream_sync(self, llm_env):
+        """验证 stream 返回 iterator，逐块产出 LLMResponse。"""
+        if not _has_real_credentials(llm_env):
+            pytest.skip("缺真 LLM_API_KEY / LLM_BASE_URL")
+        client = self._make_client(llm_env)
+        req = LLMRequest(
+            messages=[{"role": "user", "content": "say hi"}],
+            max_tokens=10,
+            temperature=0.0,
+        )
+        try:
+            chunks = list(client.stream(req))
+            assert len(chunks) > 0
+            for chunk in chunks:
+                assert isinstance(chunk, LLMResponse)
+        except Exception as e:
+            self._skip_on_billing_error(e)
+            raise
+
+
+# ============================================================
 # 6. 重试 deny 行为（认证错不重试）
 # ============================================================
 class TestRetryDenyBehavior:
@@ -449,3 +534,10 @@ class TestAbstractBase:
     def test_cannot_instantiate_abstract(self):
         with pytest.raises(TypeError, match="abstract"):
             LLMClient(api_key="x")
+
+    def test_abstract_requires_streaming_methods(self):
+        """抽象基类声明了 astream / stream，子类必须实现。"""
+        assert hasattr(LLMClient, "astream")
+        assert hasattr(LLMClient, "stream")
+        assert getattr(LLMClient, "astream").__isabstractmethod__
+        assert getattr(LLMClient, "stream").__isabstractmethod__

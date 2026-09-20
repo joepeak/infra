@@ -156,6 +156,14 @@ class LLMClient(ABC):
     def invoke(self, request: LLMRequest, use_fallback: bool = False) -> LLMResponse:
         """同步调用——子类必须实现。"""
 
+    @abstractmethod
+    async def astream(self, request: LLMRequest, use_fallback: bool = False) -> Any:
+        """异步流式调用——返回流式响应迭代器。子类必须实现。"""
+
+    @abstractmethod
+    def stream(self, request: LLMRequest, use_fallback: bool = False) -> Any:
+        """同步流式调用——返回流式响应迭代器。子类必须实现。"""
+
     def _record_usage_from_response(self, response: LLMResponse) -> None:
         """记录 token 用量——子类 ainvoke/invoke 后调用。"""
         if response.usage:
@@ -281,7 +289,7 @@ class OpenAIClient(LLMClient):
         cfg = request.retry_config or self.retry_config
         kwargs = request.to_openai_kwargs()
 
-        client = self._client_for(use_fallback)
+        client = self._sync_client if not use_fallback else self._fallback_sync_client
         effective_model = request.model or (self.fallback_model if use_fallback else None) or self.default_model
         provider_base = self.provider_base_url(use_fallback)
 
@@ -317,10 +325,117 @@ class OpenAIClient(LLMClient):
         self._record_usage_from_response(result)
         return result
 
+    async def astream(self, request: LLMRequest, use_fallback: bool = False) -> Any:
+        """Asynchronous streaming invocation.
 
-# ===========================================================================
-# Factory
-# ===========================================================================
+        Returns an async iterator yielding LLMResponse objects for each
+        incremental chunk from the provider. Token usage is accumulated
+        and a final LLMResponse with aggregated usage is yielded at the end.
+
+        use_fallback=True 时走 fallback provider。
+        """
+        kwargs = request.to_openai_kwargs()
+
+        client = self._client_for(use_fallback)
+        effective_model = request.model or (self.fallback_model if use_fallback else None) or self.default_model
+        provider_base = self.provider_base_url(use_fallback)
+
+        _extra = kwargs.get("extra_body")
+        if isinstance(_extra, dict) and "thinking" in _extra:
+            _caps = get_registry().get(provider_base, effective_model)
+            if _caps.thinking_param_rejected:
+                _extra = {k: v for k, v in _extra.items() if k != "thinking"}
+                kwargs["extra_body"] = _extra or None
+                logger.info(
+                    f"[OpenAIClient] {effective_model} 已确认拒收 thinking 参数，本次调用自动剔除。"
+                )
+
+        kwargs["stream"] = True
+
+        t0 = _time.monotonic()
+        aggregated_prompt = 0
+        aggregated_completion = 0
+        aggregated_total = 0
+        stream = None
+
+        try:
+            stream = await client.chat.completions.create(
+                model=effective_model,
+                **kwargs,
+            )
+            async for chunk in stream:
+                if chunk.usage:
+                    aggregated_prompt += getattr(chunk.usage, "prompt_tokens", 0) or 0
+                    aggregated_completion += getattr(chunk.usage, "completion_tokens", 0) or 0
+                    aggregated_total += getattr(chunk.usage, "total_tokens", 0) or 0
+                yield LLMResponse.from_openai_chunk(chunk)
+        finally:
+            if stream is not None and hasattr(stream, "aclose"):
+                try:
+                    await stream.aclose()
+                except Exception:
+                    pass
+
+        if aggregated_total > 0:
+            self._record_usage_from_response(LLMResponse(
+                usage={
+                    "prompt_tokens": aggregated_prompt,
+                    "completion_tokens": aggregated_completion,
+                    "total_tokens": aggregated_total,
+                }
+            ))  # type: ignore[call-arg]
+        logger.info(
+            f"[OpenAIClient] astream 返回（耗时 {_time.monotonic()-t0:.0f}s, "
+            f"model={effective_model}, use_fallback={use_fallback}）"
+        )
+
+    def stream(self, request: LLMRequest, use_fallback: bool = False) -> Any:
+        """Synchronous streaming invocation.
+
+        Returns an iterator yielding LLMResponse objects for each incremental chunk.
+
+        use_fallback=True 时走 fallback provider。
+        """
+        kwargs = request.to_openai_kwargs()
+
+        client = self._sync_client if not use_fallback else self._fallback_sync_client
+        effective_model = request.model or (self.fallback_model if use_fallback else None) or self.default_model
+        provider_base = self.provider_base_url(use_fallback)
+
+        _extra = kwargs.get("extra_body")
+        if isinstance(_extra, dict) and "thinking" in _extra:
+            _caps = get_registry().get(provider_base, effective_model)
+            if _caps.thinking_param_rejected:
+                _extra = {k: v for k, v in _extra.items() if k != "thinking"}
+                kwargs["extra_body"] = _extra or None
+
+        kwargs["stream"] = True
+
+        def _sync_iter() -> Any:
+            stream = client.chat.completions.create(
+                model=effective_model,
+                **kwargs,
+            )
+            aggregated_prompt = 0
+            aggregated_completion = 0
+            aggregated_total = 0
+            for chunk in stream:
+                if chunk.usage:
+                    aggregated_prompt += getattr(chunk.usage, "prompt_tokens", 0) or 0
+                    aggregated_completion += getattr(chunk.usage, "completion_tokens", 0) or 0
+                    aggregated_total += getattr(chunk.usage, "total_tokens", 0) or 0
+                yield LLMResponse.from_openai_chunk(chunk)
+            if aggregated_total > 0:
+                self._record_usage_from_response(LLMResponse(
+                    usage={
+                        "prompt_tokens": aggregated_prompt,
+                        "completion_tokens": aggregated_completion,
+                        "total_tokens": aggregated_total,
+                    }
+                ))  # type: ignore[call-arg]
+
+        return _sync_iter()
+
 
 class LLMFactory:
     """LLM 工厂——按 config['provider'] 选 provider 客户端。"""

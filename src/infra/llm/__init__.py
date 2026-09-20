@@ -17,10 +17,24 @@
     client = get_llm_client()
     if client is None:
         raise RuntimeError("LLM 未配置")
-    response = await client.ainvoke(
+
+    # 同步调用
+    response = client.invoke(
         LLMRequest(messages=[{"role": "user", "content": "hello"}])
     )
     print(response.content)
+
+    # 流式调用（异步）
+    async for chunk in client.astream(
+        LLMRequest(messages=[{"role": "user", "content": "hello"}])
+    ):
+        print(chunk.content)
+
+    # 流式调用（同步）
+    for chunk in client.stream(
+        LLMRequest(messages=[{"role": "user", "content": "hello"}])
+    ):
+        print(chunk.content)
 """
 from infra.llm.client import (
     LLMClient,
