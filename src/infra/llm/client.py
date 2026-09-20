@@ -15,7 +15,7 @@ from abc import ABC, abstractmethod
 from functools import partial
 from typing import Any, Optional, Callable
 
-from infra.utils.retry import RetryConfig
+from infra.utils.retry import RetryConfig, retry_async
 from infra.llm.models import LLMRequest, LLMResponse
 from infra.llm.usage import record_usage
 from infra.llm.retry import LLMRetryConfig
