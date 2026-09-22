@@ -72,21 +72,26 @@ def _extract_cooldown(error_msg: str) -> Optional[float]:
     return None
 
 @retry_async_deco(config=RetryConfig.default().copy(max_retries=5))
-async def send_to_wechat(message: str, timeout: int = 180) -> bool:
+async def send_to_wechat(message: str, timeout: int = 180, url: Optional[str] = None) -> bool:
     """
     发送消息到微信（纯粹 HTTP 层）
 
     Args:
         message: 消息内容
         timeout: 超时时间（秒）
+        url: 自定义发送地址，为空时从 HERMES_WECHAT_URL 环境变量读取，
+             仍为空则使用默认地址 http://172.17.0.1:9090/send
 
     Returns:
         是否发送成功
     """
+    if url is None:
+        import os
+        url = os.environ.get("HERMES_WECHAT_URL", "http://172.17.0.1:9090/send")
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                'http://172.17.0.1:9090/send',
+                url,
                 json={'message': message},
                 timeout=aiohttp.ClientTimeout(total=timeout)
             ) as resp:
