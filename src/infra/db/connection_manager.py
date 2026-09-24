@@ -121,21 +121,24 @@ class DatabaseConnectionManager:
 
     @staticmethod
     def _expand_env_vars(value: Any) -> Any:
-        """展开字符串中的 ${VAR} 形式环境变量（来自 .env / 系统环境）。
+        """展开字符串中的 ${VAR} 或 ${VAR:default} 形式环境变量。
 
-        未定义的变量保留原样——不阻断启动，便于排查配置遗漏。
+        未定义的变量且无 default 时保留占位符，以便排查配置遗漏。
+        （配置加载器层已做全局解析，此处为防御性兜底。）
         """
         if not isinstance(value, str):
             return value
         import re
-        pattern = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+        pattern = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::([^}]*))?\}")
 
         def _sub(m: "re.Match") -> str:
-            var = m.group(1)
+            var, default = m.group(1), m.group(2)
             val = os.getenv(var)
             if val is None:
+                if default is not None:
+                    return default
                 logger.warning(f"环境变量 {var} 未定义（.env 或系统环境），保留占位符")
-                return m.group(0)  # type: ignore[no-any-return]
+                return m.group(0)  # type: ignore[return-value]
             return val
 
         return pattern.sub(_sub, value)

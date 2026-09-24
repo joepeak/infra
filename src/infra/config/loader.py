@@ -7,6 +7,7 @@
 
 import os
 import copy
+import re
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 import yaml
@@ -14,6 +15,9 @@ import yaml
 from infra.logger import get_logger
 
 logger = get_logger(__name__)
+
+# Matches ${VAR} and ${VAR:default} patterns
+_ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::([^}]*))?\}")
 
 # 固定的配置文件名
 DEFAULT_CONFIG_FILES = ["config.yaml", "jobs.yaml"]
@@ -24,24 +28,46 @@ _config_loaded = False
 
 class ConfigLoader:
     """配置加载器（单例）"""
-    
+
     _instance = None
-    
+
+    # Matches ${VAR} and ${VAR:default} patterns
+    _ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::([^}]*))?\}")
+
     def __new__(cls) -> "ConfigLoader":
         if cls._instance is None:
             cls._instance = super().__new__(cls)
         if cls._instance is None:
             cls._instance = super().__new__(cls)
         return cls._instance
-    
+
     def __init__(self) -> None:
         if hasattr(self, '_initialized'):
             return
-        
+
         self._initialized = True
         self._config_dir: Optional[Path] = None
         self._config: Dict[str, Any] = {}
         logger.info("配置加载器已创建")
+
+    @classmethod
+    def _resolve_env_value(cls, value: str) -> str:
+        """Resolve a single string with ${VAR} or ${VAR:default} placeholders."""
+        def _sub(m):
+            var_name, default = m.group(1), m.group(2)
+            return os.getenv(var_name, default if default is not None else "")
+        return cls._ENV_PATTERN.sub(_sub, value)
+
+    @classmethod
+    def _resolve_env_vars(cls, obj: Any) -> Any:
+        """Recursively resolve ${VAR:default} placeholders in all string values."""
+        if isinstance(obj, str):
+            return cls._resolve_env_value(obj)
+        if isinstance(obj, dict):
+            return {k: cls._resolve_env_vars(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [cls._resolve_env_vars(v) for v in obj]
+        return obj
     
     def configure(self, config_dir: Path) -> None:
         """
@@ -135,6 +161,10 @@ class ConfigLoader:
         
         self._config = merged
         _config_loaded = True
+
+        # Resolve ${VAR} and ${VAR:default} placeholders from the environment
+        # for all string values in the merged config.
+        self._config = self._resolve_env_vars(self._config)
 
         # DB URL 环境变量覆盖（采纳 dramacraft 设计）：
         # 允许通过环境变量（如 INFRA_DB_URL / DRAMACRAFT_DB_URL）覆盖 db.url，
