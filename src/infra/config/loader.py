@@ -162,22 +162,10 @@ class ConfigLoader:
         self._config = merged
         _config_loaded = True
 
-        # Resolve ${VAR} and ${VAR:default} placeholders from the environment
-        # for all string values in the merged config.
+        # Resolve ${VAR} placeholders from the environment for all string
+        # values in the merged config. YAML values like "${POSTGRES_URL}"
+        # are resolved here; missing vars become empty strings.
         self._config = self._resolve_env_vars(self._config)
-
-        # DB URL 环境变量覆盖（采纳 dramacraft 设计）：
-        # 允许通过环境变量（如 INFRA_DB_URL / DRAMACRAFT_DB_URL）覆盖 db.url，
-        # 便于测试场景或多项目隔离使用独立 sqlite 文件等。
-        # 优先级：环境变量 > yaml。未配置时不修改。
-        _db_url_override = (
-            os.getenv("INFRA_DB_URL")
-            or os.getenv("DRAMACRAFT_DB_URL")
-            or os.getenv("DB_URL_OVERRIDE")
-        )
-        if _db_url_override:
-            self._config.setdefault("db", {})["url"] = _db_url_override
-            logger.info(f"db.url 已被环境变量覆盖: {_db_url_override}")
 
         logger.info(f"配置加载完成: {list(merged.keys())}")
         return self._config
