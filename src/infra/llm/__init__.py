@@ -42,7 +42,14 @@ from infra.llm.client import (
     LLMFactory,
     init_llm_client,
     get_llm_client,
+    MediaClient,
+    OpenAIMediaClient,
+    MediaFactory,
+    init_media_client,
+    get_media_client,
 )
+from infra.llm.models import LLMRequest, LLMResponse, MediaRequest, MediaResponse, Modality
+from infra.llm.models import ImageResult, VideoResult, AudioResult
 from infra.llm.models import LLMRequest, LLMResponse
 from infra.llm.retry import LLMRetryConfig
 from infra.llm.postprocess import (
@@ -70,9 +77,10 @@ from infra.llm.capabilities import (
 
 
 def _reset_for_test() -> None:
-    """测试用——重置全局 LLM 单例。"""
+    """测试用——重置全局 LLM 单例与媒体单例。"""
     import infra.llm.client as _client_mod
     _client_mod._llm_client = None
+    _client_mod._media_client = None
     reset_usage_summary()
     reset_registry()
 
@@ -81,8 +89,12 @@ __all__ = [
     # client
     "LLMClient", "OpenAIClient", "LLMFactory",
     "init_llm_client", "get_llm_client",
+    # media
+    "MediaClient", "OpenAIMediaClient", "MediaFactory",
+    "init_media_client", "get_media_client",
     # models
-    "LLMRequest", "LLMResponse",
+    "LLMRequest", "LLMResponse", "MediaRequest", "MediaResponse", "Modality",
+    "ImageResult", "VideoResult", "AudioResult",
     # retry
     "LLMRetryConfig",
     # postprocess

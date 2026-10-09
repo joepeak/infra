@@ -6,12 +6,14 @@
 - from_openai_response 适配器：OpenAI 响应 → LLMResponse
 - from_anthropic_response：待实现（如果未来要支持）
 """
-from typing import Any, Callable, Dict, List, Optional, Union, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, Optional, Union, TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
 if TYPE_CHECKING:
     from infra.utils.retry import RetryConfig
+
+Modality = Literal["text", "image", "video", "audio"]
 
 
 class LLMRequest(BaseModel):
@@ -33,10 +35,11 @@ class LLMRequest(BaseModel):
         default=None,
         description="内容后处理器：接收 (content, reasoning_content)，返回清洗后的字符串，用于过滤 CoT 等",
     )
+    modality: Modality = Field(default="text", description="请求模态：text|image|video|audio")
 
     def to_openai_kwargs(self) -> Dict[str, Any]:
         """转为 OpenAI 风格 kwargs（messages + model 在外层处理，避免重复传参）。"""
-        kwargs = self.model_dump(exclude_none=True, exclude={"retry_config", "model", "post_processor"})
+        kwargs = self.model_dump(exclude_none=True, exclude={"retry_config", "model", "post_processor", "modality"})
         msgs = kwargs.pop("messages", None)
         if msgs is not None:
             kwargs["messages"] = msgs
@@ -184,3 +187,75 @@ class LLMResponse(BaseModel):
             }
 
         return cls(**result)
+
+
+class MediaRequest(BaseModel):
+    """Multimodal generation request (image / video / audio).
+
+    Mirrors OpenAI-compatible media endpoints (DALL·E, Seedream, etc.).
+    Only ``prompt`` is universally required; provider-specific fields (size,
+    quality, n, reference images, seed) are passed through ``extra_body``.
+    """
+    model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)
+    if TYPE_CHECKING:
+        from infra.utils.retry import RetryConfig
+
+    prompt: str = Field(..., description="Text prompt describing the desired output")
+    model: Optional[str] = Field(None, description="Model name override")
+    modality: Modality = Field("text", description="Generation modality")
+    size: Optional[str] = Field(None, description="Output size, e.g. '1024x768'")
+    quality: Optional[str] = Field(None, description="Quality hint (e.g. 'standard' / 'hd')")
+    n: int = Field(default=1, description="Number of images to generate (image modality)")
+    reference_images: Optional[List[str]] = Field(default=None, description="URL list of reference images")
+    seed: Optional[int] = Field(None, description="Random seed (if supported by provider)")
+    response_format: Optional[str] = Field(default="url", description="b64_json | url")
+    extra_body: Optional[Dict[str, Any]] = Field(default=None, description="Provider-specific extras")
+    timeout: Optional[float] = Field(None, description="Per-call timeout (seconds)")
+    retry_config: Optional[Any] = Field(default=None, description="Override retry config (defaults to MediaClient.retry_config)")
+
+
+class MediaResponse(BaseModel):
+    """Unified media generation response."""
+    model_config = ConfigDict(existing_data_ok=True)
+
+    modality: Modality = Field(default="text", description="The modality that was generated")
+    model: Optional[str] = Field(None, description="Actual model name returned by provider")
+    images: List["ImageResult"] = Field(default_factory=list, description="Generated image results (image modality)")
+    videos: List["VideoResult"] = Field(default_factory=list, description="Video task results (video modality)")
+    audios: List["AudioResult"] = Field(default_factory=list, description="Audio results (audio modality)")
+
+
+class ImageResult(BaseModel):
+    """A single generated image."""
+    model_config = ConfigDict(existing_data_ok=True)
+
+    url: Optional[str] = Field(None, description="Publicly reachable URL to the image")
+    b64_json: Optional[str] = Field(None, description="Base64-encoded image data (when response_format=b64_json)")
+    revised_prompt: Optional[str] = Field(None, description="Provider-refined prompt (DALL·E)")
+    seed: Optional[int] = Field(None, description="Seed used for generation (for reproducibility)")
+
+
+class VideoResult(BaseModel):
+    """A video generation task (async, 4-10 minutes)."""
+
+    task_id: Optional[str] = Field(None, description="Task ID for polling status")
+    status: str = Field("pending", description="pending | running | completed | failed | cancelled")
+    video_url: Optional[str] = Field(None, description="Final video URL once completed")
+    thumbnail_url: Optional[str] = Field(None, description="Thumbnail URL")
+    progress: Optional[float] = Field(None, description="Progress 0.0–1.0 (if supported)")
+    error: Optional[str] = Field(None, description="Error message if status=failed")
+    estimated_remaining_seconds: Optional[int] = Field(None, description="ETA when running")
+
+
+class AudioResult(BaseModel):
+    """A single generated audio output."""
+    model_config = ConfigDict(existing_data_ok=True)
+
+    url: Optional[str] = Field(None, description="Publicly reachable URL to the audio")
+    b64_json: Optional[str] = Field(None, description="Base64-encoded audio data (when response_format=b64_json)")
+    duration_seconds: Optional[float] = Field(None, description="Duration of the audio in seconds")
+    voice: Optional[str] = Field(None, description="Voice identifier used")
+    seed: Optional[int] = Field(None, description="Seed used for generation (for reproducibility)")
+
+
+MediaResponse.model_rebuild()

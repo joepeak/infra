@@ -15,8 +15,17 @@ from abc import ABC, abstractmethod
 from functools import partial
 from typing import Any, Optional, Callable
 
-from infra.utils.retry import RetryConfig, retry_async
-from infra.llm.models import LLMRequest, LLMResponse
+from infra.utils.retry import RetryConfig, retry_async, retry_sync
+from infra.llm.models import (
+    LLMRequest,
+    LLMResponse,
+    MediaRequest,
+    MediaResponse,
+    Modality,
+    ImageResult,
+    VideoResult,
+    AudioResult,
+)
 from infra.llm.usage import record_usage
 from infra.llm.retry import LLMRetryConfig
 from infra.llm.capabilities import get_registry, ProviderCapabilities, reset_registry
@@ -486,6 +495,511 @@ class LLMFactory:
         raise ValueError(
             f"unsupported provider: {provider}（已实现：openai；待扩展：anthropic/deepseek/local）"
         )
+
+
+# ===========================================================================
+# Media Client (image / video / audio generation)
+# ===========================================================================
+
+class MediaClient(ABC):
+    """Abstract media-generation client.
+
+    Extends the LLM text client with image, video and audio generation
+    capabilities. Providers that only do text will raise ``NotImplementedError``
+    on media methods — callers must check ``provider_media_capabilities``.
+    """
+
+    def __init__(
+        self,
+        api_key: str,
+        base_url: Optional[str] = None,
+        image_model: str = "dall-e-3",
+        video_model: Optional[str] = None,
+        audio_model: Optional[str] = None,
+        max_retries: int = 3,
+        timeout: float = 120.0,
+        retry_config: Optional[RetryConfig] = None,
+        provider: str = "openai",
+    ):
+        self.api_key = api_key
+        self.base_url = base_url
+        self.image_model = image_model
+        self.video_model = video_model
+        self.audio_model = audio_model
+        self.timeout = timeout
+        self._provider = provider
+        if retry_config is None:
+            retry_config = LLMRetryConfig.default().retry_config.copy(max_retries=max_retries)
+        self.retry_config = retry_config
+        self._initialize_media_provider()
+
+    @abstractmethod
+    def _initialize_media_provider(self) -> None:
+        """子类初始化媒体生成 provider 客户端（如 AsyncOpenAI）。"""
+
+    @property
+    @abstractmethod
+    def provider(self) -> str:
+        """Provider 名（'openai' / 'seedream' / 'tokenfree' 等）。"""
+
+    @property
+    def provider_media_capabilities(self) -> ProviderCapabilities:
+        """返回该 provider 的媒体能力画像。"""
+        return get_registry().get(self.base_url, None)
+
+    @abstractmethod
+    async def generate_image(
+        self, request: MediaRequest, use_fallback: bool = False
+    ) -> MediaResponse:
+        """Generate an image from a text prompt."""
+
+    @abstractmethod
+    def generate_image_sync(
+        self, request: MediaRequest, use_fallback: bool = False
+    ) -> MediaResponse:
+        """Synchronous image generation."""
+
+    async def generate_video(
+        self, request: MediaRequest, use_fallback: bool = False
+    ) -> MediaResponse:
+        """Submit a video generation task (async, returns task_id)."""
+        raise NotImplementedError(
+            f"{self.provider} does not support video generation"
+        )
+
+    async def poll_video(
+        self, task_id: str, use_fallback: bool = False, interval: float = 10.0, max_wait: float = 600.0
+    ) -> MediaResponse:
+        """Poll a video task until completion or timeout."""
+        raise NotImplementedError(
+            f"{self.provider} does not support video polling"
+        )
+
+    async def synthesize_audio(
+        self, request: MediaRequest, use_fallback: bool = False
+    ) -> MediaResponse:
+        """Synthesize speech/audio from text."""
+        raise NotImplementedError(
+            f"{self.provider} does not support audio synthesis"
+        )
+
+    def _record_media_usage(self, modality: str) -> None:
+        """Record a media generation call for usage tracking."""
+        record_usage({"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}, purpose=f"media_{modality}")
+
+
+class OpenAIMediaClient(MediaClient):
+    """OpenAI-compatible media client (DALL·E, Seedream, etc.).
+
+    Uses the OpenAI SDK's ``images`` namespace for image generation and
+    ``chat.completions`` for text-to-speech / music. Video endpoints are
+    provider-specific and must be passed via ``extra_body`` or overridden.
+    """
+
+    def _initialize_media_provider(self) -> None:
+        from openai import OpenAI, AsyncOpenAI
+
+        kwargs: dict = {"api_key": self.api_key, "timeout": self.timeout}
+        if self.base_url:
+            kwargs["base_url"] = self.base_url
+        self._sync_client = OpenAI(**kwargs)  # type: ignore[arg-type]
+        self._async_client = AsyncOpenAI(**kwargs)  # type: ignore[arg-type]
+
+    @property
+    def provider(self) -> str:
+        return self._provider
+
+    async def _generate_image_async(self, request: MediaRequest, use_fallback: bool = False) -> MediaResponse:
+        cfg = request.retry_config or self.retry_config
+        client = self._async_client
+        model = request.model or self.image_model
+
+        api_kwargs: dict = {"model": model, "prompt": request.prompt, "n": request.n}
+        if request.size:
+            api_kwargs["size"] = request.size
+        if request.quality:
+            api_kwargs["quality"] = request.quality
+        if request.response_format:
+            api_kwargs["response_format"] = request.response_format
+        if request.reference_images:
+            api_kwargs["extra_image_urls"] = request.reference_images
+        if request.seed is not None:
+            api_kwargs["seed"] = request.seed
+        if request.extra_body:
+            api_kwargs.update(request.extra_body)
+
+        async def _do_call() -> Any:
+            return await client.images.generate(**api_kwargs)
+
+        t0 = _time.monotonic()
+        try:
+            response = await retry_async(_do_call, config=cfg)
+        except Exception as e:
+            logger.error(
+                f"[OpenAIMediaClient] image generation failed (model={model}): "
+                f"{type(e).__name__}: {e}"
+            )
+            raise
+        elapsed = _time.monotonic() - t0
+
+        images = []
+        data_list = getattr(response, "data", None) or []
+        for item in data_list:
+            images.append(
+                ImageResult(
+                    url=getattr(item, "url", None),
+                    b64_json=getattr(item, "b64_json", None),
+                    revised_prompt=getattr(item, "revised_prompt", None),
+                    seed=request.seed,
+                )
+            )
+
+        self._record_media_usage("image")
+        logger.info(
+            f"[OpenAIMediaClient] generated {len(images)} image(s) in {elapsed:.1f}s "
+            f"with model={model}"
+        )
+        return MediaResponse(
+            modality="image",
+            model=model,
+            images=images,
+        )
+
+    def _generate_image_sync(self, request: MediaRequest, use_fallback: bool = False) -> MediaResponse:
+        client = self._sync_client
+        model = request.model or self.image_model
+
+        api_kwargs: dict = {"model": model, "prompt": request.prompt, "n": request.n}
+        if request.size:
+            api_kwargs["size"] = request.size
+        if request.quality:
+            api_kwargs["quality"] = request.quality
+        if request.response_format:
+            api_kwargs["response_format"] = request.response_format
+        if request.reference_images:
+            api_kwargs["extra_image_urls"] = request.reference_images
+        if request.seed is not None:
+            api_kwargs["seed"] = request.seed
+        if request.extra_body:
+            api_kwargs.update(request.extra_body)
+
+        cfg = request.retry_config or self.retry_config
+        t0 = _time.monotonic()
+        try:
+            response = retry_sync(lambda: client.images.generate(**api_kwargs), config=cfg)
+        except Exception as e:
+            logger.error(
+                f"[OpenAIMediaClient] image generation (sync) failed (model={model}): "
+                f"{type(e).__name__}: {e}"
+            )
+            raise
+        elapsed = _time.monotonic() - t0
+
+        images = []
+        data_list = getattr(response, "data", None) or []
+        for item in data_list:
+            images.append(
+                ImageResult(
+                    url=getattr(item, "url", None),
+                    b64_json=getattr(item, "b64_json", None),
+                    revised_prompt=getattr(item, "revised_prompt", None),
+                    seed=request.seed,
+                )
+            )
+
+        self._record_media_usage("image")
+        logger.info(
+            f"[OpenAIMediaClient] generated {len(images)} image(s) in {elapsed:.1f}s "
+            f"with model={model}"
+        )
+        return MediaResponse(
+            modality="image",
+            model=model,
+            images=images,
+        )
+
+    async def generate_image(
+        self, request: MediaRequest, use_fallback: bool = False
+    ) -> MediaResponse:
+        return await self._generate_image_async(request, use_fallback)
+
+    def generate_image_sync(
+        self, request: MediaRequest, use_fallback: bool = False
+    ) -> MediaResponse:
+        return self._generate_image_sync(request, use_fallback)
+
+    async def generate_video(
+        self, request: MediaRequest, use_fallback: bool = False
+    ) -> MediaResponse:
+        """Seedance/WanX-style video generation via OpenAI-compatible endpoint.
+
+        Uses ``extra_body`` for provider-specific parameters (e.g., ``prompt'',
+        ``image_url'', ``duration'' for Seedance). The first call submits a task
+        and returns a ``task_id``; use ``poll_video`` to check completion.
+        """
+        model = request.model or self.video_model
+        if not model:
+            raise ValueError("video_model not configured for this MediaClient")
+
+        api_kwargs: dict = {"model": model}
+        if request.extra_body:
+            api_kwargs.update(request.extra_body)
+
+        client = self._async_client
+        cfg = request.retry_config or self.retry_config
+
+        t0 = _time.monotonic()
+        try:
+            response = await retry_async(
+                lambda: client.video.generate(**api_kwargs), config=cfg
+            )
+        except AttributeError:
+            # Provider may not have video.generate — check if it uses chat-based video
+            response = await retry_async(
+                lambda: client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": request.prompt}],
+                    max_tokens=100,
+                    extra_body=api_kwargs.get("extra_body"),
+                ),
+                config=cfg,
+            )
+
+        elapsed = _time.monotonic() - t0
+        task_id = getattr(response, "id", None) or getattr(response, "task_id", None)
+
+        self._record_media_usage("video")
+        logger.info(
+            f"[OpenAIMediaClient] submitted video task {task_id} in {elapsed:.1f}s "
+            f"with model={model}"
+        )
+        return MediaResponse(
+            modality="video",
+            model=model,
+            videos=[VideoResult(task_id=task_id, status="pending")],
+        )
+
+    async def poll_video(
+        self, task_id: str, use_fallback: bool = False, interval: float = 10.0, max_wait: float = 600.0
+    ) -> MediaResponse:
+        """Poll a video-task endpoint (provider-specific path via extra_body)."""
+        client = self._async_client
+        elapsed = 0.0
+
+        while elapsed < max_wait:
+            try:
+                # Try the dedicated video/tasks endpoint first
+                response = await client.video.tasks.retrieve(task_id)  # type: ignore[union-attr]
+            except Exception:
+                # Fall back to a chat-based polling
+                response = await client.chat.completions.create(  # type: ignore[union-attr]
+                    model=self.video_model or "video-poll",
+                    messages=[{"role": "user", "content": "poll"}],
+                    extra_body={"task_id": task_id},
+                )
+
+            status = getattr(response, "status", None)
+            if status == "completed" or getattr(response, "completed", False):
+                video_url = getattr(response, "video_url", None) or getattr(
+                    response, "result_url", None
+                )
+                return MediaResponse(
+                    modality="video",
+                    model=self.video_model,
+                    videos=[VideoResult(
+                        task_id=task_id,
+                        status="completed",
+                        video_url=video_url,
+                    )],
+                )
+            elif status == "failed" or getattr(response, "failed", False):
+                return MediaResponse(
+                    modality="video",
+                    model=self.video_model,
+                    videos=[VideoResult(
+                        task_id=task_id,
+                        status="failed",
+                        error=str(getattr(response, "error", "Unknown video generation error")),
+                    )],
+                )
+
+            await asyncio.sleep(interval)
+            elapsed += interval
+
+        # Timeout — return last known state
+        return MediaResponse(
+            modality="video",
+            model=self.video_model,
+            videos=[VideoResult(
+                task_id=task_id,
+                status="running",
+                error=f"Polling timed out after {max_wait}s",
+            )],
+        )
+
+    async def synthesize_audio(
+        self, request: MediaRequest, use_fallback: bool = False
+    ) -> MediaResponse:
+        """TTS via OpenAI-compatible ``/v1/audio/speech`` endpoint."""
+        model = request.model or self.audio_model
+        if not model:
+            raise ValueError("audio_model not configured for this MediaClient")
+
+        api_kwargs: dict = {"model": model, "input": request.prompt, "voice": request.response_format or "nova"}
+        if request.size:
+            api_kwargs["speed"] = 1.0
+
+        client = self._async_client
+        cfg = request.retry_config or self.retry_config
+
+        async def _do_call() -> Any:
+            return await client.audio.speech.create(**api_kwargs)
+
+        response = await retry_async(_do_call, config=cfg)
+
+        # Response may be a binary stream (audio bytes) or an object with .url
+        audio_url = getattr(response, "url", None)
+        b64_data = None
+        if audio_url is None:
+            # Binary response — read stream
+            try:
+                content = response.read() if hasattr(response, "read") else response
+                if isinstance(content, bytes):
+                    import base64
+                    b64_data = base64.b64encode(content).decode("ascii")
+                    audio_url = None
+            except Exception:
+                pass
+
+        self._record_media_usage("audio")
+        logger.info(f"[OpenAIMediaClient] synthesized audio with model={model}")
+        return MediaResponse(
+            modality="audio",
+            model=model,
+            audios=[AudioResult(
+                url=audio_url,
+                b64_json=b64_data,
+                voice=api_kwargs.get("voice"),
+            )],
+        )
+
+
+# ===========================================================================
+# Media Factory + Global Singleton
+# ===========================================================================
+
+class MediaFactory:
+    """Media client factory — mirrors LLMFactory for image/video/audio."""
+
+    @staticmethod
+    def create(config: dict) -> MediaClient:
+        provider = config.get("provider", "openai").lower()
+        api_key = config.get("api_key")
+        base_url = config.get("base_url")
+        image_model = config.get("image_model", "dall-e-3")
+        video_model = config.get("video_model")
+        audio_model = config.get("audio_model")
+        max_retries = config.get("max_retries", 3)
+        timeout = config.get("timeout", 120.0)
+
+        if not api_key:
+            raise ValueError(
+                "Media config 缺 api_key——请在 config dict 配 api_key 或环境变量 MEDIA_API_KEY"
+            )
+
+        if provider == "openai":
+            return OpenAIMediaClient(
+                api_key=api_key,
+                base_url=base_url,
+                image_model=image_model,
+                video_model=video_model,
+                audio_model=audio_model,
+                max_retries=max_retries,
+                timeout=timeout,
+                provider=provider,
+            )
+        # Seedream / tokenfree are OpenAI-compatible — treat as openai with a provider hint.
+        if provider in ("seedream", "tokenfree"):
+            logger.info(f"[MediaFactory] provider '{provider}' treated as OpenAI-compatible")
+            return OpenAIMediaClient(
+                api_key=api_key,
+                base_url=base_url,
+                image_model=image_model,
+                video_model=video_model,
+                audio_model=audio_model,
+                max_retries=max_retries,
+                timeout=timeout,
+                provider=provider,
+            )
+        raise ValueError(
+            f"unsupported media provider: {provider}（已实现：openai/seedream/tokenfree）"
+        )
+
+
+_media_client: Optional[MediaClient] = None
+
+
+async def init_media_client(config: dict) -> Optional[MediaClient]:
+    """初始化全局媒体生成客户端（按配置创建）。
+
+    配置来源：
+      1. yaml media.* 节 (api_key, base_url, image_model, video_model, audio_model)
+      2. 环境变量 MEDIA_API_KEY / MEDIA_BASE_URL / IMAGE_MODEL / VIDEO_MODEL / AUDIO_MODEL
+
+    若未配置 api_key —— 返回 None（不抛错，让上层检查）。
+    """
+    global _media_client
+    if _media_client is not None:
+        return _media_client
+
+    media_config = config.get("media", {}) or {}
+
+    def _pick(yaml_val: Any, env_key: str) -> Any:
+        placeholder = {"", "YOUR_API_KEY_HERE", None}
+        if yaml_val and str(yaml_val) not in placeholder:
+            return yaml_val
+        return os.getenv(env_key)
+
+    api_key = _pick(media_config.get("api_key"), "MEDIA_API_KEY")
+    if not api_key:
+        logger.warning("Media API key 未配置（yaml media.api_key 与环境变量 MEDIA_API_KEY 均为空），Media client 不可用。")
+        return None
+
+    base_url = _pick(media_config.get("base_url"), "MEDIA_BASE_URL")
+    image_model = _pick(media_config.get("image_model"), "IMAGE_MODEL")
+    video_model = _pick(media_config.get("video_model"), "VIDEO_MODEL")
+    audio_model = _pick(media_config.get("audio_model"), "AUDIO_MODEL")
+
+    _media_client = MediaFactory.create({
+        "provider": media_config.get("provider", "openai"),
+        "api_key": str(api_key),
+        "base_url": str(base_url) if base_url else None,
+        "image_model": str(image_model) if image_model else "dall-e-3",
+        "video_model": str(video_model) if video_model else None,
+        "audio_model": str(audio_model) if audio_model else None,
+        "max_retries": media_config.get("max_retries", 3),
+        "timeout": media_config.get("timeout", 300.0),
+    })
+    logger.info(
+        f"Media global client initialized. provider={_media_client.provider}, "
+        f"base_url={getattr(getattr(_media_client, '_async_client', None), 'base_url', None)}, "
+        f"image_model={_media_client.image_model}"
+    )
+    return _media_client
+
+
+def get_media_client() -> Optional[MediaClient]:
+    """获取全局媒体客户端实例。"""
+    if _media_client is None:
+        logger.warning("Media client accessed before initialization or was not configured.")
+    return _media_client
+
+
+def _reset_media_client_for_test() -> None:
+    """测试用——重置全局媒体单例。"""
+    global _media_client
+    _media_client = None
+    reset_registry()
 
 
 # ===========================================================================

@@ -50,6 +50,12 @@ class ProviderCapabilities:
     #: 模型是否会将 chain-of-thought 文本直接输出到 content 字段（非推理模型常见）。
     #: None=未知；True=已观测到 CoT 泄露。
     leaks_cot: Optional[bool] = None
+    #: 是否支持图像生成 (DALL·E / Seedream / 文生图)
+    supports_image: Optional[bool] = None
+    #: 是否支持视频生成 (Seedance / 文生视频 / 图生视频)
+    supports_video: Optional[bool] = None
+    #: 是否支持音频生成 (TTS / 配乐 / 声音合成)
+    supports_audio: Optional[bool] = None
     #: 最近一次学习到的错误摘要（仅供排查用，不参与判定）
     last_error: Optional[str] = None
     #: 数据来源标记：'probe' | 'learn' | None
@@ -66,6 +72,9 @@ class ProviderCapabilities:
         "thinking_param_rejected",
         "tool_choice_unsupported",
         "leaks_cot",
+        "supports_image",
+        "supports_video",
+        "supports_audio",
     )
 
 

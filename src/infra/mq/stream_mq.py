@@ -23,19 +23,11 @@ logger = get_logger(__name__)
 
 
 class MessagePriority:
-    """消息优先级"""
-    CRITICAL = "critical"   # 交易所上下架、风险预警
-    HIGH = "high"           # 价格异动、大额交易
-    NORMAL = "normal"       # ETF 数据、DEX 监控
-    LOW = "low"             # FRED、宏观数据
-
-# ========== 队列名称常量 ==========
-class QueueName:
-    """队列名称常量（唯一真相来源）"""
-    CRITICAL = "critical_queue"
-    HIGH_PRIORITY = "high_priority_queue"
-    NORMAL = "normal_queue"
-    LOW_PRIORITY = "low_priority_queue"
+    """消息优先级枚举"""
+    CRITICAL = "critical"
+    HIGH = "high"
+    NORMAL = "normal"
+    LOW = "low"
 
 @dataclass
 class QueueConfig:
@@ -691,37 +683,20 @@ class RedisStreamMQ:
         return False
 
 
-# 队列配置（按优先级）
-_queues_config = [
-    {
-        'name': QueueName.CRITICAL,
-        'concurrency': 5,
-        'batch_size': 5,
-        'ttl_seconds': 60,
-        'claim_interval': 15
-    },
-    {
-        'name': QueueName.HIGH_PRIORITY,
-        'concurrency': 4,
-        'batch_size': 10,
-        'ttl_seconds': 300,
-        'claim_interval': 20
-    },
-    {
-        'name': QueueName.NORMAL,
-        'concurrency': 3,
-        'batch_size': 20,
-        'ttl_seconds': 0,
-        'claim_interval': 30
-    },
-    {
-        'name': QueueName.LOW_PRIORITY,
-        'concurrency': 2,
-        'batch_size': 30,
-        'ttl_seconds': 0,
-        'claim_interval': 60
-    },
-]
+# 队列名称常量（项目自定义——infra 不再硬编码）
+# 各项目在自己的模块中定义 QueueName，比如:
+#   class QueueName:
+#       WORKFLOW = "dramacraft_workflow_queue"
+#       DEFAULT = WORKFLOW
+# 然后在 init_mq(queues=[{...}]) 传入。
+class QueueName:
+    """队列名称常量 —— 供 infra.mq.__init__ 重新导出。
+
+    各项目应在自己的模块中定义项目特定的 QueueName；
+    此处提供 infra 层的缺省值，避免 __init__.py 导入失败。
+    """
+    WORKFLOW = "workflow_queue"
+    DEFAULT = WORKFLOW
 
 # 全局实例
 _mq: Optional[RedisStreamMQ] = None
@@ -732,17 +707,26 @@ async def init_mq(
     routing: Dict[str, str],
     queues: Optional[List[Dict[str, Any]]] = None,
     handlers: Optional[Dict[str, Callable]] = None,
+    default_queue: Optional[str] = None,
 ) -> RedisStreamMQ:
-    """初始化全局消息队列"""
+    """初始化全局消息队列
+
+    Args:
+        config: 应用配置（从中读取 redis.*）
+        routing: 任务类型到队列名称的映射 {task_type: stream_name}
+        queues: 队列定义列表，每个包含 name/concurrency/batch_size 等
+        handlers: 任务类型到处理函数的映射 {task_type: handler_coroutine}
+        default_queue: 默认队列名称（用于路由未匹配的消息）
+    """
     global _mq
     
     redis_config = config.get('redis', {})
     _mq = RedisStreamMQ(redis_config)
     await _mq.connect()
     
-    queue_list = queues or _queues_config
+    queue_list = queues or []
     for q in queue_list:
-        # narrow q: Dict[str, Any]——AI 误传非 dict 防御（真业务 bug）
+        # narrow q: Dict[str, Any]——防御性检查
         if not isinstance(q, dict):
             logger.warning(f"queue 配置不是 dict，跳过: {q!r}")
             continue
@@ -763,8 +747,8 @@ async def init_mq(
     routing_rules_dict = routing
     _mq.set_routing(routing_rules_dict)
     
-    if queue_list:
-        _mq.set_default_queue('normal_queue')
+    if default_queue:
+        _mq.set_default_queue(default_queue)
     
     # 注册处理器
     if handlers:
@@ -780,7 +764,7 @@ async def init_mq(
     
     # 添加 config 属性到 _mq 实例
     _mq.config = {
-        'queue_name': _mq._default_queue,
+        'default_queue': _mq._default_queue,
         'queues': {name: {'concurrency': q.concurrency, 'batch_size': q.batch_size} 
                    for name, q in _mq._queues.items()},
         'routing': _mq._routing.copy()
