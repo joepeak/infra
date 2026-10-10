@@ -362,63 +362,104 @@ class TestSortedSetOps:
 # ============================================================
 class TestDistributedLock:
     async def test_lock_acquire(self, client_with_mock_redis):
-        """setnx 成功——加锁成功，expire 被调。"""
+        """set_nx 成功——SET key token NX EX ttl 原子加锁，不再用 setnx。"""
         c, mock = client_with_mock_redis
-        mock.setnx = AsyncMock(return_value=True)
-        mock.expire = AsyncMock(return_value=True)
+        c.set_nx = AsyncMock(return_value=True)
         result = await c.lock("mykey", ttl=60)
         assert result is True
-        mock.setnx.assert_called_once()
-        # 验证 lock key 前缀
-        lock_key = mock.setnx.call_args.args[0]
-        assert lock_key == "lock:mykey"
-        mock.expire.assert_called_once_with(lock_key, 60)
+        c.set_nx.assert_awaited_once()
+        args, kwargs = c.set_nx.call_args
+        assert args[0] == "lock:mykey"
+        assert isinstance(args[1], str) and len(args[1]) > 0   # 唯一 token
+        assert kwargs["ttl"] == 60
+        # token 被记录以备 unlock 校验
+        assert c._lock_tokens["mykey"] == args[1]
 
     async def test_lock_already_held(self, client_with_mock_redis):
-        """setnx 失败——不加锁，不调 expire。"""
+        """set_nx 失败——返回 False，不记录 token。"""
         c, mock = client_with_mock_redis
-        mock.setnx = AsyncMock(return_value=False)
-        mock.expire = AsyncMock()
+        c.set_nx = AsyncMock(return_value=False)
         result = await c.lock("k", ttl=30)
         assert result is False
-        mock.expire.assert_not_called()
+        assert "k" not in c._lock_tokens
 
     async def test_unlock_success(self, client_with_mock_redis):
-        """unlock——内部用 delete('lock:key')，返 delete 结果。"""
+        """unlock——Lua 脚本校验 token 匹配才 DEL。"""
         c, mock = client_with_mock_redis
-        mock.delete = AsyncMock(return_value=1)
+        c.set_nx = AsyncMock(return_value=True)
+        mock.eval = AsyncMock(return_value=1)
+        await c.lock("mykey", ttl=60)
+        token = c._lock_tokens["mykey"]
         result = await c.unlock("mykey")
         assert result is True
-        # 验证调了 lock:mykey
-        mock.delete.assert_called_once_with("lock:mykey")
+        mock.eval.assert_awaited_once()
+        args = mock.eval.call_args.args
+        assert args[1] == 1                      # numkeys
+        assert args[2] == "lock:mykey"             # KEYS[1]
+        assert args[3] == token                   # ARGV[1] token
+
+    async def test_unlock_wrong_token(self, client_with_mock_redis):
+        """unlock 显式 token 不匹配——Lua 返回 0，锁不被删除。"""
+        c, mock = client_with_mock_redis
+        c._lock_tokens["mykey"] = "owner-token"
+        mock.eval = AsyncMock(return_value=0)
+        result = await c.unlock("mykey", token="wrong-token")
+        assert result is False
+        mock.eval.assert_awaited_once()
+        assert "wrong-token" in mock.eval.call_args.args
 
     async def test_unlock_no_lock(self, client_with_mock_redis):
-        """unlock——delete 返 0（无锁），返 False。"""
+        """unlock 无持有 token——不调 eval，返回 False。"""
         c, mock = client_with_mock_redis
-        mock.delete = AsyncMock(return_value=0)
+        mock.eval = AsyncMock()
         result = await c.unlock("nonexistent")
         assert result is False
+        mock.eval.assert_not_called()
 
     async def test_lock_context_acquire(self, client_with_mock_redis):
-        """lock_context 立即获得锁——yield True，exit 时 unlock。"""
+        """lock_context 获得锁——yield True，exit 时 Lua unlock。"""
         c, mock = client_with_mock_redis
-        mock.setnx = AsyncMock(return_value=True)
-        mock.expire = AsyncMock(return_value=True)
-        mock.delete = AsyncMock(return_value=1)
+        c.set_nx = AsyncMock(return_value=True)
+        mock.eval = AsyncMock(return_value=1)
         async with c.lock_context("k", ttl=30) as acquired:
             assert acquired is True
-        # exit 后 unlock 被调
-        mock.delete.assert_called_once_with("lock:k")
+        mock.eval.assert_awaited_once()
+        assert "lock:k" in mock.eval.call_args.args
 
     async def test_lock_context_fail_no_unlock(self, client_with_mock_redis):
-        """lock_context 拿不到锁——不调 unlock。"""
+        """lock_context 拿不到锁——不调 unlock（防误删别人锁）。"""
         c, mock = client_with_mock_redis
-        mock.setnx = AsyncMock(return_value=False)
-        mock.delete = AsyncMock()
+        c.set_nx = AsyncMock(return_value=False)
+        mock.eval = AsyncMock()
         async with c.lock_context("k") as acquired:
             assert acquired is False
-        # 拿不到锁——不应 unlock（避免误删别人的锁）
-        mock.delete.assert_not_called()
+        mock.eval.assert_not_called()
+
+    async def test_lock_concurrent_single_winner(self, client_with_mock_redis):
+        """多个协程抢同一 key，只有一个能拿到（SET NX 原子语义）。"""
+        c, mock = client_with_mock_redis
+        store = {}
+
+        async def fake_set_nx(k, value, ttl=None):
+            if k in store:
+                return False
+            store[k] = value
+            return True
+
+        c.set_nx = fake_set_nx
+        mock.eval = AsyncMock(return_value=1)
+        winners = []
+
+        async def worker():
+            ok = await c.lock("race", ttl=10)
+            if ok:
+                winners.append(True)
+                await c.unlock("race")
+
+        await asyncio.gather(worker(), worker(), worker())
+        assert winners.count(True) == 1
+        # 获胜者释放后实例 token 被清空
+        assert c._lock_tokens.get("race") is None
 
 
 # ============================================================

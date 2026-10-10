@@ -7,6 +7,7 @@ Redis 统一客户端
 import json
 import asyncio
 import time
+import uuid
 from typing import AsyncIterator, Optional, Any, Dict, Set, Callable
 from contextlib import asynccontextmanager
 
@@ -26,6 +27,7 @@ class RedisClient:
         self.config = config or {}
         self._client: Optional[aioredis.Redis] = None
         self._pool: Optional[ConnectionPool] = None
+        self._lock_tokens: Dict[str, str] = {}
         self._init_connection()
     
     def _init_connection(self) -> None:
@@ -83,6 +85,22 @@ class RedisClient:
         if ttl:
             return bool(await client.set(key, value, ex=ttl))
         return bool(await client.set(key, value))
+    
+    async def set_nx(self, key: str, value: Any, ttl: Optional[int] = None) -> bool:
+        """
+        原子 SET NX（不存在才设置），可选 TTL。
+        
+        底层单命令 ``SET key value NX EX ttl``，共享 ``set`` 的序列化逻辑，
+        但额外保证加锁原子性——避免 ``setnx`` + ``expire`` 两步非原子导致的死锁。
+        """
+        client = self._get_client()
+        if isinstance(value, (dict, list)):
+            value = json.dumps(value, ensure_ascii=False)
+        elif not isinstance(value, str):
+            value = str(value)
+        if ttl:
+            return bool(await client.set(key, value, nx=True, ex=ttl))
+        return bool(await client.set(key, value, nx=True))
     
     async def delete(self, *keys: str) -> int:
         """删除键"""
@@ -317,9 +335,17 @@ class RedisClient:
     
     # ========== 分布式锁 ==========
     
+    _UNLOCK_LUA = """
+    if redis.call('get', KEYS[1]) == ARGV[1] then
+        return redis.call('del', KEYS[1])
+    else
+        return 0
+    end
+    """
+
     async def lock(self, key: str, ttl: int = 30) -> bool:
         """
-        获取分布式锁
+        获取分布式锁（原子安全版）
         
         Args:
             key: 锁的键名
@@ -329,24 +355,30 @@ class RedisClient:
             是否获取成功
         """
         lock_key = f"lock:{key}"
-        client = self._get_client()
-        acquired = await client.setnx(lock_key, str(time.time()))
+        token = uuid.uuid4().hex
+        acquired = await self.set_nx(lock_key, token, ttl=ttl)
         if acquired:
-            await client.expire(lock_key, ttl)
+            self._lock_tokens[key] = token
         return acquired
     
-    async def unlock(self, key: str) -> bool:
+    async def unlock(self, key: str, token: Optional[str] = None) -> bool:
         """
-        释放分布式锁
+        释放分布式锁（持有者校验版）
         
         Args:
             key: 锁的键名
+            token: 持有者 token；不传时使用 lock() 记录的 token
         
         Returns:
             是否释放成功
         """
         lock_key = f"lock:{key}"
-        return await self.delete(lock_key) > 0
+        check = token if token is not None else self._lock_tokens.pop(key, None)
+        if check is None:
+            return False
+        client = self._get_client()
+        result = await client.eval(self._UNLOCK_LUA, 1, lock_key, check)
+        return bool(result)
     
     @asynccontextmanager
     async def lock_context(
