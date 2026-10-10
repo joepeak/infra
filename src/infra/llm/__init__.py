@@ -51,6 +51,7 @@ from infra.llm.client import (
 from infra.llm.models import LLMRequest, LLMResponse, MediaRequest, MediaResponse, Modality
 from infra.llm.models import ImageResult, VideoResult, AudioResult
 from infra.llm.models import LLMRequest, LLMResponse
+from infra.llm.models import UsageCallback
 from infra.llm.retry import LLMRetryConfig
 from infra.llm.postprocess import (
     is_likely_cot,
@@ -95,6 +96,7 @@ __all__ = [
     # models
     "LLMRequest", "LLMResponse", "MediaRequest", "MediaResponse", "Modality",
     "ImageResult", "VideoResult", "AudioResult",
+    "UsageCallback",
     # retry
     "LLMRetryConfig",
     # postprocess

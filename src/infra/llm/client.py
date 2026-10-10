@@ -13,7 +13,7 @@ import asyncio
 import time as _time
 from abc import ABC, abstractmethod
 from functools import partial
-from typing import Any, Optional, Callable
+from typing import Any, Optional, Callable, Dict, Union, Tuple
 
 from infra.utils.retry import RetryConfig, retry_async, retry_sync
 from infra.llm.models import (
@@ -25,12 +25,37 @@ from infra.llm.models import (
     ImageResult,
     VideoResult,
     AudioResult,
+    UsageCallback,
 )
 from infra.llm.usage import record_usage
 from infra.llm.retry import LLMRetryConfig
 from infra.llm.capabilities import get_registry, ProviderCapabilities, reset_registry
 
 logger = logging.getLogger(__name__)
+
+
+def _invoke_usage_callback(
+    callback: Optional[UsageCallback],
+    info: Dict[str, Any],
+) -> None:
+    """Safely invoke a usage_callback. Exceptions are swallowed and logged."""
+    if callback is None:
+        return
+    try:
+        callback(info)
+    except Exception:
+        logger.warning("usage_callback 执行失败（忽略）", exc_info=True)
+
+
+def _safe_extract(value: Any, expected_type: Union[type, Tuple[type, ...]]) -> Any:
+    """Return value only if it matches the expected type, else None.
+
+    Guards against mock objects (auto-created attrs) leaking into pydantic
+    validation — provider responses in tests are often plain MagicMocks.
+    """
+    if isinstance(value, expected_type):
+        return value
+    return None
 
 
 class LLMClient(ABC):
@@ -158,25 +183,73 @@ class LLMClient(ABC):
         return changes
 
     @abstractmethod
-    async def ainvoke(self, request: LLMRequest, use_fallback: bool = False) -> LLMResponse:
-        """异步调用——子类必须实现。"""
+    async def ainvoke(
+        self,
+        request: LLMRequest,
+        use_fallback: bool = False,
+        usage_callback: Optional[UsageCallback] = None,
+    ) -> LLMResponse:
+        """异步调用——子类必须实现。
+
+        usage_callback：每次成功响应后以 usage dict 回调（可选）。
+        """
 
     @abstractmethod
-    def invoke(self, request: LLMRequest, use_fallback: bool = False) -> LLMResponse:
-        """同步调用——子类必须实现。"""
+    def invoke(
+        self,
+        request: LLMRequest,
+        use_fallback: bool = False,
+        usage_callback: Optional[UsageCallback] = None,
+    ) -> LLMResponse:
+        """同步调用——子类必须实现。
+
+        usage_callback 同 ainvoke。
+        """
 
     @abstractmethod
-    async def astream(self, request: LLMRequest, use_fallback: bool = False) -> Any:
-        """异步流式调用——返回流式响应迭代器。子类必须实现。"""
+    async def astream(
+        self,
+        request: LLMRequest,
+        use_fallback: bool = False,
+        usage_callback: Optional[UsageCallback] = None,
+    ) -> Any:
+        """异步流式调用——返回流式响应迭代器。子类必须实现。
+
+        usage_callback 在流结束时以聚合 usage 回调一次（可选）。
+        """
 
     @abstractmethod
-    def stream(self, request: LLMRequest, use_fallback: bool = False) -> Any:
-        """同步流式调用——返回流式响应迭代器。子类必须实现。"""
+    def stream(
+        self,
+        request: LLMRequest,
+        use_fallback: bool = False,
+        usage_callback: Optional[UsageCallback] = None,
+    ) -> Any:
+        """同步流式调用——返回流式响应迭代器。子类必须实现。
 
-    def _record_usage_from_response(self, response: LLMResponse) -> None:
-        """记录 token 用量——子类 ainvoke/invoke 后调用。"""
+        usage_callback 在流结束时以聚合 usage 回调一次（可选）。
+        """
+
+    def _record_usage_from_response(
+        self,
+        response: LLMResponse,
+        usage_callback: Optional[UsageCallback] = None,
+    ) -> None:
+        """记录 token 用量——子类 ainvoke/invoke 后调用。
+
+        若提供 usage_callback，则在记录完本地聚合后以 usage dict 回调一次。
+        """
         if response.usage:
             record_usage(response.usage)
+            if usage_callback is not None:
+                _invoke_usage_callback(usage_callback, {
+                    "modality": "text",
+                    "provider": self.provider,
+                    "model": response.model or "",
+                    "prompt_tokens": response.usage.get("prompt_tokens", 0),
+                    "completion_tokens": response.usage.get("completion_tokens", 0),
+                    "total_tokens": response.usage.get("total_tokens", 0),
+                })
 
 
 # ===========================================================================
@@ -230,7 +303,12 @@ class OpenAIClient(LLMClient):
     def provider(self) -> str:
         return "openai"
 
-    async def ainvoke(self, request: LLMRequest, use_fallback: bool = False) -> LLMResponse:
+    async def ainvoke(
+        self,
+        request: LLMRequest,
+        use_fallback: bool = False,
+        usage_callback: Optional[UsageCallback] = None,
+    ) -> LLMResponse:
         """Asynchronous invocation.
 
         use_fallback=True 时走 fallback provider（可用独立的 base_url/api_key）。
@@ -286,14 +364,20 @@ class OpenAIClient(LLMClient):
             f"model={effective_model}, use_fallback={use_fallback}）"
         )
         result = LLMResponse.from_openai_response(response, post_processor=request.post_processor)
-        self._record_usage_from_response(result)
+        result.model = result.model or effective_model
+        self._record_usage_from_response(result, usage_callback)
         if result.content:
             get_registry().learn_from_successful_response(
                 provider_base, effective_model, result.content, result.reasoning_content
             )
         return result
 
-    def invoke(self, request: LLMRequest, use_fallback: bool = False) -> LLMResponse:
+    def invoke(
+        self,
+        request: LLMRequest,
+        use_fallback: bool = False,
+        usage_callback: Optional[UsageCallback] = None,
+    ) -> LLMResponse:
         """Synchronous invocation.
 
         use_fallback=True 时走 fallback provider。
@@ -337,14 +421,20 @@ class OpenAIClient(LLMClient):
         result = LLMResponse.from_openai_response(
             response, post_processor=request.post_processor
         )
-        self._record_usage_from_response(result)
+        result.model = result.model or effective_model
+        self._record_usage_from_response(result, usage_callback)
         if result.content:
             get_registry().learn_from_successful_response(
                 provider_base, effective_model, result.content, result.reasoning_content
             )
         return result
 
-    async def astream(self, request: LLMRequest, use_fallback: bool = False) -> Any:
+    async def astream(
+        self,
+        request: LLMRequest,
+        use_fallback: bool = False,
+        usage_callback: Optional[UsageCallback] = None,
+    ) -> Any:
         """Asynchronous streaming invocation.
 
         Returns an async iterator yielding LLMResponse objects for each
@@ -396,19 +486,26 @@ class OpenAIClient(LLMClient):
                     pass
 
         if aggregated_total > 0:
-            self._record_usage_from_response(LLMResponse(
+            _resp = LLMResponse(  # type: ignore[call-arg]
                 usage={
                     "prompt_tokens": aggregated_prompt,
                     "completion_tokens": aggregated_completion,
                     "total_tokens": aggregated_total,
-                }
-            ))  # type: ignore[call-arg]
+                },
+                model=effective_model,
+            )
+            self._record_usage_from_response(_resp, usage_callback)
         logger.info(
             f"[OpenAIClient] astream 返回（耗时 {_time.monotonic()-t0:.0f}s, "
             f"model={effective_model}, use_fallback={use_fallback}）"
         )
 
-    def stream(self, request: LLMRequest, use_fallback: bool = False) -> Any:
+    def stream(
+        self,
+        request: LLMRequest,
+        use_fallback: bool = False,
+        usage_callback: Optional[UsageCallback] = None,
+    ) -> Any:
         """Synchronous streaming invocation.
 
         Returns an iterator yielding LLMResponse objects for each incremental chunk.
@@ -445,13 +542,15 @@ class OpenAIClient(LLMClient):
                     aggregated_total += getattr(chunk.usage, "total_tokens", 0) or 0
                 yield LLMResponse.from_openai_chunk(chunk, post_processor=request.post_processor)
             if aggregated_total > 0:
-                self._record_usage_from_response(LLMResponse(
+                _resp = LLMResponse(  # type: ignore[call-arg]
                     usage={
                         "prompt_tokens": aggregated_prompt,
                         "completion_tokens": aggregated_completion,
                         "total_tokens": aggregated_total,
-                    }
-                ))  # type: ignore[call-arg]
+                    },
+                    model=effective_model,
+                )
+                self._record_usage_from_response(_resp, usage_callback)
 
         return _sync_iter()
 
@@ -549,43 +648,88 @@ class MediaClient(ABC):
 
     @abstractmethod
     async def generate_image(
-        self, request: MediaRequest, use_fallback: bool = False
+        self,
+        request: MediaRequest,
+        use_fallback: bool = False,
+        usage_callback: Optional[UsageCallback] = None,
     ) -> MediaResponse:
-        """Generate an image from a text prompt."""
+        """Generate an image from a text prompt.
+
+        usage_callback：生成完成后以 media cost info 回调一次（可选）。
+        """
 
     @abstractmethod
     def generate_image_sync(
-        self, request: MediaRequest, use_fallback: bool = False
+        self,
+        request: MediaRequest,
+        use_fallback: bool = False,
+        usage_callback: Optional[UsageCallback] = None,
     ) -> MediaResponse:
         """Synchronous image generation."""
 
     async def generate_video(
-        self, request: MediaRequest, use_fallback: bool = False
+        self,
+        request: MediaRequest,
+        use_fallback: bool = False,
+        usage_callback: Optional[UsageCallback] = None,
     ) -> MediaResponse:
-        """Submit a video generation task (async, returns task_id)."""
+        """Submit a video generation task (async, returns task_id).
+
+        usage_callback：提交任务后以 video 状态回调一次（可选）。
+        """
         raise NotImplementedError(
             f"{self.provider} does not support video generation"
         )
 
     async def poll_video(
-        self, task_id: str, use_fallback: bool = False, interval: float = 10.0, max_wait: float = 600.0
+        self,
+        task_id: str,
+        use_fallback: bool = False,
+        interval: float = 10.0,
+        max_wait: float = 600.0,
+        usage_callback: Optional[UsageCallback] = None,
     ) -> MediaResponse:
-        """Poll a video task until completion or timeout."""
+        """Poll a video task until completion or timeout.
+
+        usage_callback：任务完成/失败/超时时以 video 状态回调一次（可选）。
+        """
         raise NotImplementedError(
             f"{self.provider} does not support video polling"
         )
 
     async def synthesize_audio(
-        self, request: MediaRequest, use_fallback: bool = False
+        self,
+        request: MediaRequest,
+        use_fallback: bool = False,
+        usage_callback: Optional[UsageCallback] = None,
     ) -> MediaResponse:
-        """Synthesize speech/audio from text."""
+        """Synthesize speech/audio from text.
+
+        usage_callback：音频生成完成后以 audio cost info 回调一次（可选）。
+        """
         raise NotImplementedError(
             f"{self.provider} does not support audio synthesis"
         )
 
-    def _record_media_usage(self, modality: str) -> None:
-        """Record a media generation call for usage tracking."""
+    def _record_media_usage(
+        self,
+        modality: str,
+        cost_info: Optional[Dict[str, Any]] = None,
+        usage_callback: Optional[UsageCallback] = None,
+    ) -> None:
+        """Record a media generation call for usage tracking.
+
+        cost_info: modality + model + cost-determining parameters.
+        usage_callback: optional external callback invoked with cost_info (errors swallowed).
+        """
         record_usage({"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}, purpose=f"media_{modality}")
+        if usage_callback is not None and cost_info is not None:
+            info: Dict[str, Any] = {
+                "modality": modality,
+                "provider": self._provider,
+            }
+            info.update(cost_info)
+            _invoke_usage_callback(usage_callback, info)
 
 
 class OpenAIMediaClient(MediaClient):
@@ -609,7 +753,12 @@ class OpenAIMediaClient(MediaClient):
     def provider(self) -> str:
         return self._provider
 
-    async def _generate_image_async(self, request: MediaRequest, use_fallback: bool = False) -> MediaResponse:
+    async def _generate_image_async(
+        self,
+        request: MediaRequest,
+        use_fallback: bool = False,
+        usage_callback: Optional[UsageCallback] = None,
+    ) -> MediaResponse:
         cfg = request.retry_config or self.retry_config
         client = self._async_client
         model = request.model or self.image_model
@@ -654,7 +803,13 @@ class OpenAIMediaClient(MediaClient):
                 )
             )
 
-        self._record_media_usage("image")
+        cost_info = {
+            "model": model,
+            "image_count": len(images),
+            "size": request.size or "",
+            "quality": request.quality or "standard",
+        }
+        self._record_media_usage("image", cost_info, usage_callback)
         logger.info(
             f"[OpenAIMediaClient] generated {len(images)} image(s) in {elapsed:.1f}s "
             f"with model={model}"
@@ -663,9 +818,17 @@ class OpenAIMediaClient(MediaClient):
             modality="image",
             model=model,
             images=images,
+            cost=_safe_extract(getattr(response, "cost", None), (int, float)),
+            currency=_safe_extract(getattr(response, "currency", None), str),
+            cost_metadata=_safe_extract(getattr(response, "cost_metadata", None), dict),
         )
 
-    def _generate_image_sync(self, request: MediaRequest, use_fallback: bool = False) -> MediaResponse:
+    def _generate_image_sync(
+        self,
+        request: MediaRequest,
+        use_fallback: bool = False,
+        usage_callback: Optional[UsageCallback] = None,
+    ) -> MediaResponse:
         client = self._sync_client
         model = request.model or self.image_model
 
@@ -707,7 +870,13 @@ class OpenAIMediaClient(MediaClient):
                 )
             )
 
-        self._record_media_usage("image")
+        cost_info = {
+            "model": model,
+            "image_count": len(images),
+            "size": request.size or "",
+            "quality": request.quality or "standard",
+        }
+        self._record_media_usage("image", cost_info, usage_callback)
         logger.info(
             f"[OpenAIMediaClient] generated {len(images)} image(s) in {elapsed:.1f}s "
             f"with model={model}"
@@ -716,20 +885,32 @@ class OpenAIMediaClient(MediaClient):
             modality="image",
             model=model,
             images=images,
+            cost=_safe_extract(getattr(response, "cost", None), (int, float)),
+            currency=_safe_extract(getattr(response, "currency", None), str),
+            cost_metadata=_safe_extract(getattr(response, "cost_metadata", None), dict),
         )
 
     async def generate_image(
-        self, request: MediaRequest, use_fallback: bool = False
+        self,
+        request: MediaRequest,
+        use_fallback: bool = False,
+        usage_callback: Optional[UsageCallback] = None,
     ) -> MediaResponse:
-        return await self._generate_image_async(request, use_fallback)
+        return await self._generate_image_async(request, use_fallback, usage_callback)
 
     def generate_image_sync(
-        self, request: MediaRequest, use_fallback: bool = False
+        self,
+        request: MediaRequest,
+        use_fallback: bool = False,
+        usage_callback: Optional[UsageCallback] = None,
     ) -> MediaResponse:
-        return self._generate_image_sync(request, use_fallback)
+        return self._generate_image_sync(request, use_fallback, usage_callback)
 
     async def generate_video(
-        self, request: MediaRequest, use_fallback: bool = False
+        self,
+        request: MediaRequest,
+        use_fallback: bool = False,
+        usage_callback: Optional[UsageCallback] = None,
     ) -> MediaResponse:
         """Seedance/WanX-style video generation via OpenAI-compatible endpoint.
 
@@ -768,7 +949,13 @@ class OpenAIMediaClient(MediaClient):
         elapsed = _time.monotonic() - t0
         task_id = getattr(response, "id", None) or getattr(response, "task_id", None)
 
-        self._record_media_usage("video")
+        cost_info = {
+            "model": model,
+            "video_status": "pending",
+            "video_duration_seconds": None,
+            "task_id": task_id,
+        }
+        self._record_media_usage("video", cost_info, usage_callback)
         logger.info(
             f"[OpenAIMediaClient] submitted video task {task_id} in {elapsed:.1f}s "
             f"with model={model}"
@@ -776,13 +963,24 @@ class OpenAIMediaClient(MediaClient):
         return MediaResponse(
             modality="video",
             model=model,
-            videos=[VideoResult(task_id=task_id, status="pending")],
+            videos=[VideoResult(task_id=task_id, status="pending")],  # type: ignore[call-arg]
+            cost=_safe_extract(getattr(response, "cost", None), (int, float)),
+            currency=_safe_extract(getattr(response, "currency", None), str),
+            cost_metadata=_safe_extract(getattr(response, "cost_metadata", None), dict),
         )
 
     async def poll_video(
-        self, task_id: str, use_fallback: bool = False, interval: float = 10.0, max_wait: float = 600.0
+        self,
+        task_id: str,
+        use_fallback: bool = False,
+        interval: float = 10.0,
+        max_wait: float = 600.0,
+        usage_callback: Optional[UsageCallback] = None,
     ) -> MediaResponse:
-        """Poll a video-task endpoint (provider-specific path via extra_body)."""
+        """Poll a video-task endpoint (provider-specific path via extra_body).
+
+        usage_callback：任务完成/失败/超时时以 video cost info 回调一次。
+        """
         client = self._async_client
         elapsed = 0.0
 
@@ -803,20 +1001,41 @@ class OpenAIMediaClient(MediaClient):
                 video_url = getattr(response, "video_url", None) or getattr(
                     response, "result_url", None
                 )
+                duration = _safe_extract(getattr(response, "duration_seconds", None), (int, float)) or _safe_extract(getattr(response, "duration", None), (int, float))
+                cost_info = {
+                    "model": self.video_model or "",
+                    "video_status": "completed",
+                    "video_duration_seconds": duration,
+                    "task_id": task_id,
+                    "cost": _safe_extract(getattr(response, "cost", None), (int, float)),
+                    "currency": _safe_extract(getattr(response, "currency", None), str),
+                }
+                self._record_media_usage("video", cost_info, usage_callback)
                 return MediaResponse(
                     modality="video",
                     model=self.video_model,
-                    videos=[VideoResult(
+                    videos=[VideoResult(  # type: ignore[call-arg]
                         task_id=task_id,
                         status="completed",
                         video_url=video_url,
+                        duration_seconds=duration,
                     )],
+                    cost=_safe_extract(getattr(response, "cost", None), (int, float)),
+                    currency=_safe_extract(getattr(response, "currency", None), str),
+                    cost_metadata=_safe_extract(getattr(response, "cost_metadata", None), dict),
                 )
             elif status == "failed" or getattr(response, "failed", False):
+                cost_info = {
+                    "model": self.video_model or "",
+                    "video_status": "failed",
+                    "video_duration_seconds": None,
+                    "task_id": task_id,
+                }
+                self._record_media_usage("video", cost_info, usage_callback)
                 return MediaResponse(
                     modality="video",
                     model=self.video_model,
-                    videos=[VideoResult(
+                    videos=[VideoResult(  # type: ignore[call-arg]
                         task_id=task_id,
                         status="failed",
                         error=str(getattr(response, "error", "Unknown video generation error")),
@@ -827,10 +1046,17 @@ class OpenAIMediaClient(MediaClient):
             elapsed += interval
 
         # Timeout — return last known state
+        cost_info = {
+            "model": self.video_model or "",
+            "video_status": "running",
+            "video_duration_seconds": None,
+            "task_id": task_id,
+        }
+        self._record_media_usage("video", cost_info, usage_callback)
         return MediaResponse(
             modality="video",
             model=self.video_model,
-            videos=[VideoResult(
+            videos=[VideoResult(  # type: ignore[call-arg]
                 task_id=task_id,
                 status="running",
                 error=f"Polling timed out after {max_wait}s",
@@ -838,7 +1064,10 @@ class OpenAIMediaClient(MediaClient):
         )
 
     async def synthesize_audio(
-        self, request: MediaRequest, use_fallback: bool = False
+        self,
+        request: MediaRequest,
+        use_fallback: bool = False,
+        usage_callback: Optional[UsageCallback] = None,
     ) -> MediaResponse:
         """TTS via OpenAI-compatible ``/v1/audio/speech`` endpoint."""
         model = request.model or self.audio_model
@@ -860,6 +1089,7 @@ class OpenAIMediaClient(MediaClient):
         # Response may be a binary stream (audio bytes) or an object with .url
         audio_url = getattr(response, "url", None)
         b64_data = None
+        duration = _safe_extract(getattr(response, "duration_seconds", None), (int, float)) or _safe_extract(getattr(response, "duration", None), (int, float))
         if audio_url is None:
             # Binary response — read stream
             try:
@@ -871,16 +1101,25 @@ class OpenAIMediaClient(MediaClient):
             except Exception:
                 pass
 
-        self._record_media_usage("audio")
+        cost_info = {
+            "model": model,
+            "input_chars": len(request.prompt),
+            "duration_seconds": duration,
+        }
+        self._record_media_usage("audio", cost_info, usage_callback)
         logger.info(f"[OpenAIMediaClient] synthesized audio with model={model}")
         return MediaResponse(
             modality="audio",
             model=model,
-            audios=[AudioResult(
+            audios=[AudioResult(  # type: ignore[call-arg]
                 url=audio_url,
                 b64_json=b64_data,
+                duration_seconds=duration,
                 voice=api_kwargs.get("voice"),
             )],
+            cost=_safe_extract(getattr(response, "cost", None), (int, float)),
+            currency=_safe_extract(getattr(response, "currency", None), str),
+            cost_metadata=_safe_extract(getattr(response, "cost_metadata", None), dict),
         )
 
 

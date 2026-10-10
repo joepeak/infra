@@ -13,6 +13,8 @@ from pydantic import BaseModel, ConfigDict, Field
 if TYPE_CHECKING:
     from infra.utils.retry import RetryConfig
 
+UsageCallback = Callable[[Dict[str, Any]], None]
+
 Modality = Literal["text", "image", "video", "audio"]
 
 
@@ -223,6 +225,9 @@ class MediaResponse(BaseModel):
     images: List["ImageResult"] = Field(default_factory=list, description="Generated image results (image modality)")
     videos: List["VideoResult"] = Field(default_factory=list, description="Video task results (video modality)")
     audios: List["AudioResult"] = Field(default_factory=list, description="Audio results (audio modality)")
+    cost: Optional[float] = Field(None, description="Provider-returned cost (if available)")
+    currency: Optional[str] = Field(None, description="Cost currency code (e.g., 'USD', 'CNY')")
+    cost_metadata: Optional[Dict[str, Any]] = Field(None, description="Provider-specific cost info from API response")
 
 
 class ImageResult(BaseModel):
@@ -245,6 +250,7 @@ class VideoResult(BaseModel):
     progress: Optional[float] = Field(None, description="Progress 0.0–1.0 (if supported)")
     error: Optional[str] = Field(None, description="Error message if status=failed")
     estimated_remaining_seconds: Optional[int] = Field(None, description="ETA when running")
+    duration_seconds: Optional[float] = Field(None, description="Duration of the generated video in seconds")
 
 
 class AudioResult(BaseModel):
