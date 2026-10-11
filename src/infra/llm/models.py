@@ -38,10 +38,14 @@ class LLMRequest(BaseModel):
         description="内容后处理器：接收 (content, reasoning_content)，返回清洗后的字符串，用于过滤 CoT 等",
     )
     modality: Modality = Field(default="text", description="请求模态：text|image|video|audio")
+    json_mode: Optional[str] = Field(
+        None,
+        description="JSON 输出策略：'json_object' | 'json_schema' | 'prompt_only' | None（自动）",
+    )
 
     def to_openai_kwargs(self) -> Dict[str, Any]:
         """转为 OpenAI 风格 kwargs（messages + model 在外层处理，避免重复传参）。"""
-        kwargs = self.model_dump(exclude_none=True, exclude={"retry_config", "model", "post_processor", "modality"})
+        kwargs = self.model_dump(exclude_none=True, exclude={"retry_config", "model", "post_processor", "modality", "json_mode"})
         msgs = kwargs.pop("messages", None)
         if msgs is not None:
             kwargs["messages"] = msgs

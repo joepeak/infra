@@ -133,6 +133,10 @@ class LLMClient(ABC):
              - 若 400 且提到 response_format/json_object → 不支持 response_format
              - 若 400 且提到 tools → 不支持 tools
              - 不报错 → 能力齐备
+          2. 探测 json_schema 支持（若 response_format 已知支持，再试 json_schema）
+          3. 探测 reasoning_effort 参数接受度（GLM 需要，deepseek 不接受）
+          4. 探测中文 JSON 后缀敏感度（deepseek-flash 曾返回空）
+
         探测失败（网络/超时/鉴权等）绝不抛出：返回空字典，由调用方回退到"学习式"降级。
         """
         changes: dict = {}
@@ -179,6 +183,77 @@ class LLMClient(ABC):
         # 请求成功：能力齐备
         changes["supports_tools"] = True
         changes["supports_response_format"] = True
+
+        # ---- 探测 json_schema 支持 ----
+        try:
+            await asyncio.wait_for(
+                client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": '只回复一个 json：{"ok": true}'}],
+                    response_format={
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "probe_schema",
+                            "schema": {
+                                "type": "object",
+                                "properties": {"ok": {"type": "boolean"}},
+                                "required": ["ok"],
+                            },
+                            "strict": True,
+                        },
+                    },
+                    max_tokens=5,
+                ),
+                timeout=15.0,
+            )
+            changes["json_schema"] = True
+        except Exception as e:
+            if isinstance(e, BadRequestError) and "json_schema" in str(e).lower():
+                changes["json_schema"] = False
+            else:
+                logger.warning(f"[probe] {model} json_schema 探测跳过（{type(e).__name__}: {e}）")
+
+        # ---- 探测 reasoning_effort 参数接受度 ----
+        try:
+            await asyncio.wait_for(
+                client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": "hello"}],
+                    max_tokens=5,
+                    extra_body={"reasoning_effort": "low"},
+                ),
+                timeout=15.0,
+            )
+            changes["reasoning_effort_supported"] = True
+        except Exception as e:
+            if isinstance(e, BadRequestError) and "reasoning_effort" in str(e).lower():
+                changes["reasoning_effort_supported"] = False
+            else:
+                logger.warning(f"[probe] {model} reasoning_effort 探测跳过（{type(e).__name__}: {e}）")
+
+        # ---- 探测中文 JSON 后缀敏感度 ----
+        # deepseek-flash 在收到中文 JSON 后缀时可能返回空字符串
+        # 通过在 prompt 中加入中文 JSON 标记，观察是否正常返回
+        try:
+            test_response = await asyncio.wait_for(
+                client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "user", "content": '只回复一个 json：{"ok": true} 这个 JSON 后面没有其他乱七八糟的内容'}
+                    ],
+                    response_format={"type": "json_object"},
+                    max_tokens=10,
+                ),
+                timeout=15.0,
+            )
+            content = test_response.choices[0].message.content
+            if not content or content.strip() == "":
+                changes["rejects_cn_suffix"] = True
+            else:
+                changes["rejects_cn_suffix"] = False
+        except Exception as e:
+            logger.warning(f"[probe] {model} cn_suffix 探测跳过（{type(e).__name__}: {e}）")
+
         logger.info(f"[probe] {model} 能力探测完成: {changes}")
         return changes
 
@@ -336,6 +411,26 @@ class OpenAIClient(LLMClient):
                     f"[OpenAIClient] {effective_model} 已确认拒收 thinking 参数，本次调用自动剔除。"
                 )
 
+        # json_mode → response_format 翻译（按能力注册表自动适配）
+        _json_mode = getattr(request, "json_mode", None)
+        if _json_mode:
+            _caps = get_registry().get(provider_base, effective_model)
+            if _json_mode == "json_object":
+                if _caps.supports_response_format is not False:
+                    kwargs["response_format"] = {"type": "json_object"}
+            elif _json_mode == "json_schema":
+                if _caps.json_schema:  # API 支持 json_schema 格式，response_format 已在 request 中携带 schema
+                    pass
+                elif _caps.supports_response_format is not False:
+                    kwargs["response_format"] = {"type": "json_object"}
+            elif _json_mode == "prompt_only":
+                kwargs.pop("response_format", None)
+        else:
+            # json_mode=None 时，若能力注册表已知不支持 response_format，自动剔除
+            _caps = get_registry().get(provider_base, effective_model)
+            if _caps.supports_response_format is False:
+                kwargs.pop("response_format", None)
+
         create_func = partial(
             client.chat.completions.create,
             model=effective_model,
@@ -396,6 +491,25 @@ class OpenAIClient(LLMClient):
             if _caps.thinking_param_rejected:
                 _extra = {k: v for k, v in _extra.items() if k != "thinking"}
                 kwargs["extra_body"] = _extra or None
+
+        # json_mode → response_format 翻译（同步调用也按能力注册表自动适配）
+        _json_mode = getattr(request, "json_mode", None)
+        if _json_mode:
+            _caps = get_registry().get(provider_base, effective_model)
+            if _json_mode == "json_object":
+                if _caps.supports_response_format is not False:
+                    kwargs["response_format"] = {"type": "json_object"}
+            elif _json_mode == "json_schema":
+                if _caps.json_schema:
+                    pass
+                elif _caps.supports_response_format is not False:
+                    kwargs["response_format"] = {"type": "json_object"}
+            elif _json_mode == "prompt_only":
+                kwargs.pop("response_format", None)
+        else:
+            _caps = get_registry().get(provider_base, effective_model)
+            if _caps.supports_response_format is False:
+                kwargs.pop("response_format", None)
 
         create_func = partial(
             client.chat.completions.create,
@@ -458,6 +572,25 @@ class OpenAIClient(LLMClient):
                 logger.info(
                     f"[OpenAIClient] {effective_model} 已确认拒收 thinking 参数，本次调用自动剔除。"
                 )
+
+        # json_mode → response_format 翻译
+        _json_mode = getattr(request, "json_mode", None)
+        if _json_mode:
+            _caps = get_registry().get(provider_base, effective_model)
+            if _json_mode == "json_object":
+                if _caps.supports_response_format is not False:
+                    kwargs["response_format"] = {"type": "json_object"}
+            elif _json_mode == "json_schema":
+                if _caps.json_schema:
+                    pass
+                elif _caps.supports_response_format is not False:
+                    kwargs["response_format"] = {"type": "json_object"}
+            elif _json_mode == "prompt_only":
+                kwargs.pop("response_format", None)
+        else:
+            _caps = get_registry().get(provider_base, effective_model)
+            if _caps.supports_response_format is False:
+                kwargs.pop("response_format", None)
 
         kwargs["stream"] = True
 
@@ -571,8 +704,9 @@ class LLMFactory:
         fallback_api_key = config.get("fallback_api_key")
         capability_probe = config.get("capability_probe", True)
 
-        if provider == "openai":
-            # narrow api_key: Any | None → str（None 时抛错——空 api_key 是真业务 bug）
+        # 所有 OpenAI 兼容协议的 provider（deepseek/zhipu/glm 等）都走 OpenAIClient，
+        # 区别仅在 base_url + 能力注册表条目。不新增 Provider 类。
+        if provider in ("openai", "deepseek", "zhipu", "glm", "moonshot", "lingyi", "qwen", "doubao"):
             if not api_key:
                 raise ValueError(
                     "LLM config 缺 api_key——请在 config dict 配 api_key 或环境变量 LLM_API_KEY"
@@ -588,11 +722,8 @@ class LLMFactory:
                 fallback_api_key=fallback_api_key,
                 capability_probe=capability_probe,
             )
-        # 未来扩展点：anthropic / deepseek / local
-        # elif provider == "anthropic":
-        #     return AnthropicClient(...)
         raise ValueError(
-            f"unsupported provider: {provider}（已实现：openai；待扩展：anthropic/deepseek/local）"
+            f"unsupported provider: {provider}（已支持：openai/deepseek/zhipu/glm/moonshot/lingyi/qwen/doubao，均走 OpenAI 兼容协议）"
         )
 
 

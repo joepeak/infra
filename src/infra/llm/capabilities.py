@@ -56,6 +56,23 @@ class ProviderCapabilities:
     supports_video: Optional[bool] = None
     #: 是否支持音频生成 (TTS / 配乐 / 声音合成)
     supports_audio: Optional[bool] = None
+    #: JSON 输出偏好的结构化方式。None=未知；'json_object' | 'json_schema' | 'prompt_only'
+    json_mode: Optional[str] = None
+    #: 是否支持 json_schema 格式的 response_format。None=未知
+    json_schema: Optional[bool] = None
+    #: 模型是否强制开启思考（如 GLM-5.3-Flash thinking 不可关闭）。None=未知
+    thinking_required: Optional[bool] = None
+    #: 思考级别参数名（'reasoning_effort' / 'thinking' / None），供调用方按能力注入。
+    thinking_param_name: Optional[str] = None
+    #: 是否接受 reasoning_effort 参数（GLM 需要，deepseek 不接受）。None=未知
+    reasoning_effort_supported: Optional[bool] = None
+    #: 模型是否对中文 JSON 后缀敏感（deepseek-flash 曾返回空）。None=未知
+    rejects_cn_suffix: Optional[bool] = None
+    #: 是否支持上下文缓存（DeepSeek prefix cache / GLM context cache / OpenAI prompt cache）。
+    #: 供路由层做成本预估。None=未知
+    supports_prompt_caching: Optional[bool] = None
+    #: 缓存命中单价（元/百万 tokens），供成本预估。None=未知
+    cache_hit_price: Optional[float] = None
     #: 最近一次学习到的错误摘要（仅供排查用，不参与判定）
     last_error: Optional[str] = None
     #: 数据来源标记：'probe' | 'learn' | None
@@ -75,6 +92,13 @@ class ProviderCapabilities:
         "supports_image",
         "supports_video",
         "supports_audio",
+        "json_mode",
+        "json_schema",
+        "thinking_required",
+        "thinking_param_name",
+        "reasoning_effort_supported",
+        "rejects_cn_suffix",
+        "supports_prompt_caching",
     )
 
 
