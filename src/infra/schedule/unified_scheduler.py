@@ -40,6 +40,15 @@ class UnifiedScheduler:
         # scheduler.stop 是 noop——真正停止调 self.scheduler.shutdown
         self.scheduler.shutdown()
         logger.info("统一调度器已关闭")
+
+    async def on_lost_leader(self) -> None:
+        """失去 leader 时停掉调度器——避免定时任务重复执行。
+
+        应挂到 :class:`LeaderElection` 的 ``on_lost_leader`` 回调::
+
+            leader = LeaderElection(cfg, on_lost_leader=unified.on_lost_leader)
+        """
+        await self.scheduler.on_lost_leader()
     
     def shutdown(self) -> None:
         """关闭调度器"""
