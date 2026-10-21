@@ -10,6 +10,7 @@ from .stream_mq import (
     init_mq,
     get_mq,
     MessagePriority,
+    PriorityConfig,
     QueueConfig,
     QueueName,
 )
@@ -19,6 +20,7 @@ __all__ = [
     'init_mq',
     'get_mq',
     'MessagePriority',
+    'PriorityConfig',
     'QueueConfig',
     'QueueName',
 ]

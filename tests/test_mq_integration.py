@@ -920,3 +920,260 @@ class TestPriorityConsumption:
 
         stats = await mq.get_stats(stream)
         assert stats["pending_count"] == 0, "消息仍卡在 PEL"
+
+
+# ============================================================
+# 15. 每优先级独立配置
+# ============================================================
+class TestPerPriorityConfig:
+    """每个优先级可以有**独立的**并发上限 / 重试次数 / 死信队列。
+
+    这是「更细粒度的优先级支持」——不只是消费顺序不同，
+    而是不同优先级的消息有不同待遇。
+    """
+
+    async def test_each_priority_has_own_concurrency_limit(self, mq):
+        """每个优先级的并发上限是**独占**的——各自有自己的额度。"""
+        stream = _stream_name(mq, "ppc")
+        mq.create_queue(
+            stream,
+            concurrency=2,
+            batch_size=5,
+            block_ms=100,
+            priorities=["critical", "low"],
+            per_priority={
+                "critical": {"max_concurrency": 2},
+                "low": {"max_concurrency": 1},
+            },
+        )
+        active = {"critical": 0, "low": 0}
+        peak = {"critical": 0, "low": 0}
+
+        async def handler(msg):
+            p = msg.priority
+            active[p] += 1
+            peak[p] = max(peak[p], active[p])
+            await asyncio.sleep(0.3)
+            active[p] -= 1
+
+        mq.register(stream, "demo", handler)
+        await mq.start([stream])
+
+        for i in range(6):
+            await mq.publish(
+                stream, {"task_id": f"c{i}", "task_type": "demo",
+                         "priority": "critical", "payload": {}},
+            )
+        for i in range(6):
+            await mq.publish(
+                stream, {"task_id": f"l{i}", "task_type": "demo",
+                         "priority": "low", "payload": {}},
+            )
+        await asyncio.sleep(4)
+
+        assert peak["critical"] <= 2, f"critical 并发 {peak['critical']} 超上限 2"
+        assert peak["low"] <= 1, f"low 并发 {peak['low']} 超上限 1"
+
+    async def test_priority_uses_own_max_retries(self, mq, real_redis):
+        """每优先级独立重试次数——critical 重试 1 次就进死信。"""
+        stream = _stream_name(mq, "ppr")
+        mq.create_queue(
+            stream,
+            concurrency=1,
+            block_ms=100,
+            claim_interval=1,
+            claim_min_idle_ms=300,
+            max_retries=5,  # 队列级：5 次
+            priorities=["critical", "normal"],
+            per_priority={
+                "critical": {"max_retries": 1, "separate_dead_letter": True},
+            },
+        )
+        calls = {"n": 0}
+
+        async def handler(msg):
+            calls["n"] += 1
+            raise RuntimeError("失败")
+
+        mq.register(stream, "demo", handler)
+        await mq.start([stream])
+
+        await mq.publish(
+            stream, {"task_id": "c", "task_type": "demo",
+                     "priority": "critical", "payload": {}},
+        )
+        ok = await _wait_for(
+            lambda: _dead_has_msg(real_redis, f"{stream}:critical"),
+            timeout=12.0,
+        )
+        assert ok, "critical 未按自己的 max_retries 进死信"
+
+        # 关键断言：delivery_count 反映的是**优先级自己的** max_retries(1)，
+        # 而不是队列级的 5——否则无法区分是否真的用了独立配置
+        entries = await real_redis.xrange(f"{stream}:critical:dead_letter", "-", "+")
+        assert entries, "死信记录为空"
+        delivery_count = int(entries[0][1].get("delivery_count", 0))
+        assert delivery_count <= 2, (
+            f"delivery_count={delivery_count} —— "
+            f"说明用的是队列级 max_retries(5) 而非 critical 自己的 1"
+        )
+
+    async def test_separate_dead_letter_queue(self, mq, real_redis):
+        """separate_dead_letter=True 的优先级用**独立**死信队列。"""
+        stream = _stream_name(mq, "pdl")
+        mq.create_queue(
+            stream,
+            concurrency=1,
+            block_ms=100,
+            claim_interval=1,
+            claim_min_idle_ms=300,
+            max_retries=1,
+            priorities=["critical", "normal"],
+            per_priority={
+                "critical": {"separate_dead_letter": True},
+            },
+        )
+
+        async def handler(msg):
+            raise RuntimeError("失败")
+
+        mq.register(stream, "demo", handler)
+        await mq.start([stream])
+
+        await mq.publish(
+            stream, {"task_id": "c", "task_type": "demo",
+                     "priority": "critical", "payload": {}},
+        )
+        ok = await _wait_for(
+            lambda: _dead_has_msg(real_redis, f"{stream}:critical"),
+            timeout=12.0,
+        )
+        assert ok, "critical 未进独立死信队列"
+        # 共用死信队列应为空
+        assert await real_redis.xlen(f"{stream}:dead_letter") == 0, (
+            "critical 的消息不该进共用死信队列"
+        )
+
+    async def test_shared_dead_letter_by_default(self, mq, real_redis):
+        """未配 separate_dead_letter 的优先级仍用共用死信队列。"""
+        stream = _stream_name(mq, "psh")
+        mq.create_queue(
+            stream,
+            concurrency=1,
+            block_ms=100,
+            claim_interval=1,
+            claim_min_idle_ms=300,
+            max_retries=1,
+            priorities=["critical", "normal"],
+        )
+
+        async def handler(msg):
+            raise RuntimeError("失败")
+
+        mq.register(stream, "demo", handler)
+        await mq.start([stream])
+
+        await mq.publish(
+            stream, {"task_id": "n", "task_type": "demo",
+                     "priority": "normal", "payload": {}},
+        )
+        ok = await _wait_for(
+            lambda: _dead_has_msg(real_redis, stream), timeout=12.0
+        )
+        assert ok, "normal 未进共用死信队列"
+
+    async def test_get_dead_letters_across_queues(self, mq, real_redis):
+        """get_dead_letters 不指定优先级时返回**全部**死信队列的记录。"""
+        stream = _stream_name(mq, "pall")
+        mq.create_queue(
+            stream,
+            concurrency=1,
+            block_ms=100,
+            claim_interval=1,
+            claim_min_idle_ms=300,
+            max_retries=1,
+            priorities=["critical", "normal"],
+            per_priority={
+                "critical": {"separate_dead_letter": True},
+            },
+        )
+
+        async def handler(msg):
+            raise RuntimeError("失败")
+
+        mq.register(stream, "demo", handler)
+        await mq.start([stream])
+
+        for p in ("critical", "normal"):
+            await mq.publish(
+                stream, {"task_id": p, "task_type": "demo",
+                         "priority": p, "payload": {}},
+            )
+        async def _both_dead() -> bool:
+            return (
+                await _dead_has_msg(real_redis, stream)
+                and await _dead_has_msg(real_redis, f"{stream}:critical")
+            )
+
+        ok = await _wait_for(_both_dead, timeout=15.0)
+        assert ok, "两个优先级的死信未都产生"
+
+        dead = await mq.get_dead_letters(stream)
+        assert len(dead) >= 2, f"应返回全部死信记录，实际 {len(dead)}"
+        priorities = {d.get("priority") for d in dead}
+        assert "critical" in priorities
+        assert "normal" in priorities
+
+        # 只清 critical
+        cleared = await mq.clear_dead_letters(stream, priority="critical")
+        assert cleared >= 1
+        assert await real_redis.xlen(f"{stream}:critical:dead_letter") == 0
+        assert await real_redis.xlen(f"{stream}:dead_letter") > 0, (
+            "共用死信队列不该被一起清掉"
+        )
+
+    async def test_priority_own_ttl(self, mq, real_redis):
+        """每优先级独立时效——critical 的 TTL 更短，过期即丢弃。
+
+        关键：消息的 created_at 只比「队列级 TTL」短一点，但比
+        「critical 自己的 TTL」长——只有用了独立 TTL 才会判定过期。
+        """
+        stream = _stream_name(mq, "pttl")
+        mq.create_queue(
+            stream,
+            concurrency=1,
+            block_ms=100,
+            ttl_seconds=3600,  # 队列级：1 小时
+            priorities=["critical", "normal"],
+            per_priority={
+                "critical": {"ttl_seconds": 1},  # critical 自己的：1 秒
+            },
+        )
+        received = []
+
+        async def handler(msg):
+            received.append(msg)
+
+        mq.register(stream, "demo", handler)
+        await mq.start([stream])
+
+        # created_at = 10 秒前 —— 比 critical 的 1s TTL 老，
+        # 但比队列级的 3600s TTL 新
+        import time as _time
+        await real_redis.xadd(
+            f"{stream}:critical",
+            {
+                "task_id": "old",
+                "task_type": "demo",
+                "scheduled_time": "2026-01-01T00:00:00",
+                "payload": "{}",
+                "metadata": "",
+                "priority": "critical",
+                "created_at": str(_time.time() - 10),
+            },
+        )
+        ok = await _wait_for(
+            lambda: mq._stats.get("total_expired", 0) >= 1, timeout=8.0
+        )
+        assert ok, "critical 的独立 TTL 未生效"
+        assert len(received) == 0, "过期消息不应交给 handler"

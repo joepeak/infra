@@ -60,6 +60,33 @@ class MessagePriority:
         return f"{queue_name}:{cls.normalize(priority)}"
 
 @dataclass
+class PriorityConfig:
+    """**单个优先级**的独立配置。
+
+    用于多优先级队列——不同优先级的消息可以有不同待遇：
+
+      - ``max_concurrency``：该优先级**独占**的并发上限
+        （critical 可以占满全部额度，low 只能分到剩下的）
+      - ``max_retries``：该优先级的重试次数上限
+      - ``ttl_seconds``：该优先级消息的时效
+      - ``separate_dead_letter``：是否使用**独立的死信队列**
+        （False 则与其它优先级共用逻辑队列的死信队列）
+
+    所有字段为 None 时表示「继承队列级默认值」。
+    """
+
+    #: 该优先级的并发上限（独立于其它优先级）——None 表示继承队列级
+    max_concurrency: Optional[int] = None
+    #: 该优先级的重试次数上限——None 表示继承队列级
+    max_retries: Optional[int] = None
+    #: 该优先级消息的时效（秒）——None 表示继承队列级
+    ttl_seconds: Optional[int] = None
+    #: 是否使用独立的死信队列（``<stream>:dead_letter``）
+    #: False（默认）表示与同队列其它优先级共用 ``<queue>:dead_letter``
+    separate_dead_letter: bool = False
+
+
+@dataclass
 class QueueConfig:
     """单个队列配置"""
     stream_name: str
@@ -80,12 +107,66 @@ class QueueConfig:
     #: 单优先级队列就是 `[stream_name]`；多优先级队列是
     #: ``["q:critical", "q:high", "q:normal", "q:low"]``。
     priority_streams: List[str] = field(default_factory=list)
+    #: **每优先级**的独立配置——键是优先级名。
+    #: 没配置的优先级继承队列级默认值。
+    per_priority: Dict[str, PriorityConfig] = field(default_factory=dict)
     #: **同时执行的 handler 数量上限**（跨所有 worker 共享）。
     #: None 表示不额外限制（实际并发度 = concurrency × batch_size）。
     max_concurrency: Optional[int] = None
     claim_interval: int = 30
     claim_min_idle_ms: int = 60000
     ttl_seconds: int = 0  # 0 表示永不过期
+
+
+def _build_per_priority(
+    raw: Optional[Dict[str, Any]],
+) -> Dict[str, PriorityConfig]:
+    """解析每优先级的独立配置。
+
+    Args:
+        raw: ``{优先级: {字段: 值}}`` 形式的 dict；
+            值也可以直接是 :class:`PriorityConfig` 实例。
+
+    Returns:
+        规整后的配置 dict（键是规整后的优先级名）
+    """
+    if not raw:
+        return {}
+    result: Dict[str, PriorityConfig] = {}
+    for key, value in raw.items():
+        priority = MessagePriority.normalize(key)
+        if isinstance(value, PriorityConfig):
+            result[priority] = value
+            continue
+        if not isinstance(value, dict):
+            logger.warning(
+                f"per_priority[{key!r}] 不是 dict 或 PriorityConfig，已忽略: {value!r}"
+            )
+            continue
+        result[priority] = PriorityConfig(
+            max_concurrency=value.get("max_concurrency"),
+            max_retries=value.get("max_retries"),
+            ttl_seconds=value.get("ttl_seconds"),
+            separate_dead_letter=bool(value.get("separate_dead_letter", False)),
+        )
+    return result
+
+
+def _extract_priority(original_data: Any) -> Optional[str]:  # noqa: ANN401
+    """从死信消息的原始数据里取出 priority 字段。
+
+    ``original_data`` 是 JSON 字符串——解析失败返回 None。
+    """
+    if not isinstance(original_data, str):
+        return None
+    try:
+        data = json.loads(original_data)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    priority = data.get("priority")
+    return str(priority) if priority else None
 
 
 class RedisStreamMQ:
@@ -193,6 +274,7 @@ class RedisStreamMQ:
         group_name: Optional[str] = None,
         *,
         priorities: Optional[List[str]] = None,
+        per_priority: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> 'RedisStreamMQ':
         """创建/注册一个队列。
@@ -205,6 +287,18 @@ class RedisStreamMQ:
                 消费时按优先级顺序读取。
                 None（默认）表示**单优先级**——只用 ``stream_name`` 这一个
                 stream，行为与之前完全一致。
+            per_priority: **每优先级的独立配置**，形如::
+
+                {
+                    "critical": {
+                        "max_concurrency": 10,   # 独占 10 个并发额度
+                        "max_retries": 5,        # 独立重试次数
+                        "ttl_seconds": 60,       # 独立时效
+                        "separate_dead_letter": True,  # 独立死信队列
+                    },
+                }
+
+                未指定的字段继承队列级默认值；未指定的优先级用队列级默认。
 
         重复调用是**幂等**的：已注册的 handler 不会被清空。
         （旧实现每次都 ``self._handlers[stream_name] = {}``，
@@ -236,6 +330,7 @@ class RedisStreamMQ:
             claim_min_idle_ms=kwargs.get('claim_min_idle_ms', 60000),
             ttl_seconds=kwargs.get('ttl_seconds', 0),
             priority_streams=priority_streams,
+            per_priority=_build_per_priority(per_priority),
         )
 
         self._queues[stream_name] = config
@@ -249,6 +344,69 @@ class RedisStreamMQ:
         )
         return self
     
+    # ==================== 每优先级配置解析 ====================
+
+    @staticmethod
+    def _priority_of_stream(config: QueueConfig, stream: str) -> Optional[str]:
+        """从实际 stream 名反推优先级——单优先级队列返回 None。"""
+        if len(config.priority_streams) <= 1:
+            return None
+        for p in MessagePriority.ORDER:
+            if MessagePriority.stream_name(config.stream_name, p) == stream:
+                return p
+        return None
+
+    @staticmethod
+    def _priority_config(
+        config: QueueConfig, priority: Optional[str]
+    ) -> Optional[PriorityConfig]:
+        """取某优先级的独立配置——没有则 None（继承队列级默认）。"""
+        if not priority:
+            return None
+        return config.per_priority.get(priority)
+
+    def _resolve_max_concurrency(
+        self, config: QueueConfig, priority: Optional[str]
+    ) -> Optional[int]:
+        """解析某优先级的并发上限——优先级的独立值，其次队列级。"""
+        pcfg = self._priority_config(config, priority)
+        if pcfg is not None and pcfg.max_concurrency is not None:
+            return pcfg.max_concurrency
+        return config.max_concurrency
+
+    def _resolve_max_retries(
+        self, config: QueueConfig, priority: Optional[str]
+    ) -> int:
+        """解析某优先级的重试次数上限。"""
+        pcfg = self._priority_config(config, priority)
+        if pcfg is not None and pcfg.max_retries is not None:
+            return pcfg.max_retries
+        return config.max_retries
+
+    def _resolve_ttl(
+        self, config: QueueConfig, priority: Optional[str]
+    ) -> int:
+        """解析某优先级的时效（秒）。"""
+        pcfg = self._priority_config(config, priority)
+        if pcfg is not None and pcfg.ttl_seconds is not None:
+            return pcfg.ttl_seconds
+        return config.ttl_seconds
+
+    def _resolve_dead_letter_key(
+        self, config: QueueConfig, priority: Optional[str]
+    ) -> str:
+        """解析某优先级的死信队列名。
+
+        - 该优先级配置了 ``separate_dead_letter=True`` → 独立死信队列
+          （``<stream>:dead_letter``，其中 stream 是该优先级的实际 stream）
+        - 否则 → 共用逻辑队列的死信队列（``<queue>:dead_letter``）
+        """
+        pcfg = self._priority_config(config, priority)
+        if pcfg is not None and pcfg.separate_dead_letter and priority:
+            actual = MessagePriority.stream_name(config.stream_name, priority)
+            return f"{actual}:dead_letter"
+        return f"{config.stream_name}:dead_letter"
+
     @staticmethod
     def _resolve_target_stream(config: QueueConfig, data: Dict[str, str]) -> str:
         """决定消息实际要写入哪个 stream。
@@ -554,7 +712,10 @@ class RedisStreamMQ:
             delivery_count = await self._get_delivery_count(
                 stream_name, config, msg_id, actual_stream
             )
-            if delivery_count > config.max_retries:
+            priority = self._priority_of_stream(
+                config, actual_stream or stream_name
+            )
+            if delivery_count > self._resolve_max_retries(config, priority):
                 await self._move_to_dead_letter_by_id(
                     stream_name, config, msg_id, delivery_count,
                     actual_stream=actual_stream,
@@ -623,7 +784,10 @@ class RedisStreamMQ:
             actual_stream: 消息实际所在的 stream（多优先级队列用）
         """
         redis = self._r()
-        dead_letter_key = f"{stream_name}:dead_letter"
+        priority = self._priority_of_stream(
+            config, actual_stream or config.stream_name
+        )
+        dead_letter_key = self._resolve_dead_letter_key(config, priority)
         src_stream = actual_stream or config.stream_name
         msgs = await redis.xrange(src_stream, msg_id, msg_id)
         if not msgs:
@@ -660,17 +824,33 @@ class RedisStreamMQ:
                 f"delivery_count={delivery_count}, reason={reason}"
             )
     
-    def _get_semaphore(self, stream_name: str, config: QueueConfig) -> Optional[asyncio.Semaphore]:
+    def _get_semaphore(
+        self,
+        stream_name: str,
+        config: QueueConfig,
+        actual_stream: Optional[str] = None,
+    ) -> Optional[asyncio.Semaphore]:
         """取该 stream 的并发信号量（跨所有 worker 共享）。
+
+        **每个优先级一个独立信号量**——所以每个优先级的并发上限是
+        「独占」的：critical 可以占满自己的额度，low 只能用剩下的。
+
+        实际并发度 = 各优先级上限之和（未单独配置的优先级共用队列级上限）。
 
         没配 ``max_concurrency`` 时返回 None——不限制并发。
         """
-        if not config.max_concurrency or config.max_concurrency <= 0:
+        priority = self._priority_of_stream(
+            config, actual_stream or stream_name
+        )
+        limit = self._resolve_max_concurrency(config, priority)
+        if not limit or limit <= 0:
             return None
-        sem = self._semaphores.get(stream_name)
+        # 信号量按**实际 stream** 存——多优先级队列下每个优先级独立
+        key = actual_stream or stream_name
+        sem = self._semaphores.get(key)
         if sem is None:
-            sem = asyncio.Semaphore(config.max_concurrency)
-            self._semaphores[stream_name] = sem
+            sem = asyncio.Semaphore(limit)
+            self._semaphores[key] = sem
         return sem
 
     async def _process_message(self, stream_name: str, config: QueueConfig,
@@ -695,7 +875,10 @@ class RedisStreamMQ:
         ack_stream = actual_stream or config.stream_name
 
         # 时效性检查
-        if self._is_message_expired(created_at, config.ttl_seconds):
+        priority = self._priority_of_stream(config, ack_stream)
+        if self._is_message_expired(
+            created_at, self._resolve_ttl(config, priority)
+        ):
             logger.warning(f"⏰ 消息已过期，丢弃: {stream_name}/{msg_id}, type={task_type}")
             await redis.xack(ack_stream, config.group_name, msg_id)
             self._stats['total_expired'] += 1
@@ -705,7 +888,7 @@ class RedisStreamMQ:
         # worker 数（concurrency）只决定有几个消费者在读，
         # 每个 worker 一次读 batch_size 条并行处理，
         # 不加这个限制实际并发度是 concurrency × batch_size。
-        sem = self._get_semaphore(stream_name, config)
+        sem = self._get_semaphore(stream_name, config, ack_stream)
         if sem is not None:
             await sem.acquire()
         try:
@@ -981,21 +1164,24 @@ class RedisStreamMQ:
             config = self._queues.get(stream_name)
             if config is None:
                 continue
-            for name in list(names):
-                try:
-                    await redis.xgroup_delconsumer(
-                        config.stream_name, config.group_name, name
-                    )
-                except ResponseError as e:
-                    # 组或 consumer 已不存在——忽略
-                    if "NOGROUP" not in str(e):
-                        logger.warning(
-                            f"删除消费者失败: {stream_name}/{name}, error={e}"
+            # 多优先级队列：consumer 注册在**每个** priority stream 上，
+            # 必须逐个删除——只删逻辑队列名那个会漏掉其余的
+            for target in (config.priority_streams or [config.stream_name]):
+                for name in list(names):
+                    try:
+                        await redis.xgroup_delconsumer(
+                            target, config.group_name, name
                         )
-                except Exception as e:
-                    logger.warning(
-                        f"删除消费者异常: {stream_name}/{name}, error={e}"
-                    )
+                    except ResponseError as e:
+                        # 组或 consumer 已不存在——忽略
+                        if "NOGROUP" not in str(e):
+                            logger.warning(
+                                f"删除消费者失败: {target}/{name}, error={e}"
+                            )
+                    except Exception as e:
+                        logger.warning(
+                            f"删除消费者异常: {target}/{name}, error={e}"
+                        )
             names.clear()
         self._consumer_names.clear()
     
@@ -1045,24 +1231,53 @@ class RedisStreamMQ:
                 pending_count += pending.get('pending', 0) if pending else 0
             except Exception as e:
                 logger.warning(f"查询 pending 失败(按0处理) {st}: {e}")
-        dead_len = await redis.xlen(f"{config.stream_name}:dead_letter")
-        
+        # 死信统计——包含各优先级的独立死信队列（若配置了）
+        dead_keys = {f"{config.stream_name}:dead_letter"}
+        for p in MessagePriority.ORDER:
+            pcfg = config.per_priority.get(p)
+            if pcfg is not None and pcfg.separate_dead_letter:
+                dead_keys.add(
+                    f"{MessagePriority.stream_name(config.stream_name, p)}:dead_letter"
+                )
+        dead_len = 0
+        for dk in dead_keys:
+            dead_len += int(await redis.xlen(dk))
+
         return {
             'stream_name': config.stream_name,
             'group_name': config.group_name,
             'stream_length': stream_len,
             'pending_count': pending_count,
             'dead_letter_count': dead_len,
+            'dead_letter_keys': sorted(dead_keys),
             'registered_handlers': list(self._handlers.get(stream_name, {}).keys()),
             'worker_count': len(self._consumer_tasks.get(stream_name, [])),
             'claimer_running': stream_name in self._claim_tasks,
             'ttl_seconds': config.ttl_seconds
         }
     
-    async def retry_dead_letter(self, stream_name: str, msg_id: str) -> bool:
-        """从死信队列重新处理消息"""
+    async def retry_dead_letter(
+        self,
+        stream_name: str,
+        msg_id: str,
+        priority: Optional[str] = None,
+    ) -> bool:
+        """从死信队列重新处理消息。
+
+        Args:
+            stream_name: 逻辑队列名
+            msg_id: 死信消息 ID
+            priority: 目标优先级——该优先级配了独立死信队列时必须指定
+                （否则从共用的死信队列里找）
+        """
         redis = self._r()  # narrow
-        dead_letter_key = f"{stream_name}:dead_letter"
+        config = self._queues.get(stream_name)
+        if config is not None:
+            dead_letter_key = self._resolve_dead_letter_key(
+                config, MessagePriority.normalize(priority) if priority else None
+            )
+        else:
+            dead_letter_key = f"{stream_name}:dead_letter"
         data = await redis.xrange(dead_letter_key, msg_id, msg_id)
 
         if not data:
@@ -1103,33 +1318,89 @@ class RedisStreamMQ:
         self,
         stream_name: str,
         count: int = 100,
+        priority: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """读取死信队列的消息（供人工排查）。
 
         Args:
             stream_name: 队列名
             count: 最多返回多少条
+            priority: 只读该优先级的死信队列（配了独立死信队列时用）；
+                None 表示读**全部**死信队列（共用 + 各独立）
 
         Returns:
             死信记录列表（每项含 original_id / original_data /
-            delivery_count / reason / failed_at）
+            delivery_count / reason / failed_at / priority）
         """
         redis = self._r()
-        dead_letter_key = f"{stream_name}:dead_letter"
-        entries = await redis.xrange(dead_letter_key, "-", "+", count=count)
         result: List[Dict[str, Any]] = []
-        for entry in entries or ():
-            if not isinstance(entry, (list, tuple)) or len(entry) < 2:
-                continue
-            msg_id, data = entry[0], entry[1]
-            item: Dict[str, Any] = {"dead_letter_id": str(msg_id)}
-            if isinstance(data, dict):
-                # key 可能是 bytes（未开 decode_responses 时）——统一转 str
-                item.update({str(k): v for k, v in data.items()})
-            result.append(item)
+        for key, prio in self._dead_letter_keys(stream_name, priority):
+            entries = await redis.xrange(key, "-", "+", count=count)
+            for entry in entries or ():
+                if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+                    continue
+                msg_id, data = entry[0], entry[1]
+                item: Dict[str, Any] = {
+                    "dead_letter_id": str(msg_id),
+                    "dead_letter_key": key,
+                }
+                if isinstance(data, dict):
+                    # key 可能是 bytes（未开 decode_responses 时）——统一转 str
+                    item.update({str(k): v for k, v in data.items()})
+                # 标记来源优先级——共用死信队列时无法从 key 推断，
+                # 用消息内容里的 priority 字段（缺失则为 normal）
+                item.setdefault(
+                    "priority",
+                    MessagePriority.normalize(
+                        item.get("original_data") and _extract_priority(
+                            item.get("original_data")
+                        )
+                    ),
+                )
+                if prio:
+                    item["priority"] = prio
+                result.append(item)
+                if len(result) >= count:
+                    return result
         return result
 
-    async def clear_dead_letters(self, stream_name: str) -> int:
+    def _dead_letter_keys(
+        self,
+        stream_name: str,
+        priority: Optional[str] = None,
+    ) -> List[Tuple[str, Optional[str]]]:
+        """列出要操作的死信队列——(队列名, 来源优先级)。
+
+        - 指定了 priority → 只操作该优先级的死信队列
+        - 未指定 → 共用队列 + 各独立队列（全部）
+        """
+        config = self._queues.get(stream_name)
+        if config is None:
+            return [(f"{stream_name}:dead_letter", priority)]
+
+        shared = (f"{config.stream_name}:dead_letter", None)
+        if priority:
+            p = MessagePriority.normalize(priority)
+            pcfg = config.per_priority.get(p)
+            if pcfg is not None and pcfg.separate_dead_letter:
+                actual = MessagePriority.stream_name(config.stream_name, p)
+                return [(f"{actual}:dead_letter", p)]
+            # 该优先级用共用队列
+            return [shared]
+
+        keys: List[Tuple[str, Optional[str]]] = [shared]
+        for p in MessagePriority.ORDER:
+            pcfg = config.per_priority.get(p)
+            if pcfg is not None and pcfg.separate_dead_letter:
+                actual = MessagePriority.stream_name(config.stream_name, p)
+                keys.append((f"{actual}:dead_letter", p))
+        return keys
+
+    async def clear_dead_letters(
+        self,
+        stream_name: str,
+        priority: Optional[str] = None,
+    ) -> int:
         """清空死信队列，返回被清除的消息条数。
 
         死信队列只增不减（maxlen=1000 封顶），长期运行会一直占 Redis 内存。
@@ -1137,17 +1408,21 @@ class RedisStreamMQ:
 
         Args:
             stream_name: 队列名
+            priority: 只清该优先级的死信队列；None 表示清**全部**
+                （共用队列 + 各独立队列）
 
         Returns:
             被清除的条数
         """
         redis = self._r()
-        dead_letter_key = f"{stream_name}:dead_letter"
-        count = int(await redis.xlen(dead_letter_key))
-        if count:
-            await redis.delete(dead_letter_key)
-            logger.info(f"死信队列已清空: {dead_letter_key}, 清除 {count} 条")
-        return count
+        total = 0
+        for key, _prio in self._dead_letter_keys(stream_name, priority):
+            count = int(await redis.xlen(key))
+            if count:
+                await redis.delete(key)
+                total += count
+                logger.info(f"死信队列已清空: {key}, 清除 {count} 条")
+        return total
 
 
 # 队列名称常量（项目自定义——infra 不再硬编码）
@@ -1201,6 +1476,8 @@ async def init_mq(
         _mq.create_queue(
             stream_name=q_dict['name'],
             group_name=q_dict.get('group'),
+            priorities=q_dict.get('priorities', None),
+            per_priority=q_dict.get('per_priority', None),
             maxlen=q_dict.get('maxlen', 10000),
             block_ms=q_dict.get('block_ms', 1000),
             batch_size=q_dict.get('batch_size', 10),
