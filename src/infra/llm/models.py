@@ -28,7 +28,14 @@ class LLMRequest(BaseModel):
     top_p: float = Field(default=1.0, ge=0, le=1)
     tools: Optional[List[Dict[str, Any]]] = Field(None, description="工具定义")
     tool_choice: Optional[Union[str, Dict[str, Any]]] = Field(None)
-    response_format: Optional[Dict[str, str]] = Field(None, description="response_format（如 OpenAI 的 json_object）")
+    response_format: Optional[Dict[str, Any]] = Field(
+        None,
+        description=(
+            "response_format（透传给 provider 的原始 dict）——"
+            "如 {'type': 'json_object'} 或 "
+            "{'type': 'json_schema', 'json_schema': {...}}（嵌套结构）"
+        ),
+    )
     timeout: Optional[float] = Field(None, description="单次调用超时（秒）")
     extra_body: Optional[Dict[str, Any]] = Field(default=None, description="Extra parameters passed to the LLM API (e.g. thinking control for DeepSeek)")
     retry_config: Optional[RetryConfig] = Field(default=None, description="Override retry config for this request (defaults to LLMRetryConfig)")
@@ -268,7 +275,10 @@ class MediaRequest(BaseModel):
 
 class MediaResponse(BaseModel):
     """Unified media generation response."""
-    model_config = ConfigDict(existing_data_ok=True)
+    # existing_data_ok 是 pydantic 运行时支持的合法配置项，
+    # 但 pydantic 2.13.5 的 ConfigDict TypedDict 尚未收录它 -> 类型检查报
+    # typeddict-unknown-key。这里保留配置（运行时有效），仅屏蔽类型告警。
+    model_config = ConfigDict(existing_data_ok=True)  # type: ignore[typeddict-unknown-key]
 
     modality: Modality = Field(default="text", description="The modality that was generated")
     model: Optional[str] = Field(None, description="Actual model name returned by provider")
@@ -282,7 +292,10 @@ class MediaResponse(BaseModel):
 
 class ImageResult(BaseModel):
     """A single generated image."""
-    model_config = ConfigDict(existing_data_ok=True)
+    # existing_data_ok 是 pydantic 运行时支持的合法配置项，
+    # 但 pydantic 2.13.5 的 ConfigDict TypedDict 尚未收录它 -> 类型检查报
+    # typeddict-unknown-key。这里保留配置（运行时有效），仅屏蔽类型告警。
+    model_config = ConfigDict(existing_data_ok=True)  # type: ignore[typeddict-unknown-key]
 
     url: Optional[str] = Field(None, description="Publicly reachable URL to the image")
     b64_json: Optional[str] = Field(None, description="Base64-encoded image data (when response_format=b64_json)")
@@ -305,7 +318,10 @@ class VideoResult(BaseModel):
 
 class AudioResult(BaseModel):
     """A single generated audio output."""
-    model_config = ConfigDict(existing_data_ok=True)
+    # existing_data_ok 是 pydantic 运行时支持的合法配置项，
+    # 但 pydantic 2.13.5 的 ConfigDict TypedDict 尚未收录它 -> 类型检查报
+    # typeddict-unknown-key。这里保留配置（运行时有效），仅屏蔽类型告警。
+    model_config = ConfigDict(existing_data_ok=True)  # type: ignore[typeddict-unknown-key]
 
     url: Optional[str] = Field(None, description="Publicly reachable URL to the audio")
     b64_json: Optional[str] = Field(None, description="Base64-encoded audio data (when response_format=b64_json)")

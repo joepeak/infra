@@ -70,6 +70,12 @@ from infra.llm.usage import (
     log_usage_summary,
     set_llm_purpose,
     reset_llm_purpose,
+    MediaUsage,
+    record_media_task,
+    record_media_billable,
+    get_media_usage_summary,
+    reset_media_usage_summary,
+    log_media_usage_summary,
 )
 from infra.llm.capabilities import (
     ProviderCapabilities,
@@ -113,6 +119,10 @@ __all__ = [
     # usage
     "record_usage", "get_usage_summary", "reset_usage_summary",
     "log_usage_summary", "set_llm_purpose", "reset_llm_purpose",
+    # media usage（按次/按张/按时长计费——与 token 是不同维度）
+    "MediaUsage", "record_media_task", "record_media_billable",
+    "get_media_usage_summary", "reset_media_usage_summary",
+    "log_media_usage_summary",
     # capabilities
     "ProviderCapabilities", "ProviderCapabilityRegistry",
     "get_registry", "reset_registry",

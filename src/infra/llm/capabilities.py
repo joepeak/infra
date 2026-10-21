@@ -25,7 +25,7 @@ from __future__ import annotations
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass, field, asdict
-from typing import ClassVar, Dict, Optional, Tuple
+from typing import Any, ClassVar, Dict, Optional, Tuple
 
 from infra.logger import get_logger
 
@@ -83,6 +83,14 @@ class ProviderCapabilities:
 
     def as_dict(self) -> Dict[str, Optional[object]]:
         return asdict(self)
+
+    def copy(self) -> "ProviderCapabilities":
+        """返回一份独立副本——防止调用方误改缓存里的对象。
+
+        比 ``ProviderCapabilities(**self.as_dict())`` 更类型安全：
+        dataclass 字段类型在构造时会被 mypy 校验，``**dict`` 展开则绕过。
+        """
+        return ProviderCapabilities(**asdict(self))
 
     #: 参与"是否有新结论"判定的字段（排除 last_error/source 这类噪声）
     #:
@@ -164,9 +172,16 @@ class ProviderCapabilityRegistry:
             # 命中则移到末尾（LRU：最近使用的留在最后）
             self._caps.move_to_end(k)
             # 返回副本，防止调用方误改缓存
-            return ProviderCapabilities(**caps.as_dict())
+            return caps.copy()
 
-    def update(self, base_url: Optional[str], model: Optional[str], *, source: str, **changes) -> ProviderCapabilities:
+    def update(
+        self,
+        base_url: Optional[str],
+        model: Optional[str],
+        *,
+        source: str,
+        **changes: Any,
+    ) -> ProviderCapabilities:
         """合并式回填能力。仅覆盖显式传入且非 None 的字段。"""
         with self._lock:
             k = self.key(base_url, model)
@@ -179,7 +194,7 @@ class ProviderCapabilityRegistry:
             self._caps[k] = caps
             self._caps.move_to_end(k)
             self._evict_if_needed()
-            return ProviderCapabilities(**caps.as_dict())
+            return caps.copy()
 
     def _evict_if_needed(self) -> None:
         """超出上限时淘汰最久未用的条目（调用方须持有锁）。"""
@@ -231,7 +246,7 @@ class ProviderCapabilityRegistry:
             self._caps[k] = caps
             self._caps.move_to_end(k)
             self._evict_if_needed()
-            return ProviderCapabilities(**caps.as_dict())
+            return caps.copy()
 
     def learn_from_successful_response(
         self,
@@ -261,7 +276,7 @@ class ProviderCapabilityRegistry:
             self._caps[k] = caps
             self._caps.move_to_end(k)
             self._evict_if_needed()
-            return ProviderCapabilities(**caps.as_dict())
+            return caps.copy()
 
     def snapshot(self) -> Dict[str, Dict[str, Optional[object]]]:
         """导出全部已学习能力（供日志/诊断）。"""

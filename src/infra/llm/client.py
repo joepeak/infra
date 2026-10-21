@@ -10,10 +10,11 @@
 import os
 import asyncio
 import inspect
+import threading
 import time as _time
 from abc import ABC, abstractmethod
 from functools import partial
-from typing import Any, Optional, Callable, Dict, Union, Tuple
+from typing import Any, List, Optional, Callable, Dict, Union, Tuple
 
 from infra.utils.retry import RetryConfig, retry_async, retry_sync
 from infra.llm.models import (
@@ -27,10 +28,20 @@ from infra.llm.models import (
     AudioResult,
     UsageCallback,
 )
-from infra.llm.usage import record_usage
+from infra.llm.usage import (
+    record_usage,
+    record_media_task,
+    record_media_billable,
+)
 from infra.llm.retry import LLMRetryConfig
 from infra.llm.capabilities import get_registry, ProviderCapabilities, reset_registry
 from infra.logger import get_logger
+
+# openai 是硬依赖（LLMFactory 只支持 openai 兼容端点）——
+# 在模块级导入 BadRequestError，避免在 except 块内做局部 import：
+# 局部 import 会让同函数内**其他** try/except 块引用该名字时抛
+# UnboundLocalError（名字只在 except 块执行后才绑定）。
+from openai import BadRequestError
 
 # 用 infra 的 LazyLogger（而非原生 logging.getLogger）——
 # 原生 logger 没有 handler，LLM 层的日志不会落进 infra 的日志文件。
@@ -389,6 +400,13 @@ class SyncStreamIterator:
 class LLMClient(ABC):
     """LLM 客户端抽象基类——子类实现 ainvoke/invoke。"""
 
+    #: 子类初始化的 provider 客户端（openai / openai 兼容 SDK 实例）
+    _async_client: Any = None
+    _sync_client: Any = None
+    #: fallback 端点客户端——同端点时复用主实例
+    _fallback_async_client: Any = None
+    _fallback_sync_client: Any = None
+
     def __init__(
         self,
         api_key: str,
@@ -415,6 +433,10 @@ class LLMClient(ABC):
         if retry_config is None:
             retry_config = LLMRetryConfig.default().retry_config.copy(max_retries=max_retries)
         self.retry_config = retry_config
+        # 能力探测状态——懒探测时避免重复请求（见 _ensure_probed）
+        self._probed_keys: set = set()
+        self._probe_lock = asyncio.Lock()
+        self._probe_thread_lock = threading.Lock()
         self._initialize_provider()
         logger.info(
             f"Initializing LLMClient | provider={self.provider}, "
@@ -439,6 +461,100 @@ class LLMClient(ABC):
     def _client_for(self, use_fallback: bool) -> Any:
         """按主/备选择底层客户端。"""
         return self._fallback_async_client if use_fallback else self._async_client
+
+    async def _ensure_probed(
+        self,
+        model: str,
+        use_fallback: bool = False,
+    ) -> None:
+        """首次调用前**懒探测**端点能力（仅当 ``capability_probe=True``）。
+
+        探测结果写回能力注册表，后续调用即可自适应（如剔除被拒收的 thinking
+        参数、选择正确的 json_mode 策略）。
+
+        设计要点：
+          - **懒触发**：初始化时探测会拖慢启动；放在首次调用前更合理。
+          - **只探一次**：``_probed_keys`` 记录已探测的 (端点, 模型) 组合，
+            避免每次调用都发 4 次探测请求。
+          - **失败不阻断**：探测异常一律吞掉——能力探测是优化手段，
+            不该让正常调用失败。
+          - **并发安全**：同一 key 的并发调用只探测一次（用锁串行化）。
+
+        Args:
+            model: 要探测的模型名
+            use_fallback: 是否探测 fallback 端点
+        """
+        if not self.capability_probe:
+            return
+        key = (self.provider_base_url(use_fallback), model)
+        if key in self._probed_keys:
+            return
+        async with self._probe_lock:
+            # 双重检查——等锁期间可能已被其他协程探测过
+            if key in self._probed_keys:
+                return
+            try:
+                changes = await self.probe_capabilities(model, use_fallback=use_fallback)
+                if changes:
+                    get_registry().update(
+                        self.provider_base_url(use_fallback),
+                        model,
+                        source="probe",
+                        **changes,
+                    )
+                    logger.info(
+                        f"[{type(self).__name__}] 能力探测完成并写入注册表: "
+                        f"model={model}, use_fallback={use_fallback}"
+                    )
+            except Exception as e:
+                # 探测失败不影响正常调用
+                logger.warning(
+                    f"[{type(self).__name__}] 能力探测失败（忽略）: "
+                    f"{type(e).__name__}: {e}"
+                )
+            finally:
+                # 无论成败都标记为已探测——避免每次调用都重试探测
+                self._probed_keys.add(key)
+
+    def _ensure_probed_sync(
+        self,
+        model: str,
+        use_fallback: bool = False,
+    ) -> None:
+        """同步版懒探测——供 ``invoke`` / ``stream`` 使用。
+
+        与 :meth:`_ensure_probed` 规则一致，只是改用同步探测与线程锁
+        （同步调用可能来自任意线程，不能用 asyncio.Lock）。
+        """
+        if not self.capability_probe:
+            return
+        key = (self.provider_base_url(use_fallback), model)
+        if key in self._probed_keys:
+            return
+        with self._probe_thread_lock:
+            # 双重检查——等锁期间可能已被其他线程探测过
+            if key in self._probed_keys:
+                return
+            try:
+                changes = self.probe_capabilities_sync(model, use_fallback=use_fallback)
+                if changes:
+                    get_registry().update(
+                        self.provider_base_url(use_fallback),
+                        model,
+                        source="probe",
+                        **changes,
+                    )
+                    logger.info(
+                        f"[{type(self).__name__}] 能力探测完成并写入注册表: "
+                        f"model={model}, use_fallback={use_fallback}"
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"[{type(self).__name__}] 能力探测失败（忽略）: "
+                    f"{type(e).__name__}: {e}"
+                )
+            finally:
+                self._probed_keys.add(key)
 
     def provider_base_url(self, use_fallback: bool = False) -> Optional[str]:
         """返回某侧（主/备）的 base_url，供能力注册表做缓存键。"""
@@ -467,6 +583,38 @@ class LLMClient(ABC):
 
         探测失败（网络/超时/鉴权等）绝不抛出：返回空字典，由调用方回退到"学习式"降级。
         """
+        client = self._client_for(use_fallback)
+
+        async def _call(**kwargs: Any) -> Any:  # noqa: ANN401
+            return await asyncio.wait_for(
+                client.chat.completions.create(**kwargs), timeout=30.0
+            )
+
+        return await self._run_probe_async(model, _call)
+
+    def probe_capabilities_sync(self, model: str, use_fallback: bool = False) -> dict:
+        """同步版能力探测——供同步调用路径（``invoke`` / ``stream``）使用。
+
+        与 :meth:`probe_capabilities` 共用同一套判定规则（``_run_probe_async``），
+        只是把「发请求」换成同步调用。
+        """
+        client = self._sync_client if not use_fallback else self._fallback_sync_client
+
+        def _call(**kwargs: Any) -> Any:  # noqa: ANN401
+            return client.chat.completions.create(**kwargs)
+
+        return self._run_probe_sync(model, _call)
+
+    async def _run_probe_async(self, model: str, call: Any) -> dict:  # noqa: ANN401
+        """能力探测的**共享判定逻辑**（异步版）。
+
+        Args:
+            model: 探测的模型名
+            call: 协程函数——参数为请求 kwargs，返回 provider 响应
+
+        Returns:
+            能力变更字典（空字典表示探测失败或无结论）
+        """
         changes: dict = {}
         dummy_tool = {
             "type": "function",
@@ -476,36 +624,17 @@ class LLMClient(ABC):
                 "parameters": {"type": "object", "properties": {}},
             },
         }
-        client = self._client_for(use_fallback)
         try:
-            response = await asyncio.wait_for(
-                client.chat.completions.create(
-                    model=model,
-                    messages=[{"role": "user", "content": '只回复一个 json：{"ok": true}'}],
-                    tools=[dummy_tool],
-                    tool_choice={"type": "function", "function": {"name": "ping"}},
-                    response_format={"type": "json_object"},
-                    max_tokens=5,
-                ),
-                timeout=30.0,
+            response = await call(
+                model=model,
+                messages=[{"role": "user", "content": '只回复一个 json：{"ok": true}'}],
+                tools=[dummy_tool],
+                tool_choice={"type": "function", "function": {"name": "ping"}},
+                response_format={"type": "json_object"},
+                max_tokens=5,
             )
         except Exception as e:
-            from openai import BadRequestError
-            if isinstance(e, BadRequestError):
-                msg = str(e).lower()
-                if "tool_choice" in msg and "thinking" in msg:
-                    changes["thinking_conflicts_with_tools"] = True
-                    changes["supports_tools"] = True
-                elif "thinking" in msg:
-                    changes["thinking_param_rejected"] = True
-                if ("response_format" in msg or "json_object" in msg) and "must contain the word" not in msg:
-                    changes["supports_response_format"] = False
-                if "tools" in msg and "thinking" not in msg and "tool_choice" not in msg:
-                    changes["supports_tools"] = False
-                changes["last_error"] = str(e)[:200]
-                logger.info(f"[probe] {model} 探测命中 400，学到能力变更: {changes}")
-            else:
-                logger.warning(f"[probe] {model} 能力探测跳过（{type(e).__name__}: {e}）")
+            changes = self._probe_error_changes(model, e)
             return changes
 
         # 请求成功：能力齐备
@@ -514,25 +643,22 @@ class LLMClient(ABC):
 
         # ---- 探测 json_schema 支持 ----
         try:
-            await asyncio.wait_for(
-                client.chat.completions.create(
-                    model=model,
-                    messages=[{"role": "user", "content": '只回复一个 json：{"ok": true}'}],
-                    response_format={
-                        "type": "json_schema",
-                        "json_schema": {
-                            "name": "probe_schema",
-                            "schema": {
-                                "type": "object",
-                                "properties": {"ok": {"type": "boolean"}},
-                                "required": ["ok"],
-                            },
-                            "strict": True,
+            await call(
+                model=model,
+                messages=[{"role": "user", "content": '只回复一个 json：{"ok": true}'}],
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "probe_schema",
+                        "schema": {
+                            "type": "object",
+                            "properties": {"ok": {"type": "boolean"}},
+                            "required": ["ok"],
                         },
+                        "strict": True,
                     },
-                    max_tokens=5,
-                ),
-                timeout=15.0,
+                },
+                max_tokens=5,
             )
             changes["json_schema"] = True
         except Exception as e:
@@ -543,14 +669,11 @@ class LLMClient(ABC):
 
         # ---- 探测 reasoning_effort 参数接受度 ----
         try:
-            await asyncio.wait_for(
-                client.chat.completions.create(
-                    model=model,
-                    messages=[{"role": "user", "content": "hello"}],
-                    max_tokens=5,
-                    extra_body={"reasoning_effort": "low"},
-                ),
-                timeout=15.0,
+            await call(
+                model=model,
+                messages=[{"role": "user", "content": "hello"}],
+                max_tokens=5,
+                extra_body={"reasoning_effort": "low"},
             )
             changes["reasoning_effort_supported"] = True
         except Exception as e:
@@ -563,16 +686,13 @@ class LLMClient(ABC):
         # deepseek-flash 在收到中文 JSON 后缀时可能返回空字符串
         # 通过在 prompt 中加入中文 JSON 标记，观察是否正常返回
         try:
-            test_response = await asyncio.wait_for(
-                client.chat.completions.create(
-                    model=model,
-                    messages=[
-                        {"role": "user", "content": '只回复一个 json：{"ok": true} 这个 JSON 后面没有其他乱七八糟的内容'}
-                    ],
-                    response_format={"type": "json_object"},
-                    max_tokens=10,
-                ),
-                timeout=15.0,
+            test_response = await call(
+                model=model,
+                messages=[
+                    {"role": "user", "content": '只回复一个 json：{"ok": true} 这个 JSON 后面没有其他乱七八糟的内容'}
+                ],
+                response_format={"type": "json_object"},
+                max_tokens=10,
             )
             content = test_response.choices[0].message.content
             if not content or content.strip() == "":
@@ -583,6 +703,113 @@ class LLMClient(ABC):
             logger.warning(f"[probe] {model} cn_suffix 探测跳过（{type(e).__name__}: {e}）")
 
         logger.info(f"[probe] {model} 能力探测完成: {changes}")
+        return changes
+
+    def _run_probe_sync(self, model: str, call: Any) -> dict:  # noqa: ANN401
+        """能力探测的**共享判定逻辑**（同步版）——与 :meth:`_run_probe_async` 规则一致。"""
+        changes: dict = {}
+        dummy_tool = {
+            "type": "function",
+            "function": {
+                "name": "ping",
+                "description": "Just a capability probe.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+        try:
+            response = call(
+                model=model,
+                messages=[{"role": "user", "content": '只回复一个 json：{"ok": true}'}],
+                tools=[dummy_tool],
+                tool_choice={"type": "function", "function": {"name": "ping"}},
+                response_format={"type": "json_object"},
+                max_tokens=5,
+            )
+        except Exception as e:
+            return self._probe_error_changes(model, e)
+
+        changes["supports_tools"] = True
+        changes["supports_response_format"] = True
+
+        try:
+            call(
+                model=model,
+                messages=[{"role": "user", "content": '只回复一个 json：{"ok": true}'}],
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "probe_schema",
+                        "schema": {
+                            "type": "object",
+                            "properties": {"ok": {"type": "boolean"}},
+                            "required": ["ok"],
+                        },
+                        "strict": True,
+                    },
+                },
+                max_tokens=5,
+            )
+            changes["json_schema"] = True
+        except Exception as e:
+            if isinstance(e, BadRequestError) and "json_schema" in str(e).lower():
+                changes["json_schema"] = False
+            else:
+                logger.warning(f"[probe] {model} json_schema 探测跳过（{type(e).__name__}: {e}）")
+
+        try:
+            call(
+                model=model,
+                messages=[{"role": "user", "content": "hello"}],
+                max_tokens=5,
+                extra_body={"reasoning_effort": "low"},
+            )
+            changes["reasoning_effort_supported"] = True
+        except Exception as e:
+            if isinstance(e, BadRequestError) and "reasoning_effort" in str(e).lower():
+                changes["reasoning_effort_supported"] = False
+            else:
+                logger.warning(f"[probe] {model} reasoning_effort 探测跳过（{type(e).__name__}: {e}）")
+
+        try:
+            test_response = call(
+                model=model,
+                messages=[
+                    {"role": "user", "content": '只回复一个 json：{"ok": true} 这个 JSON 后面没有其他乱七八糟的内容'}
+                ],
+                response_format={"type": "json_object"},
+                max_tokens=10,
+            )
+            content = test_response.choices[0].message.content
+            if not content or content.strip() == "":
+                changes["rejects_cn_suffix"] = True
+            else:
+                changes["rejects_cn_suffix"] = False
+        except Exception as e:
+            logger.warning(f"[probe] {model} cn_suffix 探测跳过（{type(e).__name__}: {e}）")
+
+        logger.info(f"[probe] {model} 能力探测完成: {changes}")
+        return changes
+
+    @staticmethod
+    def _probe_error_changes(model: str, e: Exception) -> dict:
+        """从探测异常里提取能力变更（400 类才有结论，其余返回空）。"""
+        changes: dict = {}
+        if isinstance(e, BadRequestError):
+            msg = str(e).lower()
+            if "tool_choice" in msg and "thinking" in msg:
+                changes["thinking_conflicts_with_tools"] = True
+                changes["supports_tools"] = True
+            elif "thinking" in msg:
+                changes["thinking_param_rejected"] = True
+            if ("response_format" in msg or "json_object" in msg) and "must contain the word" not in msg:
+                changes["supports_response_format"] = False
+            if "tools" in msg and "thinking" not in msg and "tool_choice" not in msg:
+                changes["supports_tools"] = False
+            changes["last_error"] = str(e)[:200]
+            logger.info(f"[probe] {model} 探测命中 400，学到能力变更: {changes}")
+        else:
+            logger.warning(f"[probe] {model} 能力探测跳过（{type(e).__name__}: {e}）")
+        return changes
         return changes
 
     @abstractmethod
@@ -657,7 +884,6 @@ class LLMClient(ABC):
                     "total_tokens": response.usage.get("total_tokens", 0),
                 })
 
-
 # ===========================================================================
 # OpenAI Provider（第一期实现）
 # ===========================================================================
@@ -679,19 +905,20 @@ class OpenAIClient(LLMClient):
         self._async_client = AsyncOpenAI(**kwargs)  # type: ignore[arg-type]
 
         # fallback 是否跨端点：base_url 不同，或显式提供了不同的 api_key
+        _fb_base = self.fallback_base_url or ""
         _distinct_fallback = (
-            bool(self.fallback_base_url)
-            and self.fallback_base_url.rstrip("/") != (self.base_url or "").rstrip("/")
+            bool(_fb_base)
+            and _fb_base.rstrip("/") != (self.base_url or "").rstrip("/")
         )
         _distinct_key = bool(self.fallback_api_key) and self.fallback_api_key != self.api_key
         if _distinct_fallback or _distinct_key:
             self._fallback_sync_client = OpenAI(
-                api_key=self.fallback_api_key or self.api_key,  # type: ignore[arg-type]
+                api_key=self.fallback_api_key or self.api_key,
                 base_url=self.fallback_base_url,
                 timeout=self.timeout,
             )
             self._fallback_async_client = AsyncOpenAI(
-                api_key=self.fallback_api_key or self.api_key,  # type: ignore[arg-type]
+                api_key=self.fallback_api_key or self.api_key,
                 base_url=self.fallback_base_url,
                 timeout=self.timeout,
             )
@@ -781,6 +1008,9 @@ class OpenAIClient(LLMClient):
         effective_model = request.model or (self.fallback_model if use_fallback else None) or self.default_model
         provider_base = self.provider_base_url(use_fallback)
 
+        # 懒探测端点能力——必须在参数适配**之前**，
+        # 探测结论（thinking 拒收 / json_mode 策略）会影响 kwargs。
+        await self._ensure_probed(effective_model, use_fallback=use_fallback)
         kwargs = self._adapt_capability_params(request, kwargs, provider_base, effective_model)
 
         create_func = partial(
@@ -792,7 +1022,6 @@ class OpenAIClient(LLMClient):
         try:
             response = await retry_async(create_func, config=cfg)
         except Exception as e:
-            from openai import BadRequestError
             if isinstance(e, BadRequestError):
                 # 学习：把端点能力回填注册表，后续调用与各 Agent 即可自适应
                 get_registry().learn_from_error(provider_base, effective_model, str(e))
@@ -837,6 +1066,8 @@ class OpenAIClient(LLMClient):
         effective_model = request.model or (self.fallback_model if use_fallback else None) or self.default_model
         provider_base = self.provider_base_url(use_fallback)
 
+        # 懒探测端点能力——必须在参数适配**之前**
+        self._ensure_probed_sync(effective_model, use_fallback=use_fallback)
         kwargs = self._adapt_capability_params(request, kwargs, provider_base, effective_model)
 
         create_func = partial(
@@ -848,7 +1079,6 @@ class OpenAIClient(LLMClient):
         try:
             response = retry_sync(create_func, config=cfg)
         except Exception as e:
-            from openai import BadRequestError
             if isinstance(e, BadRequestError):
                 get_registry().learn_from_error(provider_base, effective_model, str(e))
                 logger.error(
@@ -908,7 +1138,6 @@ class OpenAIClient(LLMClient):
         effective_model = request.model or (self.fallback_model if use_fallback else None) or self.default_model
         provider_base = self.provider_base_url(use_fallback)
 
-        kwargs = self._adapt_capability_params(request, kwargs, provider_base, effective_model)
         kwargs["stream"] = True
 
         t0 = _time.monotonic()
@@ -916,9 +1145,16 @@ class OpenAIClient(LLMClient):
 
         async def _make_stream() -> Any:  # noqa: ANN401
             """创建底层流（惰性——第一次迭代时才真正发请求）。"""
+            # 懒探测 + 参数适配都放在这里——astream 是惰性的，
+            # 真正发请求的时刻才知道要不要探测；且探测是 async 的，
+            # 构造迭代器时无法 await。
+            await self._ensure_probed(effective_model, use_fallback=use_fallback)
+            _kwargs = self._adapt_capability_params(
+                request, dict(kwargs), provider_base, effective_model
+            )
             return await client.chat.completions.create(
                 model=effective_model,
-                **kwargs,
+                **_kwargs,
             )
 
         async def _on_close() -> None:
@@ -974,16 +1210,21 @@ class OpenAIClient(LLMClient):
         effective_model = request.model or (self.fallback_model if use_fallback else None) or self.default_model
         provider_base = self.provider_base_url(use_fallback)
 
-        kwargs = self._adapt_capability_params(request, kwargs, provider_base, effective_model)
         kwargs["stream"] = True
 
         usage = _StreamUsage()
 
         def _make_stream() -> Any:  # noqa: ANN401
             """创建底层流（惰性——第一次迭代时才真正发请求）。"""
+            # 懒探测 + 参数适配放在这里——stream 是惰性的，
+            # 真正发请求的时刻才需要能力结论。
+            self._ensure_probed_sync(effective_model, use_fallback=use_fallback)
+            _kwargs = self._adapt_capability_params(
+                request, dict(kwargs), provider_base, effective_model
+            )
             return client.chat.completions.create(
                 model=effective_model,
-                **kwargs,
+                **_kwargs,
             )
 
         def _on_close() -> None:
@@ -1056,6 +1297,13 @@ class MediaClient(ABC):
     on media methods — callers must check ``provider_media_capabilities``.
     """
 
+    #: 子类初始化的 provider 客户端（openai / openai 兼容 SDK 实例）
+    _async_client: Any = None
+    _sync_client: Any = None
+    #: fallback 端点客户端——同端点时复用主实例
+    _fallback_async_client: Any = None
+    _fallback_sync_client: Any = None
+
     def __init__(
         self,
         api_key: str,
@@ -1067,6 +1315,8 @@ class MediaClient(ABC):
         timeout: float = 120.0,
         retry_config: Optional[RetryConfig] = None,
         provider: str = "openai",
+        fallback_base_url: Optional[str] = None,
+        fallback_api_key: Optional[str] = None,
     ):
         self.api_key = api_key
         self.base_url = base_url
@@ -1075,10 +1325,22 @@ class MediaClient(ABC):
         self.audio_model = audio_model
         self.timeout = timeout
         self._provider = provider
+        # fallback 的 base_url / api_key 缺省回落到主端点
+        self.fallback_base_url = fallback_base_url or base_url
+        self.fallback_api_key = fallback_api_key or api_key
         if retry_config is None:
             retry_config = LLMRetryConfig.default().retry_config.copy(max_retries=max_retries)
         self.retry_config = retry_config
         self._initialize_media_provider()
+
+    def _media_client_for(self, use_fallback: bool) -> Any:
+        """按主/备选择底层客户端。
+
+        fallback 端点与主端点相同时复用主实例（零额外开销）。
+        """
+        if not use_fallback:
+            return self._async_client
+        return getattr(self, "_fallback_async_client", None) or self._async_client
 
     @abstractmethod
     def _initialize_media_provider(self) -> None:
@@ -1164,13 +1426,49 @@ class MediaClient(ABC):
         modality: str,
         cost_info: Optional[Dict[str, Any]] = None,
         usage_callback: Optional[UsageCallback] = None,
+        units: Optional[Dict[str, float]] = None,
     ) -> None:
-        """Record a media generation call for usage tracking.
+        """记录**一次媒体生成任务**（任务数 + 计费维度）。
 
         cost_info: modality + model + cost-determining parameters.
         usage_callback: optional external callback invoked with cost_info (errors swallowed).
+        units: 计费维度数量，如 ``{"images": 2}`` / ``{"seconds": 5}``。
         """
-        record_usage({"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}, purpose=f"media_{modality}")
+        # 媒体生成**不按 token 计费**——token 维度记 0 会污染 token 统计的语义。
+        # 计费维度走独立的 media 聚合器（record_media_task）。
+        record_media_task(
+            modality,
+            model=(cost_info or {}).get("model", "") or "",
+            units=units,
+            cost=(cost_info or {}).get("cost"),
+            currency=(cost_info or {}).get("currency"),
+        )
+        if usage_callback is not None and cost_info is not None:
+            info: Dict[str, Any] = {
+                "modality": modality,
+                "provider": self._provider,
+            }
+            info.update(cost_info)
+            _invoke_usage_callback(usage_callback, info)
+
+    def _record_media_billable(
+        self,
+        modality: str,
+        cost_info: Optional[Dict[str, Any]] = None,
+        usage_callback: Optional[UsageCallback] = None,
+        units: Optional[Dict[str, float]] = None,
+    ) -> None:
+        """补记**已计费任务**的计费维度与金额——**不重复计任务数**。
+
+        典型场景：视频任务提交时不知道最终时长，轮询完成后才知道。
+        这时用本方法补记秒数与真实金额，任务数已在提交时计过。
+        """
+        record_media_billable(
+            modality,
+            units=units,
+            cost=(cost_info or {}).get("cost"),
+            currency=(cost_info or {}).get("currency"),
+        )
         if usage_callback is not None and cost_info is not None:
             info: Dict[str, Any] = {
                 "modality": modality,
@@ -1194,8 +1492,33 @@ class OpenAIMediaClient(MediaClient):
         kwargs: dict = {"api_key": self.api_key, "timeout": self.timeout}
         if self.base_url:
             kwargs["base_url"] = self.base_url
-        self._sync_client = OpenAI(**kwargs)  # type: ignore[arg-type]
-        self._async_client = AsyncOpenAI(**kwargs)  # type: ignore[arg-type]
+        self._sync_client = OpenAI(**kwargs)
+        self._async_client = AsyncOpenAI(**kwargs)
+
+        # fallback 是否跨端点：base_url 不同，或显式提供了不同的 api_key
+        _fb_base = self.fallback_base_url or ""
+        _distinct_fallback = (
+            bool(_fb_base)
+            and _fb_base.rstrip("/") != (self.base_url or "").rstrip("/")
+        )
+        _distinct_key = bool(self.fallback_api_key) and self.fallback_api_key != self.api_key
+        if _distinct_fallback or _distinct_key:
+            fb_kwargs: dict = {
+                "api_key": self.fallback_api_key or self.api_key,
+                "timeout": self.timeout,
+            }
+            if self.fallback_base_url:
+                fb_kwargs["base_url"] = self.fallback_base_url
+            self._fallback_sync_client = OpenAI(**fb_kwargs)
+            self._fallback_async_client = AsyncOpenAI(**fb_kwargs)
+            logger.info(
+                f"OpenAIMediaClient 使用独立 fallback provider："
+                f"base_url={self.fallback_base_url}"
+            )
+        else:
+            # 同端点同 key——复用主实例，零额外开销
+            self._fallback_sync_client = self._sync_client
+            self._fallback_async_client = self._async_client
 
     @property
     def provider(self) -> str:
@@ -1208,7 +1531,7 @@ class OpenAIMediaClient(MediaClient):
         usage_callback: Optional[UsageCallback] = None,
     ) -> MediaResponse:
         cfg = request.retry_config or self.retry_config
-        client = self._async_client
+        client = self._media_client_for(use_fallback)
         model = request.model or self.image_model
 
         api_kwargs: dict = {"model": model, "prompt": request.prompt, "n": request.n}
@@ -1257,7 +1580,9 @@ class OpenAIMediaClient(MediaClient):
             "size": request.size or "",
             "quality": request.quality or "standard",
         }
-        self._record_media_usage("image", cost_info, usage_callback)
+        self._record_media_usage(
+            "image", cost_info, usage_callback, units={"images": len(images)}
+        )
         logger.info(
             f"[OpenAIMediaClient] generated {len(images)} image(s) in {elapsed:.1f}s "
             f"with model={model}"
@@ -1277,7 +1602,9 @@ class OpenAIMediaClient(MediaClient):
         use_fallback: bool = False,
         usage_callback: Optional[UsageCallback] = None,
     ) -> MediaResponse:
-        client = self._sync_client
+        client = (
+            self._fallback_sync_client if use_fallback else self._sync_client
+        )
         model = request.model or self.image_model
 
         api_kwargs: dict = {"model": model, "prompt": request.prompt, "n": request.n}
@@ -1324,7 +1651,9 @@ class OpenAIMediaClient(MediaClient):
             "size": request.size or "",
             "quality": request.quality or "standard",
         }
-        self._record_media_usage("image", cost_info, usage_callback)
+        self._record_media_usage(
+            "image", cost_info, usage_callback, units={"images": len(images)}
+        )
         logger.info(
             f"[OpenAIMediaClient] generated {len(images)} image(s) in {elapsed:.1f}s "
             f"with model={model}"
@@ -1374,7 +1703,7 @@ class OpenAIMediaClient(MediaClient):
         if request.extra_body:
             api_kwargs.update(request.extra_body)
 
-        client = self._async_client
+        client = self._media_client_for(use_fallback)
         cfg = request.retry_config or self.retry_config
 
         t0 = _time.monotonic()
@@ -1403,6 +1732,8 @@ class OpenAIMediaClient(MediaClient):
             "video_duration_seconds": None,
             "task_id": task_id,
         }
+        # 提交即计 1 次生成任务（视频按「任务」计费）——
+        # 后续 poll_video 轮询不重复计 calls，只补时长与真实金额。
         self._record_media_usage("video", cost_info, usage_callback)
         logger.info(
             f"[OpenAIMediaClient] submitted video task {task_id} in {elapsed:.1f}s "
@@ -1429,19 +1760,25 @@ class OpenAIMediaClient(MediaClient):
 
         usage_callback：任务完成/失败/超时时以 video cost info 回调一次。
         """
-        client = self._async_client
-        elapsed = 0.0
+        client = self._media_client_for(use_fallback)
+        # 用**真实经过时间**判定超时，而不是累加 interval——
+        # 单次轮询请求本身就可能耗时数秒（视频端点普遍较慢），
+        # 累加 interval 会让实际耗时远超 max_wait（实测 max_wait=1s 跑了 6.6s）。
+        t_start = _time.monotonic()
 
-        while elapsed < max_wait:
+        while True:
+            elapsed = _time.monotonic() - t_start
+            if elapsed >= max_wait:
+                break
             primary_error: Optional[BaseException] = None
             try:
                 # Try the dedicated video/tasks endpoint first
-                response = await client.video.tasks.retrieve(task_id)  # type: ignore[union-attr]
+                response = await client.video.tasks.retrieve(task_id)
             except Exception as e:
                 primary_error = e
                 # Fall back to a chat-based polling
                 try:
-                    response = await client.chat.completions.create(  # type: ignore[union-attr]
+                    response = await client.chat.completions.create(
                         model=self.video_model or "video-poll",
                         messages=[{"role": "user", "content": "poll"}],
                         extra_body={"task_id": task_id},
@@ -1468,7 +1805,11 @@ class OpenAIMediaClient(MediaClient):
                     "cost": _safe_extract(getattr(response, "cost", None), (int, float)),
                     "currency": _safe_extract(getattr(response, "currency", None), str),
                 }
-                self._record_media_usage("video", cost_info, usage_callback)
+                # 任务数已在提交时计过——这里只补时长（视频按时长计费）与真实金额。
+                self._record_media_billable(
+                    "video", cost_info, usage_callback,
+                    units={"seconds": float(duration or 0)},
+                )
                 return MediaResponse(
                     modality="video",
                     model=self.video_model,
@@ -1489,7 +1830,8 @@ class OpenAIMediaClient(MediaClient):
                     "video_duration_seconds": None,
                     "task_id": task_id,
                 }
-                self._record_media_usage("video", cost_info, usage_callback)
+                # 任务数已在提交时计过——失败不再重复计数。
+                self._record_media_billable("video", cost_info, usage_callback)
                 return MediaResponse(
                     modality="video",
                     model=self.video_model,
@@ -1501,7 +1843,6 @@ class OpenAIMediaClient(MediaClient):
                 )
 
             await asyncio.sleep(interval)
-            elapsed += interval
 
         # Timeout — return last known state
         cost_info = {
@@ -1510,7 +1851,8 @@ class OpenAIMediaClient(MediaClient):
             "video_duration_seconds": None,
             "task_id": task_id,
         }
-        self._record_media_usage("video", cost_info, usage_callback)
+        # 任务数已在提交时计过——超时不重复计数。
+        self._record_media_billable("video", cost_info, usage_callback)
         return MediaResponse(
             modality="video",
             model=self.video_model,
@@ -1536,7 +1878,7 @@ class OpenAIMediaClient(MediaClient):
         if request.size:
             api_kwargs["speed"] = 1.0
 
-        client = self._async_client
+        client = self._media_client_for(use_fallback)
         cfg = request.retry_config or self.retry_config
 
         async def _do_call() -> Any:
@@ -1564,7 +1906,10 @@ class OpenAIMediaClient(MediaClient):
             "input_chars": len(request.prompt),
             "duration_seconds": duration,
         }
-        self._record_media_usage("audio", cost_info, usage_callback)
+        # 音频按输入字符数计费。
+        self._record_media_usage(
+            "audio", cost_info, usage_callback, units={"chars": len(request.prompt)}
+        )
         logger.info(f"[OpenAIMediaClient] synthesized audio with model={model}")
         return MediaResponse(
             modality="audio",
@@ -1598,6 +1943,8 @@ class MediaFactory:
         audio_model = config.get("audio_model")
         max_retries = config.get("max_retries", 3)
         timeout = config.get("timeout", 120.0)
+        fallback_base_url = config.get("fallback_base_url")
+        fallback_api_key = config.get("fallback_api_key")
 
         if not api_key:
             raise ValueError(
@@ -1614,6 +1961,8 @@ class MediaFactory:
                 max_retries=max_retries,
                 timeout=timeout,
                 provider=provider,
+                fallback_base_url=fallback_base_url,
+                fallback_api_key=fallback_api_key,
             )
         # Seedream / tokenfree are OpenAI-compatible — treat as openai with a provider hint.
         if provider in ("seedream", "tokenfree"):
@@ -1627,6 +1976,8 @@ class MediaFactory:
                 max_retries=max_retries,
                 timeout=timeout,
                 provider=provider,
+                fallback_base_url=fallback_base_url,
+                fallback_api_key=fallback_api_key,
             )
         raise ValueError(
             f"unsupported media provider: {provider}（已实现：openai/seedream/tokenfree）"
@@ -1666,6 +2017,12 @@ async def init_media_client(config: dict) -> Optional[MediaClient]:
     image_model = _pick(media_config.get("image_model"), "IMAGE_MODEL")
     video_model = _pick(media_config.get("video_model"), "VIDEO_MODEL")
     audio_model = _pick(media_config.get("audio_model"), "AUDIO_MODEL")
+    fallback_base_url = _pick(
+        media_config.get("fallback_base_url"), "MEDIA_FALLBACK_BASE_URL"
+    )
+    fallback_api_key = _pick(
+        media_config.get("fallback_api_key"), "MEDIA_FALLBACK_API_KEY"
+    )
 
     _media_client = MediaFactory.create({
         "provider": media_config.get("provider", "openai"),
@@ -1676,6 +2033,8 @@ async def init_media_client(config: dict) -> Optional[MediaClient]:
         "audio_model": str(audio_model) if audio_model else None,
         "max_retries": media_config.get("max_retries", 3),
         "timeout": media_config.get("timeout", 300.0),
+        "fallback_base_url": str(fallback_base_url) if fallback_base_url else None,
+        "fallback_api_key": str(fallback_api_key) if fallback_api_key else None,
     })
     logger.info(
         f"Media global client initialized. provider={_media_client.provider}, "
