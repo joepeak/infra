@@ -743,3 +743,180 @@ class TestGetStatsNoSideEffect:
         result = await mq.get_stats(stream)
         assert "error" not in result
         assert result["stream_name"] == stream
+
+
+# ============================================================
+# 14. 按优先级消费
+# ============================================================
+class TestPriorityConsumption:
+    """多优先级队列：真正的优先级消费。
+
+    实现方式：**一个逻辑队列 = 多个 Redis Stream**
+    （``q:critical`` / ``q:high`` / ``q:normal`` / ``q:low``）。
+    消费者用**一次** XREADGROUP 按优先级顺序读这些 stream——Redis 按传入的
+    streams 参数顺序分组返回，所以优先级顺序是 **Redis 原生保证的**。
+
+    为什么不用单 stream + 应用层排序：单 stream 里 critical 消息若排在
+    第 5 批，前面 4 批的 low 已经处理完了——那不是真正的优先级。
+    """
+
+    async def test_priority_order_is_respected(self, mq, real_redis):
+        stream = _stream_name(mq, "prio")
+        mq.create_queue(
+            stream,
+            concurrency=1,
+            block_ms=200,
+            priorities=["critical", "high", "normal", "low"],
+        )
+        order: List[str] = []
+
+        async def handler(msg):
+            order.append(msg.priority)
+
+        mq.register(stream, "demo", handler)
+        await mq.start([stream])
+
+        # **逆优先级**发布——low 最先，critical 最后
+        for p in ("low", "normal", "high", "critical"):
+            await mq.publish(
+                stream,
+                {"task_id": f"t-{p}", "task_type": "demo",
+                 "priority": p, "payload": {}},
+            )
+        await asyncio.sleep(2)
+
+        assert order == ["critical", "high", "normal", "low"], (
+            f"消费顺序不是按优先级: {order}"
+        )
+
+    async def test_messages_stored_in_separate_streams(self, mq, real_redis):
+        """不同优先级的消息应落在不同的 stream 里。"""
+        stream = _stream_name(mq, "prio2")
+        mq.create_queue(
+            stream, concurrency=1, block_ms=100,
+            priorities=["critical", "normal"],
+        )
+        config = mq._queues[stream]
+        assert config.priority_streams == [
+            f"{stream}:critical", f"{stream}:normal"
+        ]
+
+        async def handler(msg):
+            pass
+
+        mq.register(stream, "demo", handler)
+        await mq.start([stream])
+
+        await mq.publish(
+            stream, {"task_id": "c", "task_type": "demo",
+                     "priority": "critical", "payload": {}},
+        )
+        await mq.publish(
+            stream, {"task_id": "n", "task_type": "demo",
+                     "priority": "normal", "payload": {}},
+        )
+        await asyncio.sleep(1)
+
+        assert await real_redis.xlen(f"{stream}:critical") == 1
+        assert await real_redis.xlen(f"{stream}:normal") == 1
+
+    async def test_acked_on_correct_stream(self, mq, real_redis):
+        """ACK 必须打到消息实际所在的 stream——否则消息永远留在 PEL。"""
+        stream = _stream_name(mq, "prio3")
+        mq.create_queue(
+            stream, concurrency=1, block_ms=100,
+            priorities=["critical", "normal"],
+        )
+        received = []
+
+        async def handler(msg):
+            received.append(msg)
+
+        mq.register(stream, "demo", handler)
+        await mq.start([stream])
+
+        await mq.publish(
+            stream, {"task_id": "c", "task_type": "demo",
+                     "priority": "critical", "payload": {}},
+        )
+        ok = await _wait_for(lambda: len(received) == 1, timeout=8.0)
+        assert ok, "消息未被消费"
+
+        # 各 stream 的 PEL 都应为空
+        for st in mq._queues[stream].priority_streams:
+            pending = await real_redis.xpending_range(
+                st, f"{stream}_group", "-", "+", count=10
+            )
+            assert len(pending) == 0, f"{st} 仍有未 ACK 消息: {pending}"
+
+    async def test_single_priority_queue_unchanged(self, mq, real_redis):
+        """不配 priorities 时行为与之前完全一致（单 stream）。"""
+        stream = _stream_name(mq, "prio4")
+        mq.create_queue(stream, concurrency=1, block_ms=100)
+        assert mq._queues[stream].priority_streams == [stream]
+
+        received = []
+
+        async def handler(msg):
+            received.append(msg)
+
+        mq.register(stream, "demo", handler)
+        await mq.start([stream])
+
+        await mq.publish(
+            stream, {"task_id": "t", "task_type": "demo", "payload": {}},
+        )
+        assert await _wait_for(lambda: len(received) == 1, timeout=8.0)
+
+    async def test_unconfigured_priority_falls_back(self, mq, real_redis):
+        """消息的优先级未在队列中启用时——回落到最低优先级 stream，不丢消息。"""
+        stream = _stream_name(mq, "prio5")
+        mq.create_queue(
+            stream, concurrency=1, block_ms=100,
+            priorities=["critical", "normal"],
+        )
+        received = []
+
+        async def handler(msg):
+            received.append(msg)
+
+        mq.register(stream, "demo", handler)
+        await mq.start([stream])
+
+        await mq.publish(
+            stream, {"task_id": "t", "task_type": "demo",
+                     "priority": "low", "payload": {}},
+        )
+        ok = await _wait_for(lambda: len(received) == 1, timeout=8.0)
+        assert ok, "未启用优先级的消息被丢弃了"
+        # 回落到最低优先级的 stream
+        assert await real_redis.xlen(f"{stream}:normal") == 1
+
+    async def test_dead_letter_in_priority_queue(self, mq, real_redis):
+        """多优先级队列下的重试与死信同样有效。"""
+        stream = _stream_name(mq, "prio6")
+        mq.create_queue(
+            stream, concurrency=1, block_ms=100, claim_interval=1,
+            claim_min_idle_ms=300, max_retries=2,
+            priorities=["critical", "normal"],
+        )
+        calls = {"n": 0}
+
+        async def handler(msg):
+            calls["n"] += 1
+            raise RuntimeError("失败")
+
+        mq.register(stream, "demo", handler)
+        await mq.start([stream])
+
+        await mq.publish(
+            stream, {"task_id": "t", "task_type": "demo",
+                     "priority": "critical", "payload": {}},
+        )
+        ok = await _wait_for(
+            lambda: _dead_has_msg(real_redis, stream), timeout=12.0
+        )
+        assert ok, "多优先级队列的消息未进死信"
+
+        stats = await mq.get_stats(stream)
+        assert stats["pending_count"] == 0, "消息仍卡在 PEL"

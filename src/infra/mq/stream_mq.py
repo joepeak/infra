@@ -12,7 +12,7 @@ from collections import defaultdict
 import time
 from datetime import datetime
 from typing import Dict, Any, Optional, Callable, Awaitable, List, Set, Tuple, Union
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import redis.asyncio as redis
 from redis.exceptions import ResponseError
@@ -24,22 +24,40 @@ logger = get_logger(__name__)
 
 
 class MessagePriority:
-    """消息优先级枚举。
+    """消息优先级。
 
-    **注意：当前只作为消息的元数据被记录，尚未实现「按优先级消费」。**
+    **真正的优先级消费**通过「一个逻辑队列 = 多个 stream」实现：
+    逻辑队列 ``orders`` 会展开成 ``orders:critical`` / ``orders:high`` /
+    ``orders:normal`` / ``orders:low`` 四个 Redis Stream。
 
-    Redis Stream 本身不保证优先级顺序——消息按 ID 递增消费，
-    高优先级消息如果排在后面，依然会被后消费。若需要真正的优先级，
-    常规做法是**按优先级分多个 stream**（critical / high / normal / low），
-    消费者按优先级顺序依次拉取。
+    消费者用**一次** ``XREADGROUP`` 按优先级顺序读取这些 stream——
+    Redis 按传入的 streams 参数顺序分组返回，所以优先级顺序是
+    **Redis 原生保证的**，不需要应用层排序（一次 RTT 读多个 stream）。
 
-    这里保留该枚举是为了让消息**携带**优先级信息（便于调用方决策、
-    便于将来实现多 stream 方案），而不是暗示已有优先级消费能力。
+    为什么不用单 stream + 应用层排序：单 stream 里 critical 消息若排在
+    第 5 批，前面 4 批的 low 已经处理完了——那不是真正的优先级。
     """
+
     CRITICAL = "critical"
     HIGH = "high"
     NORMAL = "normal"
     LOW = "low"
+
+    #: 优先级从高到低的顺序——消费时按这个顺序传 stream
+    ORDER: Tuple[str, ...] = (CRITICAL, HIGH, NORMAL, LOW)
+
+    @classmethod
+    def normalize(cls, priority: Optional[str]) -> str:
+        """把任意输入规整成合法优先级（未知值归为 NORMAL）。"""
+        if not priority:
+            return cls.NORMAL
+        value = str(priority).strip().lower()
+        return value if value in cls.ORDER else cls.NORMAL
+
+    @classmethod
+    def stream_name(cls, queue_name: str, priority: Optional[str]) -> str:
+        """逻辑队列名 + 优先级 -> 实际 stream 名。"""
+        return f"{queue_name}:{cls.normalize(priority)}"
 
 @dataclass
 class QueueConfig:
@@ -58,6 +76,10 @@ class QueueConfig:
     #: 实际并发度 = concurrency × batch_size。
     #: 真正的并发上限由 :attr:`max_concurrency` 控制。
     concurrency: int = 5
+    #: 该逻辑队列对应的**实际 stream 名列表**（按优先级从高到低）。
+    #: 单优先级队列就是 `[stream_name]`；多优先级队列是
+    #: ``["q:critical", "q:high", "q:normal", "q:low"]``。
+    priority_streams: List[str] = field(default_factory=list)
     #: **同时执行的 handler 数量上限**（跨所有 worker 共享）。
     #: None 表示不额外限制（实际并发度 = concurrency × batch_size）。
     max_concurrency: Optional[int] = None
@@ -165,8 +187,24 @@ class RedisStreamMQ:
         logger.error(f"Redis 连接失败，已达最大重试次数: {self._connection_error}")
         return False
     
-    def create_queue(self, stream_name: str, group_name: Optional[str] = None, **kwargs: Any) -> 'RedisStreamMQ':
+    def create_queue(
+        self,
+        stream_name: str,
+        group_name: Optional[str] = None,
+        *,
+        priorities: Optional[List[str]] = None,
+        **kwargs: Any,
+    ) -> 'RedisStreamMQ':
         """创建/注册一个队列。
+
+        Args:
+            stream_name: 逻辑队列名
+            group_name: 消费者组名（默认 ``<stream_name>_group``）
+            priorities: 启用哪些优先级——给定时展开成多个 stream
+                （``orders:critical`` / ``orders:high`` / ...），
+                消费时按优先级顺序读取。
+                None（默认）表示**单优先级**——只用 ``stream_name`` 这一个
+                stream，行为与之前完全一致。
 
         重复调用是**幂等**的：已注册的 handler 不会被清空。
         （旧实现每次都 ``self._handlers[stream_name] = {}``，
@@ -174,6 +212,16 @@ class RedisStreamMQ:
         """
         if group_name is None:
             group_name = f"{stream_name}_group"
+
+        # 优先级 stream 列表（按优先级从高到低）
+        if priorities:
+            prio_set = {MessagePriority.normalize(p) for p in priorities}
+            ordered = [p for p in MessagePriority.ORDER if p in prio_set]
+            priority_streams = [
+                MessagePriority.stream_name(stream_name, p) for p in ordered
+            ]
+        else:
+            priority_streams = [stream_name]
 
         config = QueueConfig(
             stream_name=stream_name,
@@ -186,16 +234,42 @@ class RedisStreamMQ:
             max_concurrency=kwargs.get('max_concurrency', None),
             claim_interval=kwargs.get('claim_interval', 30),
             claim_min_idle_ms=kwargs.get('claim_min_idle_ms', 60000),
-            ttl_seconds=kwargs.get('ttl_seconds', 0)
+            ttl_seconds=kwargs.get('ttl_seconds', 0),
+            priority_streams=priority_streams,
         )
 
         self._queues[stream_name] = config
         # 保留已注册的 handler——重复 create_queue 不该清空它们
         self._handlers.setdefault(stream_name, {})
 
-        logger.info(f"队列已注册: {stream_name} (concurrency={config.concurrency}, ttl={config.ttl_seconds}s)")
+        logger.info(
+            f"队列已注册: {stream_name} "
+            f"(concurrency={config.concurrency}, ttl={config.ttl_seconds}s, "
+            f"streams={priority_streams})"
+        )
         return self
     
+    @staticmethod
+    def _resolve_target_stream(config: QueueConfig, data: Dict[str, str]) -> str:
+        """决定消息实际要写入哪个 stream。
+
+        单优先级队列（``priority_streams`` 只有一个元素）→ 直接用它。
+
+        多优先级队列 → 按消息的 priority 选对应的 stream；
+        若该优先级未启用（队列只配了部分优先级），回落到**最低优先级**
+        的那个 stream——保证消息不丢。
+        """
+        streams = config.priority_streams or [config.stream_name]
+        if len(streams) == 1:
+            return streams[0]
+
+        priority = MessagePriority.normalize(data.get("priority"))
+        target = MessagePriority.stream_name(config.stream_name, priority)
+        if target in streams:
+            return target
+        # 该优先级未启用——回落到最后一个（最低优先级）stream
+        return streams[-1]
+
     def set_routing(self, routing: Dict[str, str]) -> None:
         """设置消息路由规则"""
         self._routing.update(routing)
@@ -210,18 +284,22 @@ class RedisStreamMQ:
         logger.info(f"注册处理器: {stream_name}/{msg_type}")
     
     async def publish(self, stream_name: str, message: Union[TaskMessage, Dict[str, Any]]) -> Optional[str]:
-        """
-        发布消息到指定队列
-        支持 TaskMessage 对象或普通字典
+        """发布消息到指定队列。
+
+        支持 TaskMessage 对象或普通字典。
+
+        **多优先级队列**：若该队列配置了 ``priorities``，消息会按自身的
+        priority 路由到对应的 stream（``orders:critical`` 等），
+        消费时按优先级顺序取出——真正的优先级。
         """
         if stream_name not in self._queues:
             raise ValueError(f"队列不存在: {stream_name}")
-        
+
         # 尝试连接
         if not await self.connect():
             logger.error(f"Redis 未连接，消息发送失败: {stream_name}")
             return None
-        
+
         config = self._queues[stream_name]
 
         # 处理 TaskMessage 对象
@@ -255,6 +333,9 @@ class RedisStreamMQ:
                 'created_at': str(time.time())
             }
         
+        # 决定目标 stream——多优先级队列按消息 priority 路由
+        target_stream = self._resolve_target_stream(config, data)
+
         # narrow self._redis: Optional[Redis] → Redis（避免每行都重写 None 检查）
         redis = self._redis
         if redis is None:
@@ -262,7 +343,7 @@ class RedisStreamMQ:
             return None
         try:
             msg_id = await redis.xadd(
-                config.stream_name,
+                target_stream,
                 data,  # type: ignore[arg-type]
                 maxlen=config.maxlen
             )
@@ -336,27 +417,28 @@ class RedisStreamMQ:
     #     return self.send_message_sync(stream_name, message)
     
     async def _ensure_consumer_group(self, config: QueueConfig) -> bool:
-        """确保消费者组存在"""
+        """确保消费者组存在（多优先级队列需在**每个** stream 上创建）"""
         redis = self._r()
-        try:
-            await redis.xgroup_create(
-                config.stream_name,
-                config.group_name,
-                id='0',
-                mkstream=True
-            )
-            logger.debug(f"创建消费者组: {config.group_name}")
-            return True
-        except ResponseError as e:
-            if "BUSYGROUP" in str(e):
-                logger.debug(f"消费者组已存在: {config.group_name}")
-                return True
-            else:
-                logger.warning(f"创建消费者组失败: {e}")
-                return False
-        except Exception as e:
-            logger.warning(f"创建消费者组异常: {e}")
-            return False
+        all_ok = True
+        for stream in (config.priority_streams or [config.stream_name]):
+            try:
+                await redis.xgroup_create(
+                    stream,
+                    config.group_name,
+                    id='0',
+                    mkstream=True
+                )
+                logger.debug(f"创建消费者组: {stream}/{config.group_name}")
+            except ResponseError as e:
+                if "BUSYGROUP" in str(e):
+                    logger.debug(f"消费者组已存在: {stream}/{config.group_name}")
+                else:
+                    logger.warning(f"创建消费者组失败 {stream}: {e}")
+                    all_ok = False
+            except Exception as e:
+                logger.warning(f"创建消费者组异常 {stream}: {e}")
+                all_ok = False
+        return all_ok
     
     def _is_message_expired(self, created_at: str, ttl_seconds: int) -> bool:
         """检查消息是否过期"""
@@ -395,42 +477,47 @@ class RedisStreamMQ:
                 #   3. XAUTOCLAIM 会返回「已从 stream 中删除」的消息 id
                 #      （被 MAXLEN 裁剪的幽灵消息）——这类消息内容已丢失，
                 #      无法重试，只能记日志避免它们永远占着 PEL。
-                # XAUTOCLAIM 返回 [next_cursor, messages, deleted]
-                # 注意顺序——cursor 在**第一个**，不是最后一个。
-                next_cursor, claimed, deleted = await redis.xautoclaim(
-                    config.stream_name,
-                    config.group_name,
-                    consumer_name,
-                    config.claim_min_idle_ms,
-                    cursor,
-                    count=config.batch_size,
-                )
-
-                for msg_id in deleted or ():
-                    # 消息内容已被 MAXLEN 裁剪——无法重试也无法进死信
-                    # （死信需要原始数据）。只记日志并从 PEL 移除。
-                    logger.warning(
-                        f"消息内容已被 MAXLEN 裁剪，无法恢复，从 PEL 移除: "
-                        f"{stream_name}/{msg_id!r}"
+                # 多优先级队列：每个 stream 都要扫一遍
+                for actual_stream in (
+                    config.priority_streams or [config.stream_name]
+                ):
+                    # XAUTOCLAIM 返回 [next_cursor, messages, deleted]
+                    # 注意顺序——cursor 在**第一个**，不是最后一个。
+                    next_cursor, claimed, deleted = await redis.xautoclaim(
+                        actual_stream,
+                        config.group_name,
+                        consumer_name,
+                        config.claim_min_idle_ms,
+                        cursor,
+                        count=config.batch_size,
                     )
-                    try:
-                        await redis.xack(
-                            config.stream_name, config.group_name, msg_id
+
+                    for msg_id in deleted or ():
+                        # 消息内容已被 MAXLEN 裁剪——无法重试也无法进死信
+                        # （死信需要原始数据）。只记日志并从 PEL 移除。
+                        logger.warning(
+                            f"消息内容已被 MAXLEN 裁剪，无法恢复，从 PEL 移除: "
+                            f"{actual_stream}/{msg_id!r}"
                         )
-                    except Exception as e:
-                        logger.warning(f"清理裁剪消息失败: {e}")
+                        try:
+                            await redis.xack(
+                                actual_stream, config.group_name, msg_id
+                            )
+                        except Exception as e:
+                            logger.warning(f"清理裁剪消息失败: {e}")
 
-                for msg_id, data in claimed or ():
-                    # 认领后**立即处理**——否则消息归 claimer 所有，
-                    # 而 worker 用 '>' 只读新消息，永远读不到它，
-                    # 消息会在 claimer 之间空转、永远不消费。
-                    await self._handle_claimed_message(
-                        stream_name, config, str(msg_id), data
-                    )
+                    for msg_id, data in claimed or ():
+                        # 认领后**立即处理**——否则消息归 claimer 所有，
+                        # 而 worker 用 '>' 只读新消息，永远读不到它，
+                        # 消息会在 claimer 之间空转、永远不消费。
+                        await self._handle_claimed_message(
+                            stream_name, config, str(msg_id), data,
+                            actual_stream=actual_stream,
+                        )
 
-                # 更新游标——下一轮从上次的位置继续扫。
-                # 扫完一圈（cursor 回到 0-0）说明没有更多了，保持 0-0 即可。
-                cursor = next_cursor if next_cursor else "0-0"
+                    # 更新游标——下一轮从上次的位置继续扫。
+                    # 扫完一圈（cursor 回到 0-0）说明没有更多了，保持 0-0 即可。
+                    cursor = next_cursor if next_cursor else "0-0"
 
                 await asyncio.sleep(config.claim_interval)
 
@@ -450,6 +537,7 @@ class RedisStreamMQ:
         config: QueueConfig,
         msg_id: str,
         data: Dict[str, str],
+        actual_stream: Optional[str] = None,
     ) -> None:
         """处理一条**已认领**的消息。
 
@@ -464,16 +552,18 @@ class RedisStreamMQ:
             # XAUTOCLAIM 会自动累加 delivery counter，所以认领后
             # 次数 = 认领前 + 1。
             delivery_count = await self._get_delivery_count(
-                stream_name, config, msg_id
+                stream_name, config, msg_id, actual_stream
             )
             if delivery_count > config.max_retries:
                 await self._move_to_dead_letter_by_id(
-                    stream_name, config, msg_id, delivery_count
+                    stream_name, config, msg_id, delivery_count,
+                    actual_stream=actual_stream,
                 )
                 return
 
             success, error_msg = await self._process_message(
-                stream_name, config, msg_id, data
+                stream_name, config, msg_id, data,
+                actual_stream=actual_stream,
             )
             if success:
                 logger.info(f"已认领消息处理完成: {stream_name}/{msg_id}")
@@ -493,6 +583,7 @@ class RedisStreamMQ:
         stream_name: str,
         config: QueueConfig,
         msg_id: str,
+        actual_stream: Optional[str] = None,
     ) -> int:
         """查询某条消息的投递次数（times_delivered）。
 
@@ -506,7 +597,8 @@ class RedisStreamMQ:
         redis = self._r()
         try:
             pending = await redis.xpending_range(
-                stream_name, config.group_name, msg_id, msg_id, count=1
+                actual_stream or config.stream_name,
+                config.group_name, msg_id, msg_id, count=1,
             )
             for item in pending or ():
                 if str(item.get("message_id")) == str(msg_id):
@@ -518,19 +610,22 @@ class RedisStreamMQ:
     
     async def _move_to_dead_letter_by_id(self, stream_name: str, config: QueueConfig,
                                           msg_id: str, delivery_count: int,
-                                          reason: str = "max_retries_exceeded") -> None:
+                                          reason: str = "max_retries_exceeded",
+                                          actual_stream: Optional[str] = None) -> None:
         """根据消息 ID 移动到死信队列。
 
         Args:
-            stream_name: 流名
+            stream_name: 逻辑队列名（死信队列名基于它）
             config: 队列配置
             msg_id: 消息 ID
             delivery_count: 已投递次数
             reason: 移入死信的原因（写入死信记录，便于排查）
+            actual_stream: 消息实际所在的 stream（多优先级队列用）
         """
         redis = self._r()
         dead_letter_key = f"{stream_name}:dead_letter"
-        msgs = await redis.xrange(config.stream_name, msg_id, msg_id)
+        src_stream = actual_stream or config.stream_name
+        msgs = await redis.xrange(src_stream, msg_id, msg_id)
         if not msgs:
             # 消息内容已被 MAXLEN 裁剪——死信需要原始数据，没法搬运。
             # 但仍要把它从 PEL 移除，否则它会永远占着 PEL 变成幽灵消息。
@@ -539,7 +634,7 @@ class RedisStreamMQ:
                 f"{stream_name}/{msg_id}, reason={reason}"
             )
             try:
-                await redis.xack(config.stream_name, config.group_name, msg_id)
+                await redis.xack(src_stream, config.group_name, msg_id)
             except Exception as e:
                 logger.warning(f"清理裁剪消息失败: {e}")
             return
@@ -559,7 +654,7 @@ class RedisStreamMQ:
                 },
                 maxlen=1000
             )
-            await redis.xack(config.stream_name, config.group_name, msg_id)
+            await redis.xack(src_stream, config.group_name, msg_id)
             logger.warning(
                 f"消息已移至死信队列: {stream_name}/{msg_id}, "
                 f"delivery_count={delivery_count}, reason={reason}"
@@ -579,16 +674,30 @@ class RedisStreamMQ:
         return sem
 
     async def _process_message(self, stream_name: str, config: QueueConfig,
-                                msg_id: str, data: Dict[str, str]) -> Tuple[bool, Optional[str]]:
-        """处理单条消息"""
+                                msg_id: str, data: Dict[str, str],
+                                actual_stream: Optional[str] = None) -> Tuple[bool, Optional[str]]:
+        """处理单条消息。
+
+        Args:
+            stream_name: 逻辑队列名（用于取 handler / 限流器）
+            config: 队列配置
+            msg_id: 消息 ID
+            data: 消息内容
+            actual_stream: 消息**实际所在**的 Redis stream。
+                多优先级队列里消息在 ``<queue>:<priority>``——
+                ACK 必须打到这个 stream，否则消息会永远留在 PEL。
+                None 表示用 ``config.stream_name``（单优先级队列）。
+        """
         redis = self._r()  # narrow
         task_type = data.get('task_type', 'unknown')
         created_at = data.get('created_at', '0')
+        # ACK 的目标 stream——多优先级队列下与逻辑队列名不同
+        ack_stream = actual_stream or config.stream_name
 
         # 时效性检查
         if self._is_message_expired(created_at, config.ttl_seconds):
             logger.warning(f"⏰ 消息已过期，丢弃: {stream_name}/{msg_id}, type={task_type}")
-            await redis.xack(config.stream_name, config.group_name, msg_id)
+            await redis.xack(ack_stream, config.group_name, msg_id)
             self._stats['total_expired'] += 1
             return True, None
 
@@ -613,7 +722,7 @@ class RedisStreamMQ:
 
             if handler:
                 await handler(message)
-                await redis.xack(config.stream_name, config.group_name, msg_id)
+                await redis.xack(ack_stream, config.group_name, msg_id)
                 self._stats['total_processed'] += 1
                 logger.debug(f"✅ 消息处理完成: {msg_id}")
                 return True, None
@@ -625,7 +734,8 @@ class RedisStreamMQ:
                     f"⚠️ 未找到处理器，移入死信队列: {stream_name}/{task_type}"
                 )
                 await self._move_to_dead_letter_by_id(
-                    stream_name, config, msg_id, 0, reason="no_handler"
+                    stream_name, config, msg_id, 0,
+                    reason="no_handler", actual_stream=ack_stream,
                 )
                 self._stats['total_failed'] += 1
                 self._stats['last_error'] = f"no handler for task_type={task_type}"
@@ -666,10 +776,16 @@ class RedisStreamMQ:
                         continue
 
                     redis = self._redis  # narrow
+                    # 多优先级队列：按优先级顺序一次读多个 stream。
+                    # Redis 按传入的 streams 参数顺序分组返回——
+                    # 所以优先级顺序是 Redis 原生保证的，无需应用层排序。
                     result = await redis.xreadgroup(
                         groupname=config.group_name,
                         consumername=consumer_name,
-                        streams={config.stream_name: '>'},
+                        streams={
+                            s: '>' for s in
+                            (config.priority_streams or [config.stream_name])
+                        },
                         count=config.batch_size,
                         block=config.block_ms
                     )
@@ -678,16 +794,23 @@ class RedisStreamMQ:
                         continue
 
                     # result: List[Tuple[Any, List[Tuple[Any, Any]]]]——mypy 看不到解构
+                    #
+                    # Redis 按传入的 streams 参数顺序分组返回——所以这里
+                    # 逐组处理天然就是「先处理完高优先级，再处理低优先级」。
                     for entry in result:
                         if not isinstance(entry, (list, tuple)) or len(entry) < 2:
                             continue
+                        actual_stream = str(entry[0])
                         messages = entry[1]
                         tasks = [
-                            self._process_message(stream_name, config, msg_id, data)
+                            self._process_message(
+                                stream_name, config, msg_id, data,
+                                actual_stream=actual_stream,
+                            )
                             for msg_id, data in messages
                         ]
                         results = await asyncio.gather(*tasks, return_exceptions=True)
-                        
+
                         for i, res in enumerate(results):
                             if isinstance(res, Exception):
                                 if "Event loop is closed" not in str(res):
@@ -911,15 +1034,18 @@ class RedisStreamMQ:
         config = self._queues[stream_name]
         redis = self._r()  # narrow
 
-        stream_len = await redis.xlen(config.stream_name)
+        # 多优先级队列：统计所有 priority stream 的总和
+        streams = config.priority_streams or [config.stream_name]
+        stream_len = 0
+        pending_count = 0
+        for st in streams:
+            stream_len += int(await redis.xlen(st))
+            try:
+                pending = await redis.xpending(st, config.group_name)
+                pending_count += pending.get('pending', 0) if pending else 0
+            except Exception as e:
+                logger.warning(f"查询 pending 失败(按0处理) {st}: {e}")
         dead_len = await redis.xlen(f"{config.stream_name}:dead_letter")
-
-        try:
-            pending = await redis.xpending(config.stream_name, config.group_name)
-            pending_count = pending.get('pending', 0) if pending else 0
-        except Exception as e:
-            logger.warning(f"查询 pending 失败(按0处理): {e}")
-            pending_count = 0
         
         return {
             'stream_name': config.stream_name,
@@ -963,7 +1089,10 @@ class RedisStreamMQ:
                     f"死信消息数据不是 dict，跳过: {dead_letter_key}/{msg_id!r}"
                 )
                 continue
-            await redis.xadd(config.stream_name, original_data)
+            # 恢复到**正确的优先级 stream**——多优先级队列下，
+            # 写回逻辑队列名会丢掉优先级归属。
+            target = self._resolve_target_stream(config, original_data)
+            await redis.xadd(target, original_data)
             await redis.xdel(dead_letter_key, msg_id)
             logger.info(f"消息已从死信队列恢复: {msg_id!r}")
             return True
