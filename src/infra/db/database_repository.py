@@ -1,9 +1,9 @@
 
-from typing import Any, AsyncGenerator, Callable, Dict, Generic, List, Optional, TypeVar, Union
+from typing import Any, AsyncGenerator, Callable, Dict, Generic, List, Optional, TypeVar, Union, cast
 from dataclasses import dataclass
 from contextlib import asynccontextmanager
 
-from sqlalchemy import select, delete, and_, or_, func, text
+from sqlalchemy import select, delete, and_, or_, func, text, false, true
 from sqlalchemy.ext.asyncio import AsyncSession
 import asyncpg
 
@@ -175,15 +175,31 @@ class DatabaseRepository(Generic[ModelType]):
             return False
     
     @db_operation("count_records")
-    async def count(self, **filters: Any) -> int:
-        """统计记录数"""
+    async def count(
+        self,
+        where: Optional[Dict[str, Any]] = None,
+        conditions: Optional[List[tuple]] = None,
+        logic: str = "AND",
+        **filters: Any
+    ) -> int:
+        """统计记录数。
+
+        Args:
+            where: 等值 / 带操作符的条件字典（与 query() 语义一致）
+            conditions: 操作符条件列表 ``[(field, op, value), ...]``
+            logic: 条件逻辑，"AND" 或 "OR"
+            **filters: 简单等值过滤条件
+        """
         async with self.get_session() as session:
             stmt = select(func.count()).select_from(self.model_class)  # type: ignore[arg-type]
-            
-            for key, value in filters.items():
-                if hasattr(self.model_class, key):
-                    stmt = stmt.where(getattr(self.model_class, key) == value)
-            
+
+            filter_exprs = self._build_filters(
+                where=where,
+                conditions=conditions,
+                filters=filters,
+            )
+            stmt = self._apply_filters(stmt, filter_exprs, logic)
+
             result = await session.execute(stmt)
             return result.scalar() or 0
     
@@ -231,46 +247,11 @@ class DatabaseRepository(Generic[ModelType]):
             else:
                 stmt = select(self.model_class)  # type: ignore[call-overload]
 
-            filter_exprs = []
-
-            # 处理 where 等值条件
-            if where:
-                for key, value in where.items():
-                    if hasattr(self.model_class, key):
-                        # 如果 value 是 dict，可能是 in/not_in/between 等
-                        if isinstance(value, dict):
-                            for op, val in value.items():
-                                if op in ("in", "not_in") and isinstance(val, (list, tuple)):
-                                    filter_exprs.append(getattr(self.model_class, key).in_(val) if op == "in" else getattr(self.model_class, key).not_in(val))
-                                elif op == "between" and isinstance(val, (list, tuple)) and len(val) == 2:
-                                    filter_exprs.append(getattr(self.model_class, key).between(val[0], val[1]))
-                                elif op in ("gt", "gte", "lt", "lte"):
-                                    if val is not None:
-                                        col = getattr(self.model_class, key)
-                                        if op == "gt": filter_exprs.append(col > val)
-                                        elif op == "gte": filter_exprs.append(col >= val)
-                                        elif op == "lt": filter_exprs.append(col < val)
-                                        elif op == "lte": filter_exprs.append(col <= val)
-                                elif op == "like":
-                                    filter_exprs.append(getattr(self.model_class, key).like(val))
-                                elif op == "ilike":
-                                    filter_exprs.append(getattr(self.model_class, key).ilike(val))
-                        else:
-                            filter_exprs.append(getattr(self.model_class, key) == value)
-
-            # 处理简单 filters（保持兼容）
-            for key, value in filters.items():
-                if hasattr(self.model_class, key):
-                    filter_exprs.append(getattr(self.model_class, key) == value)
-
-            # 处理操作符条件
-            if conditions:
-                for field, operator, value in conditions:
-                    if hasattr(self.model_class, field):
-                        column = getattr(self.model_class, field)
-                        expr = self._build_filter_expr(column, operator, value)
-                        if expr is not None:
-                            filter_exprs.append(expr)
+            filter_exprs = self._build_filters(
+                where=where,
+                conditions=conditions,
+                filters=filters,
+            )
 
             # 应用条件
             if filter_exprs:
@@ -298,6 +279,323 @@ class DatabaseRepository(Generic[ModelType]):
             if select_fields:
                 return result.all()  # type: ignore[no-any-return]  # 返回元组列表
             return result.scalars().all()  # type: ignore[no-any-return]
+
+    # ==================== 聚合 / GROUP BY ====================
+
+    @db_operation("query_aggregate")
+    async def query_aggregate(
+        self,
+        aggregates: Dict[str, str],
+        group_by: Optional[Union[str, List[str]]] = None,
+        having: Optional[Dict[str, Any]] = None,
+        where: Optional[Dict[str, Any]] = None,
+        conditions: Optional[List[tuple]] = None,
+        logic: str = "AND",
+        order_by: Optional[Union[str, List[str], Dict[str, str]]] = None,
+        limit: Optional[int] = None,
+        offset: Optional[int] = None,
+        **filters: Any
+    ) -> List[Dict[str, Any]]:
+        """聚合查询（GROUP BY / HAVING）——返回 dict 列表。
+
+        **独立于 :meth:`query`**：``query()`` 的签名与返回类型完全不变，
+        因此这是纯新增能力，100% 向后兼容。
+
+        Args:
+            aggregates: 聚合表达式字典，``{别名: 表达式}``。
+                表达式可以是：
+                - ``"count"`` / ``"count:col"`` —— 计数
+                - ``"sum:col"`` / ``"avg:col"`` / ``"min:col"`` / ``"max:col"``
+                - ``"avg:col"`` 等价于 ``"mean:col"``
+                也接受**原始 SQL 片段**（以 ``func.`` 开头）或 ``sqlalchemy`` 表达式对象。
+            group_by: 分组列名（str 或 list）
+            having: 分组后的过滤条件，``{列名: 值或操作符 dict}``
+                —— 语义与 ``where`` 相同（如 ``{"total": {"gt": 100}}``）
+            where: 行级过滤条件（聚合前）——语义与 ``query()`` 相同
+            conditions: 操作符条件列表（聚合前）
+            logic: 条件逻辑，"AND" 或 "OR"
+            order_by: 排序（按聚合结果的别名或分组列）
+            limit: 限制数量
+            offset: 偏移量
+            **filters: 简单等值过滤条件（聚合前）
+
+        Returns:
+            dict 列表——每行含分组列与聚合别名
+
+        Examples:
+            >>> # 每个 series 的最新值
+            >>> await repo.query_aggregate(
+            ...     aggregates={"latest": "max:created_at"},
+            ...     group_by="series",
+            ... )
+            [{'series': 'btc', 'latest': datetime(...)}, ...]
+
+            >>> # 每个 series 的条数 + 平均值，并过滤
+            >>> await repo.query_aggregate(
+            ...     aggregates={"cnt": "count", "avg_price": "avg:price"},
+            ...     group_by="series",
+            ...     having={"cnt": {"gt": 10}},
+            ... )
+        """
+        if not aggregates:
+            raise DatabaseError(
+                "query_aggregate 需要至少一个聚合表达式",
+                operation="query_aggregate",
+            )
+
+        async with self.get_session() as session:
+            # ===== 1. 构造 select 列表 =====
+            select_cols: List[Any] = []
+            alias_map: Dict[str, Any] = {}
+
+            # 分组列先放进 select（顺序即返回 dict 的列序）
+            group_cols: List[Any] = []
+            group_names: List[str] = []
+            if group_by:
+                names = [group_by] if isinstance(group_by, str) else list(group_by)
+                for name in names:
+                    col = self._get_column(name)
+                    if col is None:
+                        self.logger.warning(f"group_by 的列不存在，已忽略: {name}")
+                        continue
+                    group_cols.append(col)
+                    group_names.append(name)
+                    select_cols.append(col)
+
+            # 聚合列
+            for alias, expr in aggregates.items():
+                agg_expr = self._build_aggregate_expr(expr)
+                if agg_expr is None:
+                    self.logger.warning(f"无法解析的聚合表达式，已忽略: {alias}={expr}")
+                    continue
+                labeled = agg_expr.label(alias)
+                select_cols.append(labeled)
+                alias_map[alias] = labeled
+
+            if not select_cols:
+                raise DatabaseError(
+                    "query_aggregate 没有可用的列（group_by 与 aggregates 都无效）",
+                    operation="query_aggregate",
+                )
+
+            stmt = select(*select_cols)
+            # 没有分组列时（如全表 count），select(func.count()) 无法自动推断
+            # FROM 哪张表——必须显式 select_from，否则 SQL 缺少 FROM 子句
+            if not group_cols:
+                stmt = stmt.select_from(cast(Any, self.model_class))
+
+            # ===== 2. 行级过滤（聚合前）=====
+            filter_exprs = self._build_filters(
+                where=where,
+                conditions=conditions,
+                filters=filters,
+            )
+            stmt = self._apply_filters(stmt, filter_exprs, logic)
+
+            # ===== 3. GROUP BY =====
+            if group_cols:
+                stmt = stmt.group_by(*group_cols)
+
+            # ===== 4. HAVING（聚合后过滤）=====
+            if having:
+                having_exprs = self._build_having_exprs(having, alias_map)
+                if having_exprs:
+                    stmt = stmt.having(and_(*having_exprs))
+
+            # ===== 5. 排序 / 分页 =====
+            if order_by:
+                stmt = self._apply_aggregate_order_by(stmt, order_by, alias_map, group_names)
+            if limit is not None:
+                stmt = stmt.limit(limit)
+            if offset is not None:
+                stmt = stmt.offset(offset)
+
+            result = await session.execute(stmt)
+            rows = result.mappings().all()
+            return [dict(row) for row in rows]
+
+    def _build_aggregate_expr(self, expr: Any) -> Any:  # noqa: ANN401
+        """解析单个聚合表达式。
+
+        支持的写法：
+          - ``"count"`` / ``"count:col"``
+          - ``"sum:col"`` / ``"avg:col"`` / ``"mean:col"`` / ``"min:col"`` / ``"max:col"``
+          - 原始 SQL 片段（以 ``func.`` 开头）——直接使用
+          - SQLAlchemy 表达式对象——直接使用
+
+        Returns:
+            SQLAlchemy 表达式；无法解析时 None
+        """
+        # 已经是表达式对象
+        if not isinstance(expr, str):
+            return expr
+
+        raw = expr.strip()
+        if not raw:
+            return None
+
+        # 原始 SQL 片段：func.count() / func.sum(Model.col) 等
+        if raw.startswith("func."):
+            try:
+                # 只允许 func.xxx(...) 这种受限形式——避免 eval 的任意代码执行风险
+                return self._parse_func_expression(raw)
+            except Exception as e:
+                self.logger.warning(f"聚合表达式解析失败: {expr}（{e}）")
+                return None
+
+        # "agg:col" 形式
+        if ":" in raw:
+            agg_name, col_name = raw.split(":", 1)
+            agg_name = agg_name.strip().lower()
+            col_name = col_name.strip()
+            col = self._get_column(col_name) if col_name else None
+            if col is None:
+                self.logger.warning(f"聚合表达式的列不存在: {expr}")
+                return None
+            agg_func = cast(
+                Optional[Callable[..., Any]],
+                {
+                    "count": func.count,
+                    "sum": func.sum,
+                    "avg": func.avg,
+                    "mean": func.avg,
+                    "min": func.min,
+                    "max": func.max,
+                }.get(agg_name),
+            )
+            if agg_func is None:
+                self.logger.warning(f"不支持的聚合函数: {agg_name}")
+                return None
+            return agg_func(col)
+
+        # 裸 "count" —— 计数
+        if raw.lower() == "count":
+            return func.count()
+
+        self.logger.warning(f"无法解析的聚合表达式: {expr}")
+        return None
+
+    def _parse_func_expression(self, raw: str) -> Any:  # noqa: ANN401
+        """解析 ``func.xxx(...)`` 形式的聚合表达式——**不用 eval**。
+
+        只支持受限语法，避免任意代码执行：
+
+            func.count()
+            func.count(col)
+            func.sum(col)
+            func.avg(col)
+
+        Args:
+            raw: 形如 ``func.sum(price)`` 的字符串
+
+        Returns:
+            SQLAlchemy 表达式
+
+        Raises:
+            ValueError: 语法不合法或引用了未知列
+        """
+        text = raw.strip()
+        if not text.startswith("func.") or not text.endswith(")"):
+            raise ValueError(f"不支持的聚合表达式格式: {raw}")
+
+        inner = text[len("func."):-1]
+        func_name, _, arg = inner.partition("(")
+        func_name = func_name.strip()
+        arg = arg.strip()
+
+        agg_func = cast(
+            Optional[Callable[..., Any]],
+            {
+                "count": func.count,
+                "sum": func.sum,
+                "avg": func.avg,
+                "mean": func.avg,
+                "min": func.min,
+                "max": func.max,
+            }.get(func_name),
+        )
+        if agg_func is None:
+            raise ValueError(f"不支持的聚合函数: {func_name}")
+
+        if not arg:
+            return agg_func()
+
+        # 只允许纯列名（不含括号 / 引号 / 空格）——防止注入任意表达式
+        if not arg.replace("_", "").isalnum():
+            raise ValueError(f"聚合表达式的参数只能是列名，收到: {arg}")
+
+        col = self._get_column(arg)
+        if col is None:
+            raise ValueError(f"聚合表达式的列不存在: {arg}")
+        return agg_func(col)
+
+    def _build_having_exprs(
+        self,
+        having: Dict[str, Any],
+        alias_map: Dict[str, Any],
+    ) -> List[Any]:
+        """构造 HAVING 条件。
+
+        key 可以是聚合别名（``{"cnt": {"gt": 10}}``）或真实列名
+        （``{"price": {"gt": 100}}``）——真实列名会转成 ``func.sum(col)``。
+        """
+        exprs: List[Any] = []
+        for key, value in having.items():
+            target = alias_map.get(key)
+            if target is None:
+                # 不是聚合别名——按「对该列求和后比较」处理
+                col = self._get_column(key)
+                if col is None:
+                    self.logger.warning(f"having 的列不存在，已忽略: {key}")
+                    continue
+                target = func.sum(col)
+
+            if isinstance(value, dict):
+                for op, val in value.items():
+                    expr = self._build_filter_expr(target, op, val)
+                    if expr is not None:
+                        exprs.append(expr)
+            else:
+                expr = self._build_filter_expr(target, "eq", value)
+                if expr is not None:
+                    exprs.append(expr)
+        return exprs
+
+    def _apply_aggregate_order_by(
+        self,
+        stmt: Any,
+        order_by: Any,
+        alias_map: Dict[str, Any],
+        group_names: List[str],
+    ) -> Any:
+        """聚合查询的排序——支持按聚合别名或分组列。"""
+        items: List[Any]
+        if isinstance(order_by, str):
+            items = [order_by]
+        elif isinstance(order_by, dict):
+            items = [f"{k} {v}" for k, v in order_by.items()]
+        elif isinstance(order_by, list):
+            items = list(order_by)
+        else:
+            return stmt
+
+        for item in items:
+            if not isinstance(item, str):
+                continue
+            parts = item.strip().split()
+            if not parts:
+                continue
+            name = parts[0]
+            desc = len(parts) > 1 and parts[1].upper() == "DESC"
+
+            target = alias_map.get(name)
+            if target is None and name in group_names:
+                target = self._get_column(name)
+            if target is None:
+                self.logger.warning(f"order_by 的列不存在，已忽略: {name}")
+                continue
+            stmt = stmt.order_by(target.desc() if desc else target)
+        return stmt
 
     # ==================== 分组取最新记录 ====================
     @db_operation("get_latest_per_group")
@@ -462,41 +760,24 @@ class DatabaseRepository(Generic[ModelType]):
             page_size = 20
 
         async with self.get_session() as session:
-            # 构建过滤条件
-            filter_exprs = []
-            if where:
-                for key, value in where.items():
-                    if hasattr(self.model_class, key):
-                        filter_exprs.append(getattr(self.model_class, key) == value)
-            for key, value in filters.items():
-                if hasattr(self.model_class, key):
-                    filter_exprs.append(getattr(self.model_class, key) == value)
-            if conditions:
-                for field, operator, value in conditions:
-                    if hasattr(self.model_class, field):
-                        column = getattr(self.model_class, field)
-                        expr = self._build_filter_expr(column, operator, value)
-                        if expr is not None:
-                            filter_exprs.append(expr)
+            # 构建过滤条件——与 query() 共用 _build_filters，
+            # 因此 where 的三种形式（等值 / 操作符 dict / conditions 列表）能力对等
+            filter_exprs = self._build_filters(
+                where=where,
+                conditions=conditions,
+                filters=filters,
+            )
 
             # 查询总数
             count_stmt = select(func.count()).select_from(self.model_class)  # type: ignore[arg-type]
-            if filter_exprs:
-                if logic.upper() == "OR":
-                    count_stmt = count_stmt.where(or_(*filter_exprs))
-                else:
-                    count_stmt = count_stmt.where(and_(*filter_exprs))
+            count_stmt = self._apply_filters(count_stmt, filter_exprs, logic)
 
             total_result = await session.execute(count_stmt)
             total = total_result.scalar() or 0
 
             # 查询分页数据
             stmt = select(self.model_class)  # type: ignore[call-overload]
-            if filter_exprs:
-                if logic.upper() == "OR":
-                    stmt = stmt.where(or_(*filter_exprs))
-                else:
-                    stmt = stmt.where(and_(*filter_exprs))
+            stmt = self._apply_filters(stmt, filter_exprs, logic)
 
             if order_by:
                 stmt = self._apply_order_by(stmt, order_by)
@@ -585,21 +866,134 @@ class DatabaseRepository(Generic[ModelType]):
     # ==================== 存在性检查 ====================
     
     @db_operation("exists")
-    async def exists(self, **filters: Any) -> bool:
-        """检查记录是否存在"""
+    async def exists(
+        self,
+        where: Optional[Dict[str, Any]] = None,
+        conditions: Optional[List[tuple]] = None,
+        logic: str = "AND",
+        **filters: Any
+    ) -> bool:
+        """检查记录是否存在。
+
+        Args:
+            where: 等值 / 带操作符的条件字典（与 query() 语义一致）
+            conditions: 操作符条件列表 ``[(field, op, value), ...]``
+            logic: 条件逻辑，"AND" 或 "OR"
+            **filters: 简单等值过滤条件
+        """
         async with self.get_session() as session:
             stmt = select(self.model_class)  # type: ignore[call-overload]
-            
-            for key, value in filters.items():
-                if hasattr(self.model_class, key):
-                    stmt = stmt.where(getattr(self.model_class, key) == value)
-            
+
+            filter_exprs = self._build_filters(
+                where=where,
+                conditions=conditions,
+                filters=filters,
+            )
+            stmt = self._apply_filters(stmt, filter_exprs, logic)
+
             stmt = stmt.limit(1)
             result = await session.execute(stmt)
             return result.first() is not None
     
     # ==================== 工具方法 ====================
     
+    def _build_filters(
+        self,
+        where: Optional[Dict[str, Any]] = None,
+        conditions: Optional[List[tuple]] = None,
+        filters: Optional[Dict[str, Any]] = None,
+    ) -> List[Any]:
+        """统一构造过滤表达式——``query`` / ``paginate`` / ``count`` 共用。
+
+        三种入参形式**能力对等**（这是修复前最大的 API 陷阱）：
+
+        1. ``where={"status": "active"}`` —— 等值
+        2. ``where={"age": {"gt": 18}}`` —— 带操作符的 dict（值是 dict 时）
+        3. ``conditions=[("age", "gt", 18)]`` —— 操作符列表
+        4. ``filters={"status": "active"}`` —— 关键字参数形式的等值
+
+        Args:
+            where: 等值 / 带操作符的条件字典
+            conditions: ``(field, operator, value)`` 三元组列表
+            filters: 简单等值条件
+
+        Returns:
+            SQLAlchemy 表达式列表（已按 ``logic`` 由调用方合并）
+        """
+        exprs: List[Any] = []
+
+        # where：值是 dict → 操作符形式；否则等值
+        if where:
+            for key, value in where.items():
+                column = self._get_column(key)
+                if column is None:
+                    continue
+                if isinstance(value, dict):
+                    # {"gt": 18, "lt": 65} —— 逐个操作符构造
+                    for op, val in value.items():
+                        expr = self._build_filter_expr(column, op, val)
+                        if expr is not None:
+                            exprs.append(expr)
+                else:
+                    # 等值——走 _build_filter_expr 以统一 NULL 语义
+                    # （value=None → IS NULL，而不是 == None）
+                    expr = self._build_filter_expr(column, "eq", value)
+                    if expr is not None:
+                        exprs.append(expr)
+
+        # filters：简单等值
+        if filters:
+            for key, value in filters.items():
+                column = self._get_column(key)
+                if column is None:
+                    continue
+                expr = self._build_filter_expr(column, "eq", value)
+                if expr is not None:
+                    exprs.append(expr)
+
+        # conditions：显式操作符列表
+        if conditions:
+            for field, operator, value in conditions:
+                column = self._get_column(field)
+                if column is None:
+                    continue
+                expr = self._build_filter_expr(column, operator, value)
+                if expr is not None:
+                    exprs.append(expr)
+
+        return exprs
+
+    def _get_column(self, key: str) -> Any:  # noqa: ANN401
+        """取模型列——不是列就返回 None。
+
+        用 ``__table__.columns`` 白名单校验，而不是 ``hasattr(model, key)``：
+          - ``hasattr`` 会命中 ``metadata`` / ``registry`` / ``__table__`` 等
+            非列属性，拿它们做比较会抛 ``ArgumentError``
+          - ``__table__.columns`` 是字典查找，O(1) 且精确
+
+        Args:
+            key: 列名
+
+        Returns:
+            SQLAlchemy 列对象；不是有效列则 None
+        """
+        table = getattr(self.model_class, "__table__", None)
+        if table is not None:
+            columns = getattr(table, "columns", None)
+            if columns is not None:
+                return columns.get(key)
+            return None
+        # 没有 __table__（非 ORM 模型）——退回 getattr
+        return getattr(self.model_class, key, None)
+
+    def _apply_filters(self, stmt: Any, exprs: List[Any], logic: str = "AND") -> Any:
+        """把过滤表达式应用到语句上（按 AND / OR 合并）。"""
+        if not exprs:
+            return stmt
+        if logic.upper() == "OR":
+            return stmt.where(or_(*exprs))
+        return stmt.where(and_(*exprs))
+
     def _apply_order_by(self, stmt: Any, order_by: Any) -> Any:
         """应用排序条件"""
         if isinstance(order_by, str):
@@ -642,9 +1036,10 @@ class DatabaseRepository(Generic[ModelType]):
             if operator == "is_not_null":
                 return column.is_not(None)
             # 对于 >, <, >=, <=, like, ilike, in, not_in, between
-            # None 比较永远返回 False
+            # None 比较永远返回 False——用 sqlalchemy.false() 明确表达
+            # （旧写法 `IS NULL AND IS NOT NULL` 依赖三值逻辑，脆弱且难读）
             if operator in ("gt", "gte", "lt", "lte", "like", "ilike", "in", "not_in", "between"):
-                return column.is_(None) & column.is_not(None)  # 永远为 False
+                return false()
             return None
 
         # ===== 2. 处理布尔值 =====
@@ -666,6 +1061,20 @@ class DatabaseRepository(Generic[ModelType]):
             return column.in_(value.get("in", [])) if "in" in value else None
 
         # ===== 4. 正常处理其他值 =====
+        # 注意 in / not_in 的空 list 语义：
+        #   空 list 意味着「匹配不到任何行」——必须生成恒 False 条件，
+        #   而**不是**返回 None（返回 None 会让条件被静默丢弃 → 返回全表！）。
+        if operator == "in":
+            if isinstance(value, (list, tuple, set, frozenset)):
+                return column.in_(list(value)) if value else false()
+            self.logger.warning(f"in 操作符需要 list/tuple，收到 {type(value).__name__}")
+            return None
+        if operator == "not_in":
+            if isinstance(value, (list, tuple, set, frozenset)):
+                return column.not_in(list(value)) if value else true()
+            self.logger.warning(f"not_in 操作符需要 list/tuple，收到 {type(value).__name__}")
+            return None
+
         operators = {
             "eq": column == value,
             "ne": column != value,
@@ -675,8 +1084,6 @@ class DatabaseRepository(Generic[ModelType]):
             "lte": column <= value,
             "like": column.like(value),
             "ilike": column.ilike(value),
-            "in": column.in_(value) if isinstance(value, (list, tuple)) and value else None,
-            "not_in": column.not_in(value) if isinstance(value, (list, tuple)) and value else None,
             "is_null": column.is_(None),
             "is_": column.is_(value),
             "is_not": column.is_not(value),
