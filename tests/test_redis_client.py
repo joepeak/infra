@@ -277,7 +277,27 @@ class TestSortedSetOps:
         mock.zadd = AsyncMock(return_value=2)
         result = await c.zadd("z", {"a": 1.0, "b": 2.0})
         assert result == 2
-        mock.zadd.assert_called_once_with("z", {"a": 1.0, "b": 2.0})
+        # 默认不带任何标志
+        mock.zadd.assert_called_once_with(
+            "z", {"a": 1.0, "b": 2.0}, nx=False, xx=False, ch=False, gt=False, lt=False
+        )
+
+    async def test_zadd_with_flags(self, client_with_mock_redis):
+        """zadd 的 nx / xx / ch / gt / lt 标志。"""
+        c, mock = client_with_mock_redis
+        mock.zadd = AsyncMock(return_value=1)
+        result = await c.zadd("z", {"a": 1.0}, nx=True)
+        assert result == 1
+        mock.zadd.assert_called_once_with(
+            "z", {"a": 1.0}, nx=True, xx=False, ch=False, gt=False, lt=False
+        )
+
+    async def test_zadd_empty_mapping(self, client_with_mock_redis):
+        """空 mapping 直接返回 0，不发命令。"""
+        c, mock = client_with_mock_redis
+        mock.zadd = AsyncMock(return_value=0)
+        assert await c.zadd("z", {}) == 0
+        mock.zadd.assert_not_called()
 
     async def test_zremrangebyscore(self, client_with_mock_redis):
         c, mock = client_with_mock_redis
