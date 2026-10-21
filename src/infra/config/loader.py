@@ -53,8 +53,10 @@ class ConfigLoader:
     @classmethod
     def _resolve_env_value(cls, value: str) -> str:
         """Resolve a single string with ${VAR} or ${VAR:default} placeholders."""
-        def _sub(m):
-            var_name, default = m.group(1), m.group(2)
+        def _sub(m: "re.Match[str]") -> str:
+            var_name: str = m.group(1)
+            # group(2) 是可选组——未匹配时返回 None
+            default: Optional[str] = m.group(2)
             return os.getenv(var_name, default if default is not None else "")
         return cls._ENV_PATTERN.sub(_sub, value)
 

@@ -8,7 +8,7 @@ import os
 import re
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
-from typing import Optional, Dict, Any, AsyncGenerator
+from typing import Optional, Dict, Any, AsyncGenerator, cast
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncEngine, AsyncSession, async_sessionmaker
 from sqlalchemy import text
 from sqlalchemy.pool import StaticPool
@@ -131,14 +131,17 @@ class DatabaseConnectionManager:
         import re
         pattern = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::([^}]*))?\}")
 
-        def _sub(m: "re.Match") -> str:
-            var, default = m.group(1), m.group(2)
+        def _sub(m: "re.Match[str]") -> str:
+            var: str = m.group(1)
+            # group(2) 是可选组——未匹配时返回 None
+            default: Optional[str] = m.group(2)
             val = os.getenv(var)
             if val is None:
                 if default is not None:
                     return default
                 logger.warning(f"环境变量 {var} 未定义（.env 或系统环境），保留占位符")
-                return m.group(0)  # type: ignore[return-value]
+                # group(0) 是整个匹配串——必为 str
+                return cast(str, m.group(0))
             return val
 
         return pattern.sub(_sub, value)
