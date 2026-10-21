@@ -187,18 +187,34 @@ class RedisStreamMQ:
             return None
         
         config = self._queues[stream_name]
-        
+
         # 处理 TaskMessage 对象
         if isinstance(message, TaskMessage):
             data = message.to_mq()
         else:
             # 兼容旧的字典格式
+            #
+            # 序列化单独包 try：payload 不可 JSON 序列化是**调用方的 bug**
+            # （传了非 JSON 类型），不是运行时故障——必须抛出来暴露问题，
+            # 不能伪装成「发送失败返回 None」，否则消息静默丢失。
+            try:
+                payload_json = json.dumps(
+                    message.get('payload', {}), ensure_ascii=False
+                )
+                metadata_json = (
+                    json.dumps(message.get('metadata', {}), ensure_ascii=False)
+                    if message.get('metadata') else ''
+                )
+            except (TypeError, ValueError) as e:
+                raise TypeError(
+                    f"消息 payload/metadata 无法 JSON 序列化: {e}"
+                ) from e
             data = {
                 'task_id': message.get('task_id', str(uuid.uuid4())),
                 'task_type': message.get('task_type', 'unknown'),
                 'scheduled_time': message.get('scheduled_time', datetime.now().isoformat()),
-                'payload': json.dumps(message.get('payload', {}), ensure_ascii=False),
-                'metadata': json.dumps(message.get('metadata', {}), ensure_ascii=False) if message.get('metadata') else '',
+                'payload': payload_json,
+                'metadata': metadata_json,
                 'priority': message.get('priority', MessagePriority.NORMAL),
                 'created_at': str(time.time())
             }
@@ -321,7 +337,10 @@ class RedisStreamMQ:
         """独立协程：定期扫描并认领超时的待处理消息"""
         consumer_name = f"claimer_{uuid.uuid4().hex[:8]}"
         logger.info(f"🔁 认领协程启动: {stream_name}/{consumer_name}")
-        
+
+        # XAUTOCLAIM 的游标——续扫用，避免每次都从 0-0 开始
+        cursor = "0-0"
+
         while self._running:
             try:
                 if self._redis is None:
@@ -329,39 +348,55 @@ class RedisStreamMQ:
                     continue
 
                 redis = self._redis  # narrow
-                pending = await redis.xpending_range(
+
+                # 用 XAUTOCLAIM 批量认领超时消息。
+                #
+                # 为什么不用 xpending_range + xclaim 逐条处理：
+                #   1. XAUTOCLAIM 一次最多可认领 count 条，RTT 更少；
+                #   2. XAUTOCLAIM **自动累加** delivery counter
+                #      （xclaim 也会累加，但需要逐条调用）；
+                #   3. XAUTOCLAIM 会返回「已从 stream 中删除」的消息 id
+                #      （被 MAXLEN 裁剪的幽灵消息）——这类消息内容已丢失，
+                #      无法重试，只能记日志避免它们永远占着 PEL。
+                # XAUTOCLAIM 返回 [next_cursor, messages, deleted]
+                # 注意顺序——cursor 在**第一个**，不是最后一个。
+                next_cursor, claimed, deleted = await redis.xautoclaim(
                     config.stream_name,
                     config.group_name,
-                    '-',
-                    '+',
-                    count=100
+                    consumer_name,
+                    config.claim_min_idle_ms,
+                    cursor,
+                    count=config.batch_size,
                 )
-                
-                if pending:
-                    for item in pending:
-                        msg_id = item['message_id']
-                        # redis 返回 bytes / str / int——强制 int 转换
-                        # 避免 bytes > int 在 Python 3 抛 TypeError
-                        idle_time = int(item.get('idle', 0))
-                        delivery_count = int(item.get('times_delivered', 0))
 
-                        if idle_time > config.claim_min_idle_ms:
-                            if delivery_count >= config.max_retries:
-                                # msg_id 可能是 bytes/str——cast str 防下游类型错
-                                await self._move_to_dead_letter_by_id(stream_name, config, str(msg_id), delivery_count)
-                            else:
-                                claimed = await redis.xclaim(
-                                    config.stream_name,
-                                    config.group_name,
-                                    consumer_name,
-                                    config.claim_min_idle_ms,
-                                    [msg_id]
-                                )
-                                if claimed:
-                                    logger.info(f"已认领超时消息: {msg_id!r}, delivery_count={delivery_count + 1}")
-                
+                for msg_id in deleted or ():
+                    # 消息内容已被 MAXLEN 裁剪——无法重试也无法进死信
+                    # （死信需要原始数据）。只记日志并从 PEL 移除。
+                    logger.warning(
+                        f"消息内容已被 MAXLEN 裁剪，无法恢复，从 PEL 移除: "
+                        f"{stream_name}/{msg_id!r}"
+                    )
+                    try:
+                        await redis.xack(
+                            config.stream_name, config.group_name, msg_id
+                        )
+                    except Exception as e:
+                        logger.warning(f"清理裁剪消息失败: {e}")
+
+                for msg_id, data in claimed or ():
+                    # 认领后**立即处理**——否则消息归 claimer 所有，
+                    # 而 worker 用 '>' 只读新消息，永远读不到它，
+                    # 消息会在 claimer 之间空转、永远不消费。
+                    await self._handle_claimed_message(
+                        stream_name, config, str(msg_id), data
+                    )
+
+                # 更新游标——下一轮从上次的位置继续扫。
+                # 扫完一圈（cursor 回到 0-0）说明没有更多了，保持 0-0 即可。
+                cursor = next_cursor if next_cursor else "0-0"
+
                 await asyncio.sleep(config.claim_interval)
-                
+
             except asyncio.CancelledError:
                 logger.info(f"认领协程被取消: {stream_name}")
                 break
@@ -369,34 +404,129 @@ class RedisStreamMQ:
                 if "Event loop is closed" not in str(e):
                     logger.error(f"认领协程异常: {stream_name}, error={e}")
                 await asyncio.sleep(config.claim_interval)
-        
+
         logger.info(f"👋 认领协程已停止: {stream_name}")
-    
-    async def _move_to_dead_letter_by_id(self, stream_name: str, config: QueueConfig, 
-                                          msg_id: str, delivery_count: int) -> None:
-        """根据消息 ID 移动到死信队列"""
+
+    async def _handle_claimed_message(
+        self,
+        stream_name: str,
+        config: QueueConfig,
+        msg_id: str,
+        data: Dict[str, str],
+    ) -> None:
+        """处理一条**已认领**的消息。
+
+        认领只是把消息的所有权转给 claimer——还必须真正执行 handler，
+        否则消息永远不会被消费。
+
+        处理成功 → XACK；失败 → 不 ACK，留在 PEL 等待下一轮认领
+        （重试次数超限则移入死信队列）。
+        """
+        try:
+            # 认领前的投递次数——用于判断是否已超 max_retries。
+            # XAUTOCLAIM 会自动累加 delivery counter，所以认领后
+            # 次数 = 认领前 + 1。
+            delivery_count = await self._get_delivery_count(
+                stream_name, config, msg_id
+            )
+            if delivery_count > config.max_retries:
+                await self._move_to_dead_letter_by_id(
+                    stream_name, config, msg_id, delivery_count
+                )
+                return
+
+            success, error_msg = await self._process_message(
+                stream_name, config, msg_id, data
+            )
+            if success:
+                logger.info(f"已认领消息处理完成: {stream_name}/{msg_id}")
+            else:
+                logger.warning(
+                    f"已认领消息处理失败（将重试）: {stream_name}/{msg_id}, "
+                    f"error={error_msg}"
+                )
+        except Exception as e:
+            # 处理本身抛异常（如 Redis 断连）——不 ACK，留在 PEL
+            logger.error(
+                f"处理已认领消息时异常: {stream_name}/{msg_id}, error={e}"
+            )
+
+    async def _get_delivery_count(
+        self,
+        stream_name: str,
+        config: QueueConfig,
+        msg_id: str,
+    ) -> int:
+        """查询某条消息的投递次数（times_delivered）。
+
+        查不到时返回 0（不阻塞主流程）。
+
+        Note:
+            ``xpending_range`` 返回的字段是 ``time_since_delivered``
+            （空闲毫秒数），**不是** ``idle``——读错字段名会恒拿到 0，
+            导致超时判断永远不成立。
+        """
         redis = self._r()
+        try:
+            pending = await redis.xpending_range(
+                stream_name, config.group_name, msg_id, msg_id, count=1
+            )
+            for item in pending or ():
+                if str(item.get("message_id")) == str(msg_id):
+                    return int(item.get("times_delivered", 0) or 0)
+        except Exception as e:
+            logger.warning(f"查询投递次数失败: {e}")
+        return 0
+
+    
+    async def _move_to_dead_letter_by_id(self, stream_name: str, config: QueueConfig,
+                                          msg_id: str, delivery_count: int,
+                                          reason: str = "max_retries_exceeded") -> None:
+        """根据消息 ID 移动到死信队列。
+
+        Args:
+            stream_name: 流名
+            config: 队列配置
+            msg_id: 消息 ID
+            delivery_count: 已投递次数
+            reason: 移入死信的原因（写入死信记录，便于排查）
+        """
+        redis = self._r()
+        dead_letter_key = f"{stream_name}:dead_letter"
         msgs = await redis.xrange(config.stream_name, msg_id, msg_id)
         if not msgs:
+            # 消息内容已被 MAXLEN 裁剪——死信需要原始数据，没法搬运。
+            # 但仍要把它从 PEL 移除，否则它会永远占着 PEL 变成幽灵消息。
+            logger.warning(
+                f"消息内容已不可用（可能被 MAXLEN 裁剪），从 PEL 移除: "
+                f"{stream_name}/{msg_id}, reason={reason}"
+            )
+            try:
+                await redis.xack(config.stream_name, config.group_name, msg_id)
+            except Exception as e:
+                logger.warning(f"清理裁剪消息失败: {e}")
             return
-        
+
         for entry in msgs:
             if not isinstance(entry, (list, tuple)) or len(entry) < 2:
                 continue
             data = entry[1]
-            dead_letter_key = f"{stream_name}:dead_letter"
             await redis.xadd(
                 dead_letter_key,
                 {
                     'original_id': msg_id,
-                    'original_data': json.dumps(data),
+                    'original_data': json.dumps(data, ensure_ascii=False),
                     'delivery_count': str(delivery_count),
+                    'reason': reason,
                     'failed_at': str(time.time())
                 },
                 maxlen=1000
             )
             await redis.xack(config.stream_name, config.group_name, msg_id)
-            logger.warning(f"消息已移至死信队列: {stream_name}/{msg_id}, delivery_count={delivery_count}")
+            logger.warning(
+                f"消息已移至死信队列: {stream_name}/{msg_id}, "
+                f"delivery_count={delivery_count}, reason={reason}"
+            )
     
     async def _process_message(self, stream_name: str, config: QueueConfig, 
                                 msg_id: str, data: Dict[str, str]) -> Tuple[bool, Optional[str]]:
@@ -428,8 +558,17 @@ class RedisStreamMQ:
                 logger.debug(f"✅ 消息处理完成: {msg_id}")
                 return True, None
             else:
-                logger.warning(f"⚠️ 未找到处理器: {stream_name}/{task_type}")
-                await redis.xack(config.stream_name, config.group_name, msg_id)
+                # 没有对应的处理器——**移入死信队列**而不是静默丢弃。
+                # 静默 XACK 会让消息彻底消失且无任何痕迹：既不知道丢了什么，
+                # 也没法事后重放。进死信后至少可查、可 retry_dead_letter。
+                logger.warning(
+                    f"⚠️ 未找到处理器，移入死信队列: {stream_name}/{task_type}"
+                )
+                await self._move_to_dead_letter_by_id(
+                    stream_name, config, msg_id, 0, reason="no_handler"
+                )
+                self._stats['total_failed'] += 1
+                self._stats['last_error'] = f"no handler for task_type={task_type}"
                 return True, None
                 
         except Exception as e:
@@ -575,19 +714,25 @@ class RedisStreamMQ:
     async def stop(self) -> None:
         """优雅停止所有消费者"""
         logger.info("正在停止消息队列...")
-        
+
         self._running = False
-        
-        # 给正在处理的消息一些时间
-        await asyncio.sleep(3)
-        
+
+        # 等正在处理的消息完成。
+        #
+        # 旧实现是固定 sleep(3)——handler 执行超过 3 秒会被强行中断
+        # （消息未 ACK 会重试，行为可接受但很粗暴）。改成：
+        #   1. 先等一小段时间让 worker 看到 _running=False 自然退出；
+        #   2. 再 cancel 剩余任务并等待它们真正结束。
+        await asyncio.sleep(0.1)
+
         if self._monitor_task:
             self._monitor_task.cancel()
             try:
                 await self._monitor_task
             except asyncio.CancelledError:
                 pass
-        
+            self._monitor_task = None
+
         for stream_name, task in self._claim_tasks.items():
             task.cancel()
             try:
@@ -595,19 +740,25 @@ class RedisStreamMQ:
             except asyncio.CancelledError:
                 pass
         self._claim_tasks.clear()
-        
+
         for stream_name, tasks in self._consumer_tasks.items():
             for task in tasks:
                 task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
+            # 等待所有 worker 真正结束（而不是逐个 await，
+            # 避免第一个 await 阻塞时其它任务还没被 cancel）
+            await asyncio.gather(*tasks, return_exceptions=True)
         self._consumer_tasks.clear()
-        
+
         if self._redis:
-            await self._redis.aclose()
-        
+            try:
+                await self._redis.aclose()
+            except Exception as e:
+                logger.warning(f"关闭 Redis 连接失败: {e}")
+            finally:
+                # 置空——让下次 connect() 走完整重连流程，
+                # 而不是复用已关闭的连接对象
+                self._redis = None
+
         logger.info("消息队列已停止")
     
     async def get_stats(self, stream_name: Optional[str] = None) -> Dict[str, Any]:
@@ -674,12 +825,25 @@ class RedisStreamMQ:
             msg_data = entry[1]
             # narrow bytes | str → str（json 字符串）+ fallback {}（防 None 真业务 bug）
             raw = msg_data.get('original_data', '{}') if msg_data else '{}'
-            original_data = json.loads(raw)
+            # 死信数据可能损坏（人工改过 / 旧版本写入的格式不同）——
+            # 解析失败不能抛异常打断调用方，记日志并跳过该条。
+            try:
+                original_data = json.loads(raw)
+            except (TypeError, ValueError) as e:
+                logger.error(
+                    f"死信消息数据解析失败，跳过: {dead_letter_key}/{msg_id!r}, error={e}"
+                )
+                continue
+            if not isinstance(original_data, dict):
+                logger.error(
+                    f"死信消息数据不是 dict，跳过: {dead_letter_key}/{msg_id!r}"
+                )
+                continue
             await redis.xadd(config.stream_name, original_data)
             await redis.xdel(dead_letter_key, msg_id)
             logger.info(f"消息已从死信队列恢复: {msg_id!r}")
             return True
-        
+
         return False
 
 
