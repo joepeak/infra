@@ -106,17 +106,36 @@ _FINAL_ANSWER_PATTERN = re.compile(
     r"(?i)\b(?:final\s+)?answer\s*[:：]\s*",
 )
 
+#: 匹配 "Final answer" / "最终答案" 等**独占一行**的强标记。
+#:
+#: 强标记优先——正文里出现的 "The answer: 42" 属于答案内容的一部分，
+#: 不能被当成 CoT 的结束标记（否则会把答案截断错位置）。
+_STRONG_FINAL_ANSWER_PATTERN = re.compile(
+    r"(?im)^[ \t]*(?:final\s+answer|最终答案|结论|answer)[ \t]*[:：][ \t]*$",
+)
+
 
 def _extract_after_final_answer(content: str) -> Optional[str]:
     """从 CoT 内容中提取 'final answer:' 之后的部分。
 
     返回提取到的内容（去除首尾空白），若找不到则返回 None。
+
+    选取规则（避免截断错位置）：
+      1. 优先取**独占一行**的强标记（``Final answer:`` / ``最终答案：``）——
+         这是模型明确标记答案起点的可靠信号。
+      2. 没有强标记时，取**第一个**弱标记（``answer:``）之后的内容。
+         不用最后一个——答案正文里再次出现 "answer:"（如 "The answer: 42"）
+         时，取最后一个会把真正的答案内容也吃掉。
     """
-    matches = list(_FINAL_ANSWER_PATTERN.finditer(content))
-    if not matches:
+    strong = list(_STRONG_FINAL_ANSWER_PATTERN.finditer(content))
+    if strong:
+        extracted = content[strong[-1].end():].strip()
+        return extracted if extracted else None
+
+    weak = list(_FINAL_ANSWER_PATTERN.finditer(content))
+    if not weak:
         return None
-    last_match = matches[-1]
-    extracted = content[last_match.end():].strip()
+    extracted = content[weak[0].end():].strip()
     return extracted if extracted else None
 
 

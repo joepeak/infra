@@ -47,6 +47,8 @@ from infra.llm.client import (
     MediaFactory,
     init_media_client,
     get_media_client,
+    AsyncStreamIterator,
+    SyncStreamIterator,
 )
 from infra.llm.models import LLMRequest, LLMResponse, MediaRequest, MediaResponse, Modality
 from infra.llm.models import ImageResult, VideoResult, AudioResult
@@ -93,6 +95,8 @@ __all__ = [
     # media
     "MediaClient", "OpenAIMediaClient", "MediaFactory",
     "init_media_client", "get_media_client",
+    # 流式迭代器（消费方可 isinstance 判断 / 显式关闭）
+    "AsyncStreamIterator", "SyncStreamIterator",
     # models
     "LLMRequest", "LLMResponse", "MediaRequest", "MediaResponse", "Modality",
     "ImageResult", "VideoResult", "AudioResult",

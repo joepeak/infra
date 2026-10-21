@@ -23,8 +23,9 @@ Agent 实例上——换个 Agent、换个节点又要重撞一遍，白白浪�
 from __future__ import annotations
 
 import threading
+from collections import OrderedDict
 from dataclasses import dataclass, field, asdict
-from typing import Dict, Optional
+from typing import ClassVar, Dict, Optional, Tuple
 
 from infra.logger import get_logger
 
@@ -84,7 +85,10 @@ class ProviderCapabilities:
         return asdict(self)
 
     #: 参与"是否有新结论"判定的字段（排除 last_error/source 这类噪声）
-    DECISION_FIELDS = (
+    #:
+    #: 用 ClassVar 标注——这是类级常量而非 dataclass 字段，
+    #: 否则 dataclass 会把它当实例字段处理（每个实例一份元组）。
+    DECISION_FIELDS: ClassVar[Tuple[str, ...]] = (
         "supports_tools",
         "supports_response_format",
         "thinking_conflicts_with_tools",
@@ -105,24 +109,60 @@ class ProviderCapabilities:
 
 
 class ProviderCapabilityRegistry:
-    """进程内 (base_url, model) → 能力 的缓存注册表（线程安全）。"""
+    """进程内 (base_url, model) → 能力 的缓存注册表（线程安全 + LRU 上限）。"""
 
-    def __init__(self) -> None:
-        self._caps: Dict[str, ProviderCapabilities] = {}
+    #: 缓存条目上限——超出后淘汰最久未用的条目。
+    #: 防止多端点 / 多模型场景下无限增长（长跑进程内存泄漏）。
+    MAX_ENTRIES = 256
+
+    def __init__(self, max_entries: Optional[int] = None) -> None:
+        self._caps: "OrderedDict[str, ProviderCapabilities]" = OrderedDict()
         self._lock = threading.Lock()
+        self._max_entries = max_entries if max_entries is not None else self.MAX_ENTRIES
 
     @staticmethod
-    def key(base_url: Optional[str], model: Optional[str]) -> str:
+    def _sanitize_base_url(base_url: Optional[str]) -> str:
+        """去掉 base_url 里的凭据部分（userinfo）。
+
+        ``https://sk-xxx@api.example.com/v1`` → ``https://api.example.com/v1``
+
+        base_url 可能带 userinfo（``user:pass@host`` 或 ``token@host``），
+        直接当缓存键会把**密钥存进内存**，也会随 ``snapshot()`` 导出到
+        日志 / 诊断里——与本模块「缓存键不含 api_key」的设计约束冲突。
+        """
+        if not base_url:
+            return ""
+        base = base_url.rstrip("/")
+        if "@" not in base:
+            return base
+        scheme_sep = "://"
+        idx = base.find(scheme_sep)
+        if idx == -1:
+            # 无 scheme（如 "token@host"）——直接去掉 @ 之前的部分
+            return base.rsplit("@", 1)[1]
+        head = base[: idx + len(scheme_sep)]
+        rest = base[idx + len(scheme_sep):]
+        if "@" not in rest:
+            return base
+        _userinfo, host_part = rest.rsplit("@", 1)
+        return f"{head}{host_part}"
+
+    @classmethod
+    def key(cls, base_url: Optional[str], model: Optional[str]) -> str:
         # 尾部斜杠归一化，避免 "http://x/v1" 与 "http://x/v1/" 记成两条
-        base = (base_url or "").rstrip("/")
+        # 凭据剥离——保证缓存键里不含 api_key / 密码
+        base = cls._sanitize_base_url(base_url)
         return f"{base}::{model or ''}"
 
     def get(self, base_url: Optional[str], model: Optional[str]) -> ProviderCapabilities:
         """读取能力画像；未知组合返回全 None 的空画像（不写入缓存）。"""
         with self._lock:
-            caps = self._caps.get(self.key(base_url, model))
+            k = self.key(base_url, model)
+            caps = self._caps.get(k)
             if caps is None:
                 return ProviderCapabilities()
+            # 命中则移到末尾（LRU：最近使用的留在最后）
+            self._caps.move_to_end(k)
             # 返回副本，防止调用方误改缓存
             return ProviderCapabilities(**caps.as_dict())
 
@@ -137,7 +177,17 @@ class ProviderCapabilityRegistry:
             if source:
                 caps.source = source
             self._caps[k] = caps
+            self._caps.move_to_end(k)
+            self._evict_if_needed()
             return ProviderCapabilities(**caps.as_dict())
+
+    def _evict_if_needed(self) -> None:
+        """超出上限时淘汰最久未用的条目（调用方须持有锁）。"""
+        if self._max_entries <= 0:
+            return
+        while len(self._caps) > self._max_entries:
+            evicted_key, _ = self._caps.popitem(last=False)
+            logger.debug(f"能力注册表超出上限，淘汰条目: {evicted_key}")
 
     def learn_from_error(self, base_url: Optional[str], model: Optional[str], error_message: str) -> ProviderCapabilities:
         """从真实调用的 BadRequestError 文本里学习能力，回填缓存（状态感知）。
@@ -179,6 +229,8 @@ class ProviderCapabilityRegistry:
             caps.last_error = (error_message or "")[:200]
             caps.source = "learn"
             self._caps[k] = caps
+            self._caps.move_to_end(k)
+            self._evict_if_needed()
             return ProviderCapabilities(**caps.as_dict())
 
     def learn_from_successful_response(
@@ -207,6 +259,8 @@ class ProviderCapabilityRegistry:
                 caps.leaks_cot = True
             caps.source = "learn"
             self._caps[k] = caps
+            self._caps.move_to_end(k)
+            self._evict_if_needed()
             return ProviderCapabilities(**caps.as_dict())
 
     def snapshot(self) -> Dict[str, Dict[str, Optional[object]]]:

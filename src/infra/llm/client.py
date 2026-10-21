@@ -9,6 +9,7 @@
 """
 import os
 import asyncio
+import inspect
 import time as _time
 from abc import ABC, abstractmethod
 from functools import partial
@@ -58,6 +59,331 @@ def _safe_extract(value: Any, expected_type: Union[type, Tuple[type, ...]]) -> A
     if isinstance(value, expected_type):
         return value
     return None
+
+
+def _dispose_awaitable(result: Any) -> None:
+    """处置一个「可能还没被 await 的协程」——不泄漏、不报 never-awaited 警告。
+
+    用于 GC 兜底路径。优先级很重要：
+
+      1. 有运行中的 loop → ``create_task`` 让协程**真正执行**（这才释放连接）
+      2. 没有 loop → 只能 ``close()`` 掉协程对象，避免 never-awaited 警告
+         （此时连接只能靠 SDK 自身的回收逻辑）
+
+    Args:
+        result: 协程对象（已确认是 awaitable）
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        closer = getattr(result, "close", None)
+        if callable(closer):
+            try:
+                closer()
+            except Exception:
+                pass
+        return
+    try:
+        loop.create_task(result)
+    except Exception:
+        pass
+
+
+class _StreamUsage:
+    """流式调用的 token 用量累加器。"""
+
+    __slots__ = ("prompt", "completion", "total")
+
+    def __init__(self) -> None:
+        self.prompt = 0
+        self.completion = 0
+        self.total = 0
+
+    def add(self, usage: Any) -> None:  # noqa: ANN401
+        """累加一个 chunk 的 usage（usage 为 None 时跳过）。"""
+        if not usage:
+            return
+        self.prompt += getattr(usage, "prompt_tokens", 0) or 0
+        self.completion += getattr(usage, "completion_tokens", 0) or 0
+        self.total += getattr(usage, "total_tokens", 0) or 0
+
+    def has_any(self) -> bool:
+        """是否记录到过任何 token。
+
+        不能只看 ``total``——部分 provider 返回 ``total_tokens=0``
+        但 prompt/completion 正常（免费端点常见），只看 total 会漏记成本。
+        """
+        return bool(self.prompt or self.completion or self.total)
+
+    def as_usage(self) -> Dict[str, int]:
+        """转成 usage dict；``total_tokens`` 缺失时回退到 prompt + completion。"""
+        total = self.total or (self.prompt + self.completion)
+        return {
+            "prompt_tokens": self.prompt,
+            "completion_tokens": self.completion,
+            "total_tokens": total,
+        }
+
+
+class AsyncStreamIterator:
+    """流式响应的异步迭代器（可显式关闭）。
+
+    为什么不用裸 async generator：generator 的 ``finally`` 块只在生成器被
+    **关闭或 GC** 时才执行。消费方写 ``gen = client.astream(...); async for
+    chunk in gen: break`` 时，生成器引用仍被持有，``finally`` 不会执行——
+    底层 HTTP 连接不会释放，久了会耗尽连接池。
+
+    本类直接持有底层流并实现 ``__anext__``，提供三条确定性释放路径：
+      1. ``async with client.astream(req) as stream:`` —— **推荐**，退出即释放
+      2. ``await stream.aclose()`` —— 显式释放
+      3. 对象被 GC 时由 ``__del__`` 兜底释放
+
+    注意：裸 ``async for ... break`` **不会**立即关闭——CPython 的 async for
+    在 break 时不通知迭代器，底层流要等对象释放才关闭。这是语言层面的限制，
+    不是本实现能绕过的；需要确定性释放就用 ``async with``。
+    """
+
+    def __init__(
+        self,
+        stream_factory: Any,  # noqa: ANN401
+        on_close: Any = None,  # noqa: ANN401
+        on_chunk: Any = None,  # noqa: ANN401
+        transform: Any = None,  # noqa: ANN401
+    ) -> None:
+        self._stream_factory = stream_factory
+        self._on_close = on_close
+        self._on_chunk = on_chunk
+        self._transform = transform
+        self._stream: Any = None  # noqa: ANN401
+        self._iterator: Any = None  # noqa: ANN401
+        self._closed = False
+        self._settled = False
+
+    def __aiter__(self) -> "AsyncStreamIterator":
+        return self
+
+    async def __anext__(self) -> Any:  # noqa: ANN401
+        if self._closed:
+            raise StopAsyncIteration
+        if self._iterator is None:
+            # 惰性创建底层流（真正发请求发生在第一次迭代时）
+            self._stream = self._stream_factory()
+            if inspect.isawaitable(self._stream):
+                # 异步工厂（openai SDK 的 create 是协程）
+                self._stream = await self._stream
+            self._iterator = self._stream.__aiter__()
+        try:
+            raw = await self._iterator.__anext__()
+        except StopAsyncIteration:
+            await self.aclose()
+            raise
+        except BaseException:
+            # 流中途出错（网络异常 / provider 错误）——必须关闭底层流，
+            # 否则连接泄漏（异常路径最容易漏）
+            await self.aclose()
+            raise
+        if self._on_chunk is not None:
+            self._on_chunk(raw)
+        if self._transform is not None:
+            return self._transform(raw)
+        return raw
+
+    async def aclose(self) -> None:
+        """关闭流（幂等）——立即释放底层 HTTP 连接。
+
+        兼容三种底层流形态（真实 openai SDK 只提供其中一种，混用会漏关）：
+          - ``aclose()`` 协程——部分 HTTP 客户端（如 httpx 风格的自定义流）
+          - ``close()`` 协程——**openai ``AsyncStream`` 的真实形态**（3.x）
+          - ``close()`` 同步方法——httpx.Response 等
+
+        注意：openai 的 ``AsyncStream.close`` 是 ``async def``，所以必须 await；
+        若误用同步调用会得到「coroutine was never awaited」并且连接**不会**释放。
+        """
+        if self._closed:
+            await self._settle()
+            return
+        self._closed = True
+        await self._close_underlying()
+        self._stream = None
+        self._iterator = None
+        await self._settle()
+
+    async def _close_underlying(self) -> None:
+        """按优先级关闭底层流（幂等、异常不外泄）。"""
+        stream = self._stream
+        if stream is None:
+            return
+        # 1) aclose() 协程
+        aclose = getattr(stream, "aclose", None)
+        if callable(aclose):
+            try:
+                result = aclose()
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:
+                logger.debug("流关闭时发生异常（忽略）", exc_info=True)
+            return
+        # 2) close()——可能是协程（openai AsyncStream），也可能是同步方法（httpx）
+        close = getattr(stream, "close", None)
+        if callable(close):
+            try:
+                result = close()
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:
+                logger.debug("流关闭时发生异常（忽略）", exc_info=True)
+
+    async def _settle(self) -> None:
+        """结算 usage + 跑关闭回调（幂等）。"""
+        if self._settled:
+            return
+        self._settled = True
+        if self._on_close is not None:
+            try:
+                await self._on_close()
+            except Exception:
+                logger.debug("流关闭回调异常（忽略）", exc_info=True)
+
+    async def __aenter__(self) -> "AsyncStreamIterator":
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        await self.aclose()
+
+    def __del__(self) -> None:
+        """GC 兜底——对象被回收时关闭底层流。
+
+        ``aclose()`` 是协程，``__del__`` 里无法 await。这里尽力而为：
+          - ``close()`` 是**同步**方法 → 直接调
+          - ``close()`` 是**协程**（openai ``AsyncStream`` 的真实形态）→
+            尝试在当前运行中的 loop 里调度
+          - 只有 ``aclose()`` → 同样尝试调度
+        没有运行中的 loop 时放弃（连接最终由 SDK 自身回收）。
+        """
+        stream = getattr(self, "_stream", None)
+        if stream is None:
+            return
+
+        for attr in ("aclose", "close"):
+            fn = getattr(stream, attr, None)
+            if not callable(fn):
+                continue
+            try:
+                result = fn()
+            except Exception:
+                return
+            if inspect.isawaitable(result):
+                # 协程——必须调度到 loop 上 await，否则连接不会释放
+                _dispose_awaitable(result)
+            return
+
+
+class SyncStreamIterator:
+    """流式响应的同步迭代器（可显式关闭）。
+
+    与 :class:`AsyncStreamIterator` 同理——``with`` / ``close()`` 提供
+    确定性释放，``__del__`` 做 GC 兜底。
+    """
+
+    def __init__(
+        self,
+        stream_factory: Any,  # noqa: ANN401
+        on_close: Any = None,  # noqa: ANN401
+        on_chunk: Any = None,  # noqa: ANN401
+        transform: Any = None,  # noqa: ANN401
+    ) -> None:
+        self._stream_factory = stream_factory
+        self._on_close = on_close
+        self._on_chunk = on_chunk
+        self._transform = transform
+        self._stream: Any = None  # noqa: ANN401
+        self._iterator: Any = None  # noqa: ANN401
+        self._closed = False
+        self._settled = False
+
+    def __iter__(self) -> "SyncStreamIterator":
+        return self
+
+    def __next__(self) -> Any:  # noqa: ANN401
+        if self._closed:
+            raise StopIteration
+        if self._iterator is None:
+            self._stream = self._stream_factory()
+            self._iterator = iter(self._stream)
+        try:
+            raw = next(self._iterator)
+        except StopIteration:
+            self.close()
+            raise
+        except BaseException:
+            # 流中途出错——必须关闭底层流，否则连接泄漏
+            self.close()
+            raise
+        if self._on_chunk is not None:
+            self._on_chunk(raw)
+        if self._transform is not None:
+            return self._transform(raw)
+        return raw
+
+    def close(self) -> None:
+        """关闭流（幂等）——立即释放底层 HTTP 连接。
+
+        同步路径下底层流通常是 httpx 风格的**同步** ``close()``；
+        但也要兼容返回协程的 ``close()``（部分异步实现），此时把协程
+        丢到当前 loop 上执行，避免连接不释放。
+        """
+        if self._closed:
+            self._settle()
+            return
+        self._closed = True
+        if self._stream is not None:
+            close = getattr(self._stream, "close", None)
+            if callable(close):
+                try:
+                    result = close()
+                    if inspect.isawaitable(result):
+                        _dispose_awaitable(result)
+                except Exception:
+                    logger.debug("流关闭时发生异常（忽略）", exc_info=True)
+        self._stream = None
+        self._iterator = None
+        self._settle()
+
+    def _settle(self) -> None:
+        """结算 usage + 跑关闭回调（幂等）。"""
+        if self._settled:
+            return
+        self._settled = True
+        if self._on_close is not None:
+            try:
+                self._on_close()
+            except Exception:
+                logger.debug("流关闭回调异常（忽略）", exc_info=True)
+
+    def __enter__(self) -> "SyncStreamIterator":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        """GC 兜底——对象被回收时关闭底层流。
+
+        同步流的 ``close()`` 通常是同步方法；若返回协程则调度到当前
+        loop（无 loop 时丢弃，避免 never-awaited 警告）。
+        """
+        stream = getattr(self, "_stream", None)
+        if stream is None:
+            return
+        close = getattr(stream, "close", None)
+        if not callable(close):
+            return
+        try:
+            result = close()
+        except Exception:
+            return
+        if inspect.isawaitable(result):
+            _dispose_awaitable(result)
 
 
 class LLMClient(ABC):
@@ -284,13 +610,16 @@ class LLMClient(ABC):
         """
 
     @abstractmethod
-    async def astream(
+    def astream(
         self,
         request: LLMRequest,
         use_fallback: bool = False,
         usage_callback: Optional[UsageCallback] = None,
     ) -> Any:
         """异步流式调用——返回流式响应迭代器。子类必须实现。
+
+        返回值是异步可迭代对象（支持 ``async for``），**调用方不需 await**。
+        额外提供 ``aclose()`` / ``async with`` 供提前退出时释放连接。
 
         usage_callback 在流结束时以聚合 usage 回调一次（可选）。
         """
@@ -380,6 +709,57 @@ class OpenAIClient(LLMClient):
     def provider(self) -> str:
         return "openai"
 
+    @staticmethod
+    def _adapt_capability_params(
+        request: LLMRequest,
+        kwargs: Dict[str, Any],
+        provider_base: Optional[str],
+        effective_model: str,
+    ) -> Dict[str, Any]:
+        """按能力注册表适配请求参数（thinking 剔除 + json_mode 翻译）。
+
+        同步 / 异步 / 流式四条调用路径共用这一份逻辑——避免各自复制后分叉。
+
+        两件事：
+        1. **thinking 参数端点适配**——``extra_body.thinking`` 是 DeepSeek 系专有
+           参数，其他厂商可能不认识而报 400。若注册表已确认该端点拒收
+           thinking，则自动剔除。
+        2. **json_mode → response_format 翻译**——按端点已知能力选择
+           json_object / json_schema / 纯 prompt 策略；``json_mode=None`` 时，
+           若已知端点不支持 response_format 则自动剔除。
+        """
+        _caps = get_registry().get(provider_base, effective_model)
+
+        # 1. thinking 参数端点适配
+        _extra = kwargs.get("extra_body")
+        if isinstance(_extra, dict) and "thinking" in _extra:
+            if _caps.thinking_param_rejected:
+                _extra = {k: v for k, v in _extra.items() if k != "thinking"}
+                kwargs["extra_body"] = _extra or None
+                logger.info(
+                    f"[OpenAIClient] {effective_model} 已确认拒收 thinking 参数，本次调用自动剔除。"
+                )
+
+        # 2. json_mode → response_format 翻译
+        _json_mode = getattr(request, "json_mode", None)
+        if _json_mode:
+            if _json_mode == "json_object":
+                if _caps.supports_response_format is not False:
+                    kwargs["response_format"] = {"type": "json_object"}
+            elif _json_mode == "json_schema":
+                if _caps.json_schema:
+                    pass  # API 支持 json_schema 格式，response_format 已在 request 中携带 schema
+                elif _caps.supports_response_format is not False:
+                    kwargs["response_format"] = {"type": "json_object"}
+            elif _json_mode == "prompt_only":
+                kwargs.pop("response_format", None)
+        else:
+            # json_mode=None 时，若能力注册表已知不支持 response_format，自动剔除
+            if _caps.supports_response_format is False:
+                kwargs.pop("response_format", None)
+
+        return kwargs
+
     async def ainvoke(
         self,
         request: LLMRequest,
@@ -401,37 +781,7 @@ class OpenAIClient(LLMClient):
         effective_model = request.model or (self.fallback_model if use_fallback else None) or self.default_model
         provider_base = self.provider_base_url(use_fallback)
 
-        # thinking 参数端点适配：extra_body.thinking 是 DeepSeek 系专有参数，
-        # 其他厂商可能不认识而报 400。若注册表已确认该端点拒收 thinking，则自动剔除。
-        _extra = kwargs.get("extra_body")
-        if isinstance(_extra, dict) and "thinking" in _extra:
-            _caps = get_registry().get(provider_base, effective_model)
-            if _caps.thinking_param_rejected:
-                _extra = {k: v for k, v in _extra.items() if k != "thinking"}
-                kwargs["extra_body"] = _extra or None
-                logger.info(
-                    f"[OpenAIClient] {effective_model} 已确认拒收 thinking 参数，本次调用自动剔除。"
-                )
-
-        # json_mode → response_format 翻译（按能力注册表自动适配）
-        _json_mode = getattr(request, "json_mode", None)
-        if _json_mode:
-            _caps = get_registry().get(provider_base, effective_model)
-            if _json_mode == "json_object":
-                if _caps.supports_response_format is not False:
-                    kwargs["response_format"] = {"type": "json_object"}
-            elif _json_mode == "json_schema":
-                if _caps.json_schema:  # API 支持 json_schema 格式，response_format 已在 request 中携带 schema
-                    pass
-                elif _caps.supports_response_format is not False:
-                    kwargs["response_format"] = {"type": "json_object"}
-            elif _json_mode == "prompt_only":
-                kwargs.pop("response_format", None)
-        else:
-            # json_mode=None 时，若能力注册表已知不支持 response_format，自动剔除
-            _caps = get_registry().get(provider_base, effective_model)
-            if _caps.supports_response_format is False:
-                kwargs.pop("response_format", None)
+        kwargs = self._adapt_capability_params(request, kwargs, provider_base, effective_model)
 
         create_func = partial(
             client.chat.completions.create,
@@ -487,31 +837,7 @@ class OpenAIClient(LLMClient):
         effective_model = request.model or (self.fallback_model if use_fallback else None) or self.default_model
         provider_base = self.provider_base_url(use_fallback)
 
-        _extra = kwargs.get("extra_body")
-        if isinstance(_extra, dict) and "thinking" in _extra:
-            _caps = get_registry().get(provider_base, effective_model)
-            if _caps.thinking_param_rejected:
-                _extra = {k: v for k, v in _extra.items() if k != "thinking"}
-                kwargs["extra_body"] = _extra or None
-
-        # json_mode → response_format 翻译（同步调用也按能力注册表自动适配）
-        _json_mode = getattr(request, "json_mode", None)
-        if _json_mode:
-            _caps = get_registry().get(provider_base, effective_model)
-            if _json_mode == "json_object":
-                if _caps.supports_response_format is not False:
-                    kwargs["response_format"] = {"type": "json_object"}
-            elif _json_mode == "json_schema":
-                if _caps.json_schema:
-                    pass
-                elif _caps.supports_response_format is not False:
-                    kwargs["response_format"] = {"type": "json_object"}
-            elif _json_mode == "prompt_only":
-                kwargs.pop("response_format", None)
-        else:
-            _caps = get_registry().get(provider_base, effective_model)
-            if _caps.supports_response_format is False:
-                kwargs.pop("response_format", None)
+        kwargs = self._adapt_capability_params(request, kwargs, provider_base, effective_model)
 
         create_func = partial(
             client.chat.completions.create,
@@ -545,7 +871,7 @@ class OpenAIClient(LLMClient):
             )
         return result
 
-    async def astream(
+    def astream(
         self,
         request: LLMRequest,
         use_fallback: bool = False,
@@ -553,9 +879,26 @@ class OpenAIClient(LLMClient):
     ) -> Any:
         """Asynchronous streaming invocation.
 
-        Returns an async iterator yielding LLMResponse objects for each
-        incremental chunk from the provider. Token usage is accumulated
-        and a final LLMResponse with aggregated usage is yielded at the end.
+        Returns an :class:`AsyncStreamIterator` yielding LLMResponse objects for
+        each incremental chunk from the provider. Token usage is accumulated and
+        a final usage callback fires at the end of the stream.
+
+        调用方式与普通 async generator 一致（**不需要 await**）::
+
+            async for chunk in client.astream(req):
+                ...
+
+        返回的迭代器额外支持 ``aclose()`` / ``async with``——提前退出循环时
+        用它们**确定性**释放底层 HTTP 连接::
+
+            async with client.astream(req) as stream:
+                async for chunk in stream:
+                    if done(chunk):
+                        break            # aclose 在退出 async with 时执行
+
+        注意：裸 ``async for ... break`` 不会立即关闭——CPython 的 async for
+        在 break 时不通知迭代器，底层流要等迭代器对象被 GC 才关闭。
+        需要确定性释放就用 ``async with``（或显式 ``await stream.aclose()``）。
 
         use_fallback=True 时走 fallback provider。
         """
@@ -565,74 +908,39 @@ class OpenAIClient(LLMClient):
         effective_model = request.model or (self.fallback_model if use_fallback else None) or self.default_model
         provider_base = self.provider_base_url(use_fallback)
 
-        _extra = kwargs.get("extra_body")
-        if isinstance(_extra, dict) and "thinking" in _extra:
-            _caps = get_registry().get(provider_base, effective_model)
-            if _caps.thinking_param_rejected:
-                _extra = {k: v for k, v in _extra.items() if k != "thinking"}
-                kwargs["extra_body"] = _extra or None
-                logger.info(
-                    f"[OpenAIClient] {effective_model} 已确认拒收 thinking 参数，本次调用自动剔除。"
-                )
-
-        # json_mode → response_format 翻译
-        _json_mode = getattr(request, "json_mode", None)
-        if _json_mode:
-            _caps = get_registry().get(provider_base, effective_model)
-            if _json_mode == "json_object":
-                if _caps.supports_response_format is not False:
-                    kwargs["response_format"] = {"type": "json_object"}
-            elif _json_mode == "json_schema":
-                if _caps.json_schema:
-                    pass
-                elif _caps.supports_response_format is not False:
-                    kwargs["response_format"] = {"type": "json_object"}
-            elif _json_mode == "prompt_only":
-                kwargs.pop("response_format", None)
-        else:
-            _caps = get_registry().get(provider_base, effective_model)
-            if _caps.supports_response_format is False:
-                kwargs.pop("response_format", None)
-
+        kwargs = self._adapt_capability_params(request, kwargs, provider_base, effective_model)
         kwargs["stream"] = True
 
         t0 = _time.monotonic()
-        aggregated_prompt = 0
-        aggregated_completion = 0
-        aggregated_total = 0
-        stream = None
+        usage = _StreamUsage()
 
-        try:
-            stream = await client.chat.completions.create(
+        async def _make_stream() -> Any:  # noqa: ANN401
+            """创建底层流（惰性——第一次迭代时才真正发请求）。"""
+            return await client.chat.completions.create(
                 model=effective_model,
                 **kwargs,
             )
-            async for chunk in stream:
-                if chunk.usage:
-                    aggregated_prompt += getattr(chunk.usage, "prompt_tokens", 0) or 0
-                    aggregated_completion += getattr(chunk.usage, "completion_tokens", 0) or 0
-                    aggregated_total += getattr(chunk.usage, "total_tokens", 0) or 0
-                yield LLMResponse.from_openai_chunk(chunk, post_processor=request.post_processor)
-        finally:
-            if stream is not None and hasattr(stream, "aclose"):
-                try:
-                    await stream.aclose()
-                except Exception:
-                    pass
 
-        if aggregated_total > 0:
-            _resp = LLMResponse(  # type: ignore[call-arg]
-                usage={
-                    "prompt_tokens": aggregated_prompt,
-                    "completion_tokens": aggregated_completion,
-                    "total_tokens": aggregated_total,
-                },
-                model=effective_model,
+        async def _on_close() -> None:
+            """流结束（或提前关闭）时结算 usage。"""
+            if usage.has_any():
+                _resp = LLMResponse(  # type: ignore[call-arg]
+                    usage=usage.as_usage(),
+                    model=effective_model,
+                )
+                self._record_usage_from_response(_resp, usage_callback)
+            logger.info(
+                f"[OpenAIClient] astream 返回（耗时 {_time.monotonic()-t0:.0f}s, "
+                f"model={effective_model}, use_fallback={use_fallback}）"
             )
-            self._record_usage_from_response(_resp, usage_callback)
-        logger.info(
-            f"[OpenAIClient] astream 返回（耗时 {_time.monotonic()-t0:.0f}s, "
-            f"model={effective_model}, use_fallback={use_fallback}）"
+
+        return AsyncStreamIterator(
+            _make_stream,
+            on_close=_on_close,
+            on_chunk=lambda chunk: usage.add(getattr(chunk, "usage", None)),
+            transform=lambda chunk: LLMResponse.from_openai_chunk(
+                chunk, post_processor=request.post_processor
+            ),
         )
 
     def stream(
@@ -643,7 +951,20 @@ class OpenAIClient(LLMClient):
     ) -> Any:
         """Synchronous streaming invocation.
 
-        Returns an iterator yielding LLMResponse objects for each incremental chunk.
+        Returns a :class:`SyncStreamIterator` yielding LLMResponse objects for
+        each incremental chunk.
+
+        The returned iterator supports ``close()`` and ``with`` — use them when
+        you break out of the loop early for a **deterministic** release of the
+        underlying HTTP connection::
+
+            with client.stream(req) as stream:
+                for chunk in stream:
+                    if done(chunk):
+                        break            # close 在退出 with 时执行
+
+        注意：裸 ``for ... break`` 不会立即关闭——要确定性释放就用 ``with``
+        （或显式 ``stream.close()``）。
 
         use_fallback=True 时走 fallback provider。
         """
@@ -653,41 +974,35 @@ class OpenAIClient(LLMClient):
         effective_model = request.model or (self.fallback_model if use_fallback else None) or self.default_model
         provider_base = self.provider_base_url(use_fallback)
 
-        _extra = kwargs.get("extra_body")
-        if isinstance(_extra, dict) and "thinking" in _extra:
-            _caps = get_registry().get(provider_base, effective_model)
-            if _caps.thinking_param_rejected:
-                _extra = {k: v for k, v in _extra.items() if k != "thinking"}
-                kwargs["extra_body"] = _extra or None
-
+        kwargs = self._adapt_capability_params(request, kwargs, provider_base, effective_model)
         kwargs["stream"] = True
 
-        def _sync_iter() -> Any:
-            stream = client.chat.completions.create(
+        usage = _StreamUsage()
+
+        def _make_stream() -> Any:  # noqa: ANN401
+            """创建底层流（惰性——第一次迭代时才真正发请求）。"""
+            return client.chat.completions.create(
                 model=effective_model,
                 **kwargs,
             )
-            aggregated_prompt = 0
-            aggregated_completion = 0
-            aggregated_total = 0
-            for chunk in stream:
-                if chunk.usage:
-                    aggregated_prompt += getattr(chunk.usage, "prompt_tokens", 0) or 0
-                    aggregated_completion += getattr(chunk.usage, "completion_tokens", 0) or 0
-                    aggregated_total += getattr(chunk.usage, "total_tokens", 0) or 0
-                yield LLMResponse.from_openai_chunk(chunk, post_processor=request.post_processor)
-            if aggregated_total > 0:
+
+        def _on_close() -> None:
+            """流结束（或提前关闭）时结算 usage。"""
+            if usage.has_any():
                 _resp = LLMResponse(  # type: ignore[call-arg]
-                    usage={
-                        "prompt_tokens": aggregated_prompt,
-                        "completion_tokens": aggregated_completion,
-                        "total_tokens": aggregated_total,
-                    },
+                    usage=usage.as_usage(),
                     model=effective_model,
                 )
                 self._record_usage_from_response(_resp, usage_callback)
 
-        return _sync_iter()
+        return SyncStreamIterator(
+            _make_stream,
+            on_close=_on_close,
+            on_chunk=lambda chunk: usage.add(getattr(chunk, "usage", None)),
+            transform=lambda chunk: LLMResponse.from_openai_chunk(
+                chunk, post_processor=request.post_processor
+            ),
+        )
 
 
 class LLMFactory:
@@ -1118,16 +1433,26 @@ class OpenAIMediaClient(MediaClient):
         elapsed = 0.0
 
         while elapsed < max_wait:
+            primary_error: Optional[BaseException] = None
             try:
                 # Try the dedicated video/tasks endpoint first
                 response = await client.video.tasks.retrieve(task_id)  # type: ignore[union-attr]
-            except Exception:
+            except Exception as e:
+                primary_error = e
                 # Fall back to a chat-based polling
-                response = await client.chat.completions.create(  # type: ignore[union-attr]
-                    model=self.video_model or "video-poll",
-                    messages=[{"role": "user", "content": "poll"}],
-                    extra_body={"task_id": task_id},
-                )
+                try:
+                    response = await client.chat.completions.create(  # type: ignore[union-attr]
+                        model=self.video_model or "video-poll",
+                        messages=[{"role": "user", "content": "poll"}],
+                        extra_body={"task_id": task_id},
+                    )
+                except Exception as fallback_error:
+                    # 两条路都失败——把主端点的真实原因一起带出去，
+                    # 否则排查时只能看到 fallback 的错误，主因（如余额不足）丢失。
+                    raise RuntimeError(
+                        f"视频任务轮询失败：主端点 {type(primary_error).__name__}: {primary_error}；"
+                        f"chat fallback {type(fallback_error).__name__}: {fallback_error}"
+                    ) from fallback_error
 
             status = getattr(response, "status", None)
             if status == "completed" or getattr(response, "completed", False):

@@ -10,8 +10,7 @@ from typing import Any, Callable, Dict, List, Optional, Union, TYPE_CHECKING, Li
 
 from pydantic import BaseModel, ConfigDict, Field
 
-if TYPE_CHECKING:
-    from infra.utils.retry import RetryConfig
+from infra.utils.retry import RetryConfig
 
 UsageCallback = Callable[[Dict[str, Any]], None]
 
@@ -32,7 +31,7 @@ class LLMRequest(BaseModel):
     response_format: Optional[Dict[str, str]] = Field(None, description="response_format（如 OpenAI 的 json_object）")
     timeout: Optional[float] = Field(None, description="单次调用超时（秒）")
     extra_body: Optional[Dict[str, Any]] = Field(default=None, description="Extra parameters passed to the LLM API (e.g. thinking control for DeepSeek)")
-    retry_config: Optional[Any] = Field(default=None, description="Override retry config for this request (defaults to LLMRetryConfig)")
+    retry_config: Optional[RetryConfig] = Field(default=None, description="Override retry config for this request (defaults to LLMRetryConfig)")
     post_processor: Optional[Callable[[str, Optional[str]], str]] = Field(
         default=None,
         description="内容后处理器：接收 (content, reasoning_content)，返回清洗后的字符串，用于过滤 CoT 等",
@@ -143,12 +142,19 @@ class LLMResponse(BaseModel):
         }
 
         # token 用量
+        # 注意：provider 可能不返回 total_tokens（部分端点返回 0），
+        # 此时回退到 prompt + completion，避免调用方直接读 usage["total_tokens"] 拿到 0。
         usage = getattr(response, "usage", None)
         if usage is not None:
+            prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+            completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+            total_tokens = int(getattr(usage, "total_tokens", 0) or 0)
+            if not total_tokens:
+                total_tokens = prompt_tokens + completion_tokens
             result["usage"] = {
-                "prompt_tokens": getattr(usage, "prompt_tokens", 0) or 0,
-                "completion_tokens": getattr(usage, "completion_tokens", 0) or 0,
-                "total_tokens": getattr(usage, "total_tokens", 0) or 0,
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": total_tokens,
             }
 
         # 工具调用
@@ -221,10 +227,15 @@ class LLMResponse(BaseModel):
         # token 用量（通常在最后一个 chunk）
         usage = getattr(chunk, "usage", None)
         if usage is not None:
+            prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+            completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+            total_tokens = int(getattr(usage, "total_tokens", 0) or 0)
+            if not total_tokens:
+                total_tokens = prompt_tokens + completion_tokens
             result["usage"] = {
-                "prompt_tokens": getattr(usage, "prompt_tokens", 0) or 0,
-                "completion_tokens": getattr(usage, "completion_tokens", 0) or 0,
-                "total_tokens": getattr(usage, "total_tokens", 0) or 0,
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": total_tokens,
             }
 
         return cls(**result)
@@ -252,7 +263,7 @@ class MediaRequest(BaseModel):
     response_format: Optional[str] = Field(default="url", description="b64_json | url")
     extra_body: Optional[Dict[str, Any]] = Field(default=None, description="Provider-specific extras")
     timeout: Optional[float] = Field(None, description="Per-call timeout (seconds)")
-    retry_config: Optional[Any] = Field(default=None, description="Override retry config (defaults to MediaClient.retry_config)")
+    retry_config: Optional[RetryConfig] = Field(default=None, description="Override retry config (defaults to MediaClient.retry_config)")
 
 
 class MediaResponse(BaseModel):
