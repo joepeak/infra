@@ -301,6 +301,75 @@ class TestPydanticBehavior:
 
 
 # ============================================================
+# 9. LLMResponse 派生属性（客户需求 4，20261021 新增）
+# ============================================================
+class TestLLMResponseDerivedProperties:
+    """total_tokens / is_truncated 等便捷访问。
+
+    背景：消费方要在日志里打「这次用了多少 token」「是不是被截断了」，
+    直接写 ``usage["total_tokens"]`` 要防 KeyError。
+    """
+
+    def test_total_tokens_from_usage(self):
+        r = LLMResponse(usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15})
+        assert r.total_tokens == 15
+
+    def test_total_tokens_fallback_to_sum(self):
+        """没有 total_tokens 时回退到 prompt + completion。"""
+        r = LLMResponse(usage={"prompt_tokens": 10, "completion_tokens": 5})
+        assert r.total_tokens == 15
+
+    def test_total_tokens_empty_usage(self):
+        assert LLMResponse().total_tokens == 0
+
+    def test_total_tokens_zero_total_falls_back(self):
+        """total_tokens=0（falsy）时也走回退，不返回 0 假值。"""
+        r = LLMResponse(usage={"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 0})
+        assert r.total_tokens == 7
+
+    def test_prompt_and_completion_tokens(self):
+        r = LLMResponse(usage={"prompt_tokens": 10, "completion_tokens": 5})
+        assert r.prompt_tokens == 10
+        assert r.completion_tokens == 5
+
+    def test_prompt_completion_missing_default_zero(self):
+        r = LLMResponse(usage={})
+        assert r.prompt_tokens == 0
+        assert r.completion_tokens == 0
+
+    def test_is_truncated_true(self):
+        r = LLMResponse(finish_reason="length")
+        assert r.is_truncated is True
+
+    def test_is_truncated_false(self):
+        r = LLMResponse(finish_reason="stop")
+        assert r.is_truncated is False
+
+    def test_is_truncated_none_finish_reason(self):
+        assert LLMResponse().is_truncated is False
+
+    def test_is_success_for_stop(self):
+        assert LLMResponse(finish_reason="stop").is_success is True
+
+    def test_is_success_for_tool_calls(self):
+        assert LLMResponse(finish_reason="tool_calls").is_success is True
+
+    def test_is_success_for_none(self):
+        assert LLMResponse().is_success is True
+
+    def test_is_success_false_for_length(self):
+        assert LLMResponse(finish_reason="length").is_success is False
+
+    def test_derived_properties_not_in_model_dump(self):
+        """派生属性是 property——不进序列化（不破坏既有 payload 契约）。"""
+        r = LLMResponse(content="x", usage={"total_tokens": 5})
+        dumped = r.model_dump()
+        assert "total_tokens" not in dumped
+        assert "is_truncated" not in dumped
+        assert dumped["usage"] == {"total_tokens": 5}
+
+
+# ============================================================
 # 运行入口
 # ============================================================
 if __name__ == "__main__":

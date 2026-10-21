@@ -61,6 +61,41 @@ class LLMResponse(BaseModel):
     model: Optional[str] = Field(None, description="实际使用的模型名")
     finish_reason: Optional[str] = Field(None)
 
+    @property
+    def total_tokens(self) -> int:
+        """总 token 数。
+
+        优先用 provider 返回的 ``total_tokens``；缺失时回退到
+        ``prompt_tokens + completion_tokens``。
+        """
+        total = self.usage.get("total_tokens")
+        if total:
+            return int(total)
+        return int(
+            self.usage.get("prompt_tokens", 0)
+            + self.usage.get("completion_tokens", 0)
+        )
+
+    @property
+    def prompt_tokens(self) -> int:
+        """输入 token 数（缺失时 0）。"""
+        return int(self.usage.get("prompt_tokens", 0))
+
+    @property
+    def completion_tokens(self) -> int:
+        """输出 token 数（缺失时 0）。"""
+        return int(self.usage.get("completion_tokens", 0))
+
+    @property
+    def is_truncated(self) -> bool:
+        """输出是否因长度上限被截断（finish_reason == "length"）。"""
+        return self.finish_reason == "length"
+
+    @property
+    def is_success(self) -> bool:
+        """是否正常结束（finish_reason 为 stop / tool_calls / None）。"""
+        return self.finish_reason in (None, "", "stop", "tool_calls")
+
     @staticmethod
     def _get_value(source: Any, name: str) -> Any:
         if isinstance(source, dict):

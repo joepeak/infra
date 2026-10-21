@@ -36,6 +36,7 @@ from infra.config import (
     ConfigLoader,
     get_config,
     get_config_path,
+    try_get_config_path,
     init_config,
     reload_config,
     set_config,
@@ -534,6 +535,105 @@ class TestReplaceConfig:
         # 没有 host/port/user 残留
         for k in ("host", "port", "user", "password", "database"):
             assert k not in get_config()["db"]
+
+
+# ============================================================
+# 11. try_get_config_path / find_config_path（20261021 新增）
+# ============================================================
+class TestTryGetConfigPath:
+    """温和版配置目录查找——未 configure 时不抛异常。
+
+    背景：消费方需要在「运行时配置尚未初始化」时读某个 yaml
+    （单测 / 独立脚本 / 早期启动），原先被迫自己从包路径推导目录。
+    """
+
+    def test_returns_configured_dir(self, tmp_path):
+        """已 configure 时直接返回该目录。"""
+        init_config(tmp_path)
+        assert try_get_config_path() == tmp_path
+
+    def test_returns_none_without_configure(self, tmp_path, monkeypatch):
+        """未 configure 且无任何候选时返回 None（不抛异常）。"""
+        monkeypatch.delenv("INFRA_CONFIG_DIR", raising=False)
+        monkeypatch.delenv("MACRO_CONFIG_DIR", raising=False)
+        monkeypatch.chdir(tmp_path)  # 空目录 → 无 ./config / ./configs
+        assert try_get_config_path() is None
+
+    def test_finds_via_infra_config_dir_env(self, tmp_path, monkeypatch):
+        """环境变量 INFRA_CONFIG_DIR 命中。"""
+        target = tmp_path / "myconf"
+        target.mkdir()
+        monkeypatch.setenv("INFRA_CONFIG_DIR", str(target))
+        assert try_get_config_path() == target
+
+    def test_finds_via_macro_config_dir_env(self, tmp_path, monkeypatch):
+        """环境变量 MACRO_CONFIG_DIR 命中（历史遗留，消费方项目用）。"""
+        monkeypatch.delenv("INFRA_CONFIG_DIR", raising=False)
+        target = tmp_path / "macroconf"
+        target.mkdir()
+        monkeypatch.setenv("MACRO_CONFIG_DIR", str(target))
+        assert try_get_config_path() == target
+
+    def test_env_takes_priority_over_cwd(self, tmp_path, monkeypatch):
+        """环境变量优先于 CWD 下的 ./config。"""
+        env_dir = tmp_path / "from_env"
+        env_dir.mkdir()
+        cwd_dir = tmp_path / "config"
+        cwd_dir.mkdir()
+        (cwd_dir / "a.yaml").write_text("k: v")
+        monkeypatch.setenv("INFRA_CONFIG_DIR", str(env_dir))
+        monkeypatch.chdir(tmp_path)
+        assert try_get_config_path() == env_dir
+
+    def test_invalid_env_dir_falls_through(self, tmp_path, monkeypatch):
+        """环境变量指向不存在的目录 → 继续往下找，最终 None。"""
+        monkeypatch.setenv("INFRA_CONFIG_DIR", str(tmp_path / "nope"))
+        monkeypatch.delenv("MACRO_CONFIG_DIR", raising=False)
+        monkeypatch.chdir(tmp_path)
+        assert try_get_config_path() is None
+
+    def test_finds_cwd_config_dir(self, tmp_path, monkeypatch):
+        """CWD 下 ./config 且含 yaml → 命中。"""
+        cfg_dir = tmp_path / "config"
+        cfg_dir.mkdir()
+        (cfg_dir / "config.yaml").write_text("k: v")
+        monkeypatch.delenv("INFRA_CONFIG_DIR", raising=False)
+        monkeypatch.delenv("MACRO_CONFIG_DIR", raising=False)
+        monkeypatch.chdir(tmp_path)
+        assert try_get_config_path() == cfg_dir
+
+    def test_finds_cwd_configs_dir(self, tmp_path, monkeypatch):
+        """CWD 下 ./configs 且含 yaml → 命中。"""
+        cfg_dir = tmp_path / "configs"
+        cfg_dir.mkdir()
+        (cfg_dir / "inferences.yaml").write_text("k: v")
+        monkeypatch.delenv("INFRA_CONFIG_DIR", raising=False)
+        monkeypatch.delenv("MACRO_CONFIG_DIR", raising=False)
+        monkeypatch.chdir(tmp_path)
+        assert try_get_config_path() == cfg_dir
+
+    def test_empty_config_dir_not_matched(self, tmp_path, monkeypatch):
+        """CWD 下 ./config 存在但没有 yaml → 不命中。"""
+        (tmp_path / "config").mkdir()
+        monkeypatch.delenv("INFRA_CONFIG_DIR", raising=False)
+        monkeypatch.delenv("MACRO_CONFIG_DIR", raising=False)
+        monkeypatch.chdir(tmp_path)
+        assert try_get_config_path() is None
+
+    def test_get_config_path_still_raises(self, tmp_path, monkeypatch):
+        """get_config_path 的原有行为不变——未 configure 仍抛 RuntimeError。"""
+        monkeypatch.delenv("INFRA_CONFIG_DIR", raising=False)
+        monkeypatch.delenv("MACRO_CONFIG_DIR", raising=False)
+        with pytest.raises(RuntimeError, match="请先调用 configure"):
+            get_config_path()
+
+    def test_loader_method_find_config_path(self, tmp_path, monkeypatch):
+        """ConfigLoader.find_config_path() 方法级也可用。"""
+        monkeypatch.delenv("INFRA_CONFIG_DIR", raising=False)
+        monkeypatch.delenv("MACRO_CONFIG_DIR", raising=False)
+        monkeypatch.chdir(tmp_path)
+        loader = ConfigLoader()
+        assert loader.find_config_path() is None
 
 
 # ============================================================

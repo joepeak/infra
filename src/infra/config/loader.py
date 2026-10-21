@@ -228,6 +228,41 @@ class ConfigLoader:
             raise RuntimeError("请先调用 configure() 设置配置目录")
         return self._config_dir
 
+    def find_config_path(self) -> Optional[Path]:
+        """查找配置目录（温和版——找不到返回 None，不抛异常）。
+
+        查找顺序（高→低）：
+          1. 已 configure() 的目录
+          2. 环境变量 INFRA_CONFIG_DIR（通用）
+          3. 环境变量 MACRO_CONFIG_DIR（历史遗留，消费方项目用）
+          4. 当前工作目录下的 ./config 或 ./configs（含任一配置文件时才算命中）
+
+        用于「配置尚未初始化但需要读某个 yaml」的场景（单测 / 独立脚本 /
+        早期启动阶段）——避免每个消费项目都自己写一遍「从包路径推导配置目录」。
+        """
+        # 1. 已 configure
+        if self._config_dir is not None:
+            return self._config_dir
+
+        # 2+3. 环境变量
+        for env_key in ("INFRA_CONFIG_DIR", "MACRO_CONFIG_DIR"):
+            raw = os.getenv(env_key)
+            if not raw:
+                continue
+            candidate = Path(raw).expanduser()
+            if candidate.is_dir():
+                return candidate
+            logger.warning(f"{env_key} 指向的目录不存在: {candidate}")
+
+        # 4. CWD 下的 ./config 或 ./configs
+        cwd = Path.cwd()
+        for name in ("config", "configs"):
+            candidate = cwd / name
+            if candidate.is_dir() and any(candidate.glob("*.yaml")):
+                return candidate
+
+        return None
+
 # ========== 便捷函数 ==========
 
 _loader: Optional[ConfigLoader] = None
@@ -285,3 +320,19 @@ def reload_config() -> Dict[str, Any]:
 def get_config_path() -> Path:
     """获取配置文件目录"""
     return _get_loader().get_config_path()
+
+
+def try_get_config_path() -> Optional[Path]:
+    """获取配置目录；找不到时返回 None（不抛异常）。
+
+    与 :func:`get_config_path` 的区别：后者未 configure() 时抛 RuntimeError，
+    本函数走「温和查找」（见 :meth:`ConfigLoader.find_config_path`）——
+    适合配置尚未初始化但需要读某个 yaml 的场景（单测 / 独立脚本 / 早期启动）。
+
+    用法::
+
+        path = try_get_config_path()
+        if path is not None:
+            data = yaml.safe_load((path / "inferences.yaml").read_text())
+    """
+    return _get_loader().find_config_path()

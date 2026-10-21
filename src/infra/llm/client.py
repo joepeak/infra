@@ -7,7 +7,6 @@
 - 自动记录 token 用量
 - 能力注册表（infra.llm.capabilities）驱动思考参数自适应 + fallback provider 支持
 """
-import logging
 import os
 import asyncio
 import time as _time
@@ -30,8 +29,11 @@ from infra.llm.models import (
 from infra.llm.usage import record_usage
 from infra.llm.retry import LLMRetryConfig
 from infra.llm.capabilities import get_registry, ProviderCapabilities, reset_registry
+from infra.logger import get_logger
 
-logger = logging.getLogger(__name__)
+# 用 infra 的 LazyLogger（而非原生 logging.getLogger）——
+# 原生 logger 没有 handler，LLM 层的日志不会落进 infra 的日志文件。
+logger = get_logger(__name__)
 
 
 def _invoke_usage_callback(

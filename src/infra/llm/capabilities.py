@@ -22,13 +22,15 @@ Agent 实例上——换个 Agent、换个节点又要重撞一遍，白白浪�
 """
 from __future__ import annotations
 
-import logging
 import threading
 from dataclasses import dataclass, field, asdict
 from typing import Dict, Optional
 
+from infra.logger import get_logger
 
-logger = logging.getLogger(__name__)
+# 用 infra 的 LazyLogger（而非原生 logging.getLogger）——
+# 原生 logger 没有 handler，LLM 层的日志不会落进 infra 的日志文件。
+logger = get_logger(__name__)
 
 
 @dataclass

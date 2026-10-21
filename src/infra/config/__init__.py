@@ -14,7 +14,16 @@
     redis_host = config.get('redis', {}).get('host')
 """
 
-from .loader import ConfigLoader, get_config, set_config, replace_config, get_config_path, init_config, reload_config
+from .loader import (
+    ConfigLoader,
+    get_config,
+    set_config,
+    replace_config,
+    get_config_path,
+    try_get_config_path,
+    init_config,
+    reload_config,
+)
 
 __all__ = [
     'ConfigLoader',
@@ -22,6 +31,7 @@ __all__ = [
     'set_config',
     'replace_config',
     'get_config_path',
+    'try_get_config_path',
     'init_config',
     'reload_config',
 ]

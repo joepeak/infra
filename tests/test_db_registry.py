@@ -372,6 +372,63 @@ class TestLoadConfig:
 
 
 # ============================================================
+# 6. db_type 从 URL dialect 推断（20261021 修复回归）
+# ============================================================
+class TestInferDbTypeFromUrl:
+    """URL scheme 带驱动后缀时也能正确推断 db_type。
+
+    回归 bug：``scheme in ("postgres", "postgresql")`` 匹配不到
+    ``postgresql+asyncpg``，导致 db_type 留空 → 抛「不支持的 db_type」。
+    """
+
+    @pytest.mark.parametrize(
+        "url,expected",
+        [
+            ("postgresql+asyncpg://u:p@h:5432/d", "postgresql"),
+            ("postgresql://u:p@h:5432/d", "postgresql"),
+            ("postgres://u:p@h:5432/d", "postgresql"),
+            ("postgres+asyncpg://u:p@h:5432/d", "postgresql"),
+            ("mysql+aiomysql://u:p@h:3306/d", "mysql"),
+            ("mysql://u:p@h:3306/d", "mysql"),
+            ("sqlite+aiosqlite:///test.db", "sqlite"),
+            ("sqlite:///test.db", "sqlite"),
+            ("clickhouse+asyncch://h:8123/d", ""),
+            ("not-a-url", ""),
+            ("", ""),
+        ],
+    )
+    def test_infer(self, url, expected):
+        from infra.db.connection_manager import DatabaseConnectionManager
+        assert DatabaseConnectionManager._infer_db_type_from_url(url) == expected
+
+    def test_inferred_type_written_back_to_config(self, tmp_path):
+        """推断结果写回 config——调用方看到的 type 是最终生效值。"""
+        _write_cfg(tmp_path, "config.yaml", {
+            "db": {"url": "postgresql+asyncpg://u:p@h:5432/d"},
+        })
+        init_config(tmp_path)
+        mgr = DatabaseConnectionManager("db", require_db=False)
+        assert mgr.config["type"] == "postgresql"
+
+    def test_inferred_sqlite_type_written_back(self, tmp_path):
+        _write_cfg(tmp_path, "config.yaml", {
+            "db": {"url": "sqlite+aiosqlite:///:memory:"},
+        })
+        init_config(tmp_path)
+        mgr = DatabaseConnectionManager("db", require_db=False)
+        assert mgr.config["type"] == "sqlite"
+
+    def test_explicit_type_takes_precedence(self, tmp_path):
+        """显式 type 优先于 URL 推断。"""
+        _write_cfg(tmp_path, "config.yaml", {
+            "db": {"type": "sqlite", "url": "postgresql+asyncpg://u:p@h:5432/d"},
+        })
+        init_config(tmp_path)
+        mgr = DatabaseConnectionManager("db", require_db=False)
+        assert mgr.config["type"] == "sqlite"
+
+
+# ============================================================
 # 运行入口
 # ============================================================
 if __name__ == "__main__":

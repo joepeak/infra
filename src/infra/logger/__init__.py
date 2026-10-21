@@ -7,6 +7,7 @@
 """
 
 import os
+import sys
 import logging
 from logging.handlers import RotatingFileHandler
 from typing import Optional, Dict, Any
@@ -35,6 +36,8 @@ class LogConfig:
 # 全局配置
 _log_config: Optional[LogConfig] = None
 _initialized_loggers: set = set()
+# 每个 logger 建立时的配置签名 (level, log_dir)——配置变了要重建 handler
+_logger_signatures: Dict[str, tuple] = {}
 
 
 def configure_logging(config: LogConfig) -> None:
@@ -137,15 +140,49 @@ def reset_logging() -> None:
     global _log_config, _initialized_loggers
     _log_config = None
     _initialized_loggers.clear()
+    _logger_signatures.clear()
+
+
+def _has_console_handler(logger: logging.Logger) -> bool:
+    """判断 logger 是否已挂了「控制台」handler。
+
+    注意：``RotatingFileHandler`` 是 ``StreamHandler`` 的子类，
+    所以不能直接用 ``isinstance(h, logging.StreamHandler)`` 判断——
+    那会把文件 handler 误判成控制台 handler，导致控制台输出永远装不上。
+    这里显式排除 ``FileHandler``。
+    """
+    return any(
+        isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler)
+        for h in logger.handlers
+    )
+
+
+def _create_console_handler(config: LogConfig) -> logging.StreamHandler:
+    """创建控制台 handler（stdout）"""
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    ))
+    handler.setLevel(_get_log_level(config.level))
+    return handler
+
 
 class LazyLogger:
     """延迟加载logger代理，每次打印实时获取最新配置的logger实例"""
-    def __init__(self, name: str) -> None:
+
+    def __init__(self, name: str, *, console: bool = False) -> None:
         self._name = name
+        #: True 时额外挂 stdout handler——适合独立脚本/CLI 在终端观察流程
+        self._console = console
 
     def _get_real_logger(self) -> logging.Logger:
         # 每次输出日志都重新拿当前最新配置的原生logger
-        return _raw_get_logger(self._name)
+        lg = _raw_get_logger(self._name)
+        if self._console and not _has_console_handler(lg):
+            # 幂等：已有控制台 handler 就不重复挂
+            lg.addHandler(_create_console_handler(_get_log_config()))
+        return lg
 
     # 代理全部日志方法
     def debug(self, msg: str, *args: Any, **kwargs: Any) -> None:
@@ -158,19 +195,35 @@ class LazyLogger:
         self._get_real_logger().error(msg, *args, **kwargs)
     def critical(self, msg: str, *args: Any, **kwargs: Any) -> None:
         self._get_real_logger().critical(msg, *args, **kwargs)
+    def exception(self, msg: str, *args: Any, **kwargs: Any) -> None:
+        """记录 ERROR 级别 + 异常堆栈（等价于原生 logger.exception）。"""
+        self._get_real_logger().exception(msg, *args, **kwargs)
+    def log(self, level: int, msg: str, *args: Any, **kwargs: Any) -> None:
+        """按指定级别记录（等价于原生 logger.log）。"""
+        self._get_real_logger().log(level, msg, *args, **kwargs)
+    def isEnabledFor(self, level: int) -> bool:
+        """该级别是否会输出（等价于原生 logger.isEnabledFor）。"""
+        return self._get_real_logger().isEnabledFor(level)
+    def setLevel(self, level: int) -> None:
+        """设置该 logger 的级别（等价于原生 logger.setLevel）。"""
+        self._get_real_logger().setLevel(level)
 
 # 把原来创建logger的逻辑改名成内部原生函数
 def _raw_get_logger(name: str) -> logging.Logger:
     global _initialized_loggers
     config = _get_log_config()
     target_level = _get_log_level(config.level)
+    # 配置签名——level 或 log_dir 变了都要重建 handler，
+    # 否则改完 log_dir 旧 logger 仍写老目录（测试间日志互相污染）
+    signature = (target_level, config.log_dir)
 
-    # 存在缓存，但等级和当前配置不匹配，销毁旧实例
+    # 存在缓存，但配置签名不匹配 → 销毁旧实例重建
     if name in _initialized_loggers:
         old_logger = logging.getLogger(name)
-        if old_logger.level != target_level:
+        if _logger_signatures.get(name) != signature:
             old_logger.handlers.clear()
-            _initialized_loggers.remove(name)
+            _initialized_loggers.discard(name)
+            _logger_signatures.pop(name, None)
         else:
             return old_logger
 
@@ -185,8 +238,16 @@ def _raw_get_logger(name: str) -> logging.Logger:
     logger.propagate = True
 
     _initialized_loggers.add(name)
+    _logger_signatures[name] = signature
     return logger
 
 # 对外暴露的函数名不变，依旧叫 get_logger，返回延迟代理
-def get_logger(name: str) -> LazyLogger:
-    return LazyLogger(name)
+def get_logger(name: str, *, console: bool = False) -> LazyLogger:
+    """获取 logger（返回延迟代理，每次输出取最新配置）。
+
+    Args:
+        name: logger 名称（通常是 ``__name__``）
+        console: True 时额外挂 stdout handler——适合独立脚本 / CLI 工具
+            在终端观察程序流程；服务端程序保持默认 False（避免 stdout 噪音）。
+    """
+    return LazyLogger(name, console=console)

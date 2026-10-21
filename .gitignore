@@ -15,6 +15,7 @@ env/
 .idea/
 .vscode/
 reasonix.toml
+.reasonix/
 
 # 本地运行时产物 / 凭据
 .env

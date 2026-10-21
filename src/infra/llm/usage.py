@@ -8,13 +8,16 @@
 
 注意：本聚合是进程内——多进程/多机器需额外方案（DB/Redis 持久化）。
 """
-import logging
 import threading
 from collections import defaultdict
 from contextvars import ContextVar
 from typing import Any, Dict, Optional
 
-logger = logging.getLogger(__name__)
+from infra.logger import get_logger
+
+# 用 infra 的 LazyLogger（而非原生 logging.getLogger）——
+# 原生 logger 没有 handler，LLM 层的日志不会落进 infra 的日志文件。
+logger = get_logger(__name__)
 
 
 _usage_lock = threading.Lock()

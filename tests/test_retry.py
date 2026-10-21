@@ -17,10 +17,12 @@ from __future__ import annotations
 
 import asyncio
 import time
+from functools import partial
 from unittest.mock import patch
 
 import pytest
 
+from infra.logger import LogConfig, configure_logging, reset_logging
 from infra.utils.retry import (
     RetryConfig,
     RetryExecutor,
@@ -29,6 +31,14 @@ from infra.utils.retry import (
     retry_sync_deco,
     retry_async_deco,
 )
+
+
+@pytest.fixture(autouse=True)
+def _reset_logger_state():
+    """日志状态是全局的——每个测试后还原，避免跨测试污染。"""
+    reset_logging()
+    yield
+    reset_logging()
 
 
 # ============================================================
@@ -506,6 +516,141 @@ class TestCalcDelay:
         assert exe._calc_delay(0) == pytest.approx(1.0)
         assert exe._calc_delay(1) == pytest.approx(2.0)
         assert exe._calc_delay(2) == pytest.approx(2.0)
+
+
+# ============================================================
+# 8. 重试日志可观测性（客户需求 5，20261021 新增）
+# ============================================================
+class TestRetryLogging:
+    """重试日志要带 model / attempt / 异常类型，且**不能泄露调用参数**。
+
+    历史 bug：``getattr(func, "__name__", str(func))`` 在 func 是
+    ``functools.partial`` 时会 fallback 到 ``str(func)``——把绑定进去的
+    messages（含用户 prompt）、api_key 整个打进日志文件。
+    """
+
+    @staticmethod
+    def _fast_cfg(max_retries: int = 1) -> RetryConfig:
+        return RetryConfig.default().copy(
+            max_retries=max_retries, base_delay=0.01, jitter=False
+        )
+
+    def test_safe_func_label_plain_function(self):
+        from infra.utils.retry import _safe_func_label
+
+        def my_func(**kwargs):
+            return None
+
+        assert _safe_func_label(my_func) == "my_func"
+
+    def test_safe_func_label_partial_hides_args(self):
+        """partial 只取内层函数名，不打印绑定的参数。"""
+        from infra.utils.retry import _safe_func_label
+
+        def create(**kwargs):
+            return None
+
+        p = partial(create, messages=[{"role": "user", "content": "SECRET"}])
+        label = _safe_func_label(p)
+        assert label == "partial:create"
+        assert "SECRET" not in label
+
+    def test_safe_func_label_callable_object(self):
+        from infra.utils.retry import _safe_func_label
+
+        class MyCallable:
+            def __call__(self, **kwargs):
+                return None
+
+        assert _safe_func_label(MyCallable()) == "MyCallable"
+
+    def test_redact_kwargs_masks_sensitive(self):
+        from infra.utils.retry import _redact_kwargs
+
+        out = _redact_kwargs({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "SECRET"}],
+            "api_key": "sk-REAL",
+            "temperature": 0.7,
+        })
+        assert out["model"] == "gpt-4o"
+        assert out["temperature"] == 0.7
+        assert out["messages"] == "***"
+        assert out["api_key"] == "***"
+
+    def test_describe_includes_model_and_masks_secrets(self):
+        from infra.utils.retry import RetryExecutor
+
+        def create(**kwargs):
+            return None
+
+        p = partial(
+            create,
+            model="gpt-4o",
+            messages=[{"role": "user", "content": "SECRET_PROMPT"}],
+            api_key="sk-REALKEY",
+        )
+        desc = RetryExecutor._describe(p, {})
+        assert "model='gpt-4o'" in desc
+        assert "func=partial:create" in desc
+        assert "SECRET_PROMPT" not in desc
+        assert "sk-REALKEY" not in desc
+
+    def test_retry_log_contains_attempt_and_error_type(self, tmp_path):
+        """重试日志含 attempt 计数 + 异常类型 + model。"""
+        configure_logging(LogConfig(level="DEBUG", log_dir=str(tmp_path / "logs")))
+
+        async def create(**kwargs):
+            raise ConnectionError("boom")
+
+        p = partial(create, model="gpt-4o", messages=[{"content": "SECRET"}])
+        cfg = self._fast_cfg()
+
+        with pytest.raises(ConnectionError):
+            asyncio.run(retry_async(p, config=cfg))
+
+        content = (tmp_path / "logs" / "infra_utils_retry.log").read_text(encoding="utf-8")
+        assert "attempt=1/2" in content
+        assert "ConnectionError" in content
+        assert "model='gpt-4o'" in content
+
+    def test_retry_log_does_not_leak_prompt(self, tmp_path):
+        """关键回归：用户 prompt 不能进日志文件。"""
+        configure_logging(LogConfig(level="DEBUG", log_dir=str(tmp_path / "logs")))
+
+        async def create(**kwargs):
+            raise ConnectionError("boom")
+
+        p = partial(
+            create,
+            model="gpt-4o",
+            messages=[{"role": "user", "content": "用户私密提示词 SECRET_ABC"}],
+        )
+        cfg = self._fast_cfg()
+
+        with pytest.raises(ConnectionError):
+            asyncio.run(retry_async(p, config=cfg))
+
+        content = (tmp_path / "logs" / "infra_utils_retry.log").read_text(encoding="utf-8")
+        assert "SECRET_ABC" not in content
+        assert "用户私密提示词" not in content
+
+    def test_sync_retry_log_also_safe(self, tmp_path):
+        """同步路径同样不泄露。"""
+        configure_logging(LogConfig(level="DEBUG", log_dir=str(tmp_path / "logs")))
+
+        def create(**kwargs):
+            raise ConnectionError("boom")
+
+        p = partial(create, model="gpt-4o", messages=[{"content": "SECRET_XYZ"}])
+        cfg = self._fast_cfg()
+
+        with pytest.raises(ConnectionError):
+            retry_sync(p, config=cfg)
+
+        content = (tmp_path / "logs" / "infra_utils_retry.log").read_text(encoding="utf-8")
+        assert "SECRET_XYZ" not in content
+        assert "model='gpt-4o'" in content
 
 
 # ============================================================

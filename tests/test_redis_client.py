@@ -584,6 +584,165 @@ class TestGlobalRegistry:
 
 
 # ============================================================
+# 10. Key 扫描 + 批量操作（20261021 新增）
+# ============================================================
+class TestKeyScanning:
+    """keys / scan_iter / delete_pattern——客户需求 1。
+
+    背景：消费方（crypto-watcher）原先被迫用 ``redis._get_client().scan_iter(...)``
+    绕过私有方法；这里验证公开 API 可用且返回 str。
+    """
+
+    async def test_keys_returns_str_list(self, client_with_mock_redis):
+        c, mock = client_with_mock_redis
+        mock.keys = AsyncMock(return_value=["a:1", "a:2"])
+        result = await c.keys("a:*")
+        assert result == ["a:1", "a:2"]
+        mock.keys.assert_awaited_once_with("a:*")
+
+    async def test_keys_default_pattern_is_star(self, client_with_mock_redis):
+        c, mock = client_with_mock_redis
+        mock.keys = AsyncMock(return_value=[])
+        await c.keys()
+        mock.keys.assert_awaited_once_with("*")
+
+    async def test_keys_decodes_bytes(self, client_with_mock_redis):
+        """bytes key 也统一成 str（自定义连接池 / mock 场景的兜底）。"""
+        c, mock = client_with_mock_redis
+        mock.keys = AsyncMock(return_value=[b"a:1", "a:2"])
+        assert await c.keys() == ["a:1", "a:2"]
+
+    async def test_scan_iter_yields_str(self, client_with_mock_redis):
+        c, mock = client_with_mock_redis
+
+        async def fake_scan_iter(match=None, count=None):
+            yield b"llm:article_body:1"
+            yield "llm:article_body:2"
+
+        mock.scan_iter = fake_scan_iter
+        got = [k async for k in c.scan_iter("llm:article_body:*")]
+        assert got == ["llm:article_body:1", "llm:article_body:2"]
+
+    async def test_scan_iter_passes_match_and_count(self, client_with_mock_redis):
+        c, mock = client_with_mock_redis
+        captured = {}
+
+        async def fake_scan_iter(match=None, count=None):
+            captured["match"] = match
+            captured["count"] = count
+            if False:
+                yield  # pragma: no cover
+
+        mock.scan_iter = fake_scan_iter
+        _ = [k async for k in c.scan_iter("x:*", count=50)]
+        assert captured == {"match": "x:*", "count": 50}
+
+    async def test_scan_iter_defaults(self, client_with_mock_redis):
+        c, mock = client_with_mock_redis
+        captured = {}
+
+        async def fake_scan_iter(match=None, count=None):
+            captured["match"] = match
+            captured["count"] = count
+            if False:
+                yield  # pragma: no cover
+
+        mock.scan_iter = fake_scan_iter
+        _ = [k async for k in c.scan_iter()]
+        assert captured == {"match": "*", "count": 100}
+
+    async def test_delete_pattern_batches(self, client_with_mock_redis):
+        """按模式删除——分批 delete，返回总数。"""
+        c, mock = client_with_mock_redis
+
+        async def fake_scan_iter(match=None, count=None):
+            for i in range(5):
+                yield f"tmp:{i}"
+
+        mock.scan_iter = fake_scan_iter
+        mock.delete = AsyncMock(return_value=2)
+        # batch=2 → 3 批（2+2+1）
+        assert await c.delete_pattern("tmp:*", batch=2) == 6
+        assert mock.delete.await_count == 3
+
+    async def test_delete_pattern_no_match_returns_zero(self, client_with_mock_redis):
+        c, mock = client_with_mock_redis
+
+        async def fake_scan_iter(match=None, count=None):
+            if False:
+                yield  # pragma: no cover
+
+        mock.scan_iter = fake_scan_iter
+        mock.delete = AsyncMock()
+        assert await c.delete_pattern("none:*") == 0
+        mock.delete.assert_not_awaited()
+
+
+# ============================================================
+# 11. 批量操作 + 公开 client 访问器（20261021 新增）
+# ============================================================
+class TestBatchOps:
+    async def test_pipeline_returns_underlying_pipeline(self, client_with_mock_redis):
+        c, mock = client_with_mock_redis
+        sentinel = object()
+        mock.pipeline.return_value = sentinel
+        assert c.pipeline() is sentinel
+        mock.pipeline.assert_called_once_with(transaction=True)
+
+    async def test_pipeline_accepts_transaction_false(self, client_with_mock_redis):
+        c, mock = client_with_mock_redis
+        mock.pipeline.return_value = object()
+        c.pipeline(transaction=False)
+        mock.pipeline.assert_called_once_with(transaction=False)
+
+    async def test_mget(self, client_with_mock_redis):
+        c, mock = client_with_mock_redis
+        mock.mget = AsyncMock(return_value=["v1", None, "v3"])
+        assert await c.mget("k1", "k2", "k3") == ["v1", None, "v3"]
+        mock.mget.assert_awaited_once_with("k1", "k2", "k3")
+
+    async def test_mget_no_keys_returns_empty(self, client_with_mock_redis):
+        c, mock = client_with_mock_redis
+        mock.mget = AsyncMock()
+        assert await c.mget() == []
+        mock.mget.assert_not_awaited()
+
+    async def test_mset_serializes_dict(self, client_with_mock_redis):
+        c, mock = client_with_mock_redis
+        mock.mset = AsyncMock(return_value=True)
+        assert await c.mset({"a": {"x": 1}, "b": [1, 2]}) is True
+        mock.mset.assert_awaited_once_with({"a": '{"x": 1}', "b": "[1, 2]"})
+
+    async def test_mset_converts_non_str(self, client_with_mock_redis):
+        c, mock = client_with_mock_redis
+        mock.mset = AsyncMock(return_value=True)
+        await c.mset({"a": 1})
+        mock.mset.assert_awaited_once_with({"a": "1"})
+
+    async def test_mset_empty_returns_true(self, client_with_mock_redis):
+        c, mock = client_with_mock_redis
+        mock.mset = AsyncMock()
+        assert await c.mset({}) is True
+        mock.mset.assert_not_awaited()
+
+
+# ============================================================
+# 12. 公开 client 访问器（替代 _get_client 私有绕过）
+# ============================================================
+class TestPublicClientAccessor:
+    def test_client_property_returns_underlying(self, client_with_mock_redis):
+        c, mock = client_with_mock_redis
+        assert c.client is mock
+
+    def test_client_property_raises_when_uninitialized(self):
+        with patch("infra.redis.client.aioredis.Redis"):
+            c = RedisClient()
+        c._client = None
+        with pytest.raises(RedisError, match="客户端未初始化"):
+            _ = c.client
+
+
+# ============================================================
 # 运行入口
 # ============================================================
 if __name__ == "__main__":

@@ -158,6 +158,31 @@ class DatabaseConnectionManager:
         "sqlite": (),
     }
 
+    @staticmethod
+    def _infer_db_type_from_url(url: str) -> str:
+        """从 URL 的 dialect 推断 db_type（type 未显式配置时使用）。
+
+        scheme 可能带驱动后缀：
+            postgresql+asyncpg://... → postgresql
+            mysql+aiomysql://...     → mysql
+            sqlite+aiosqlite://...   → sqlite
+        先剥掉 ``+driver`` 再比对裸 dialect，否则带驱动的 scheme 匹配不上，
+        db_type 会留空并最终抛「不支持的 db_type」。
+        """
+        if not url or "://" not in url:
+            return ""
+
+        scheme = url.split("://", 1)[0].lower()
+        dialect = scheme.split("+", 1)[0]
+
+        if dialect == "sqlite":
+            return "sqlite"
+        if dialect in ("postgres", "postgresql"):
+            return "postgresql"
+        if dialect == "mysql":
+            return "mysql"
+        return ""
+
     def _resolve_url_and_type(self, db_config: Dict[str, Any]) -> tuple[str, str]:
         """
         决定 db_type 和最终 url。
@@ -184,13 +209,9 @@ class DatabaseConnectionManager:
 
         # 若 type 未显式指定（空字符串），从 URL dialect 推断
         if not db_type and database_url:
-            scheme = database_url.split("://", 1)[0] if "://" in database_url else ""
-            if scheme.startswith("sqlite"):
-                db_type = "sqlite"
-            elif scheme in ("postgres", "postgresql"):
-                db_type = "postgresql"
-            elif scheme in ("mysql", "mysql+aiomysql"):
-                db_type = "mysql"
+            db_type = self._infer_db_type_from_url(database_url)
+            # 推断结果写回 config——调用方（以及 mgr.config["type"]）应看到最终生效的 type
+            db_config["type"] = db_type
 
         # 3: yaml 无 url 字段 → 按 type 查环境变量
         if not database_url:

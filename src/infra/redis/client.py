@@ -8,7 +8,7 @@ import json
 import asyncio
 import time
 import uuid
-from typing import AsyncIterator, Optional, Any, Dict, Set, Callable
+from typing import AsyncIterator, Optional, Any, Dict, List, Set, Callable
 from contextlib import asynccontextmanager
 
 import redis.asyncio as aioredis
@@ -67,7 +67,120 @@ class RedisClient:
         if self._client is None:
             raise RedisError("Redis 客户端未初始化")
         return self._client
-    
+
+    @property
+    def client(self) -> aioredis.Redis:
+        """底层 redis.asyncio 客户端（公开访问器）。
+
+        用于 pipeline / scan_iter / 批量命令等本类未封装的能力。
+        优先用本类提供的方法（keys / scan_iter / pipeline 等）；
+        确实需要原生能力时再用这个属性——不要再去碰 ``_get_client()``。
+        """
+        return self._get_client()
+
+    # ========== Key 扫描 ==========
+
+    async def keys(self, pattern: str = "*") -> List[str]:
+        """按模式列出所有匹配的 key（返回 str）。
+
+        ⚠️ 生产环境慎用：``KEYS`` 会阻塞 Redis 单线程。
+        大 keyspace 请改用 :meth:`scan_iter`（增量扫描，不阻塞）。
+        """
+        raw = await self._get_client().keys(pattern)
+        return [self._decode_key(k) for k in raw]
+
+    async def scan_iter(
+        self, pattern: str = "*", count: int = 100
+    ) -> AsyncIterator[str]:
+        """增量扫描匹配的 key（生产推荐——不阻塞 Redis）。
+
+        用法::
+
+            async for key in redis.scan_iter("llm:article_body:*"):
+                ...
+
+        Args:
+            pattern: 匹配模式（glob 语法）
+            count: 每批扫描的 hint 条数（越大吞吐越高，单次阻塞越久）
+        """
+        async for k in self._get_client().scan_iter(match=pattern, count=count):
+            yield self._decode_key(k)
+
+    @staticmethod
+    def _decode_key(key: Any) -> str:  # noqa: ANN401
+        """key 统一成 str。
+
+        连接池开了 ``decode_responses=True``，正常返回就是 str；
+        这里保留 bytes 兜底（自定义连接池 / mock 场景）。
+        """
+        if isinstance(key, bytes):
+            return key.decode("utf-8", errors="replace")
+        return str(key)
+
+    # ========== 批量操作 ==========
+
+    def pipeline(self, transaction: bool = True) -> Any:  # noqa: ANN401
+        """创建 pipeline（批量命令，减少 RTT）。
+
+        用法::
+
+            async with redis.pipeline() as pipe:
+                pipe.set("k1", "v1")
+                pipe.get("k1")
+                await pipe.execute()
+
+        底层返回 ``redis.asyncio.client.Pipeline``。
+        """
+        return self._get_client().pipeline(transaction=transaction)
+
+    async def mget(self, *keys: str) -> List[Any]:  # noqa: ANN401
+        """批量取多个 key 的值（一次 RTT）。
+
+        不存在的 key 对应位置为 None。
+        """
+        if not keys:
+            return []
+        return list(await self._get_client().mget(*keys))
+
+    async def mset(self, mapping: Dict[str, Any]) -> bool:  # noqa: ANN401
+        """批量写多个 key（一次 RTT）。
+
+        Args:
+            mapping: {key: value}；value 为 dict/list 时自动 JSON 序列化
+        """
+        if not mapping:
+            return True
+        payload: Dict[str, Any] = {}
+        for k, v in mapping.items():
+            if isinstance(v, (dict, list)):
+                payload[k] = json.dumps(v, ensure_ascii=False)
+            elif not isinstance(v, str):
+                payload[k] = str(v)
+            else:
+                payload[k] = v
+        return bool(await self._get_client().mset(payload))
+
+    async def delete_pattern(self, pattern: str, batch: int = 500) -> int:
+        """按模式批量删除 key（用 SCAN 增量扫描，不阻塞 Redis）。
+
+        Args:
+            pattern: 匹配模式（glob 语法）
+            batch: 每批删除的条数
+
+        Returns:
+            实际删除的 key 数量
+        """
+        deleted = 0
+        batch_keys: List[str] = []
+        async for key in self.scan_iter(pattern):
+            batch_keys.append(key)
+            if len(batch_keys) >= batch:
+                deleted += await self.delete(*batch_keys)
+                batch_keys = []
+        if batch_keys:
+            deleted += await self.delete(*batch_keys)
+        return deleted
+
     # ========== 基础操作 ==========
     
     async def get(self, key: str) -> Any:  # noqa: ANN401  # bytes | str | None

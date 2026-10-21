@@ -35,6 +35,45 @@ _DEFAULT_RETRY_EXCEPTIONS: Tuple[Type[Exception], ...] = (
     ConnectionError, TimeoutError, OSError,
 )
 
+# 出现在调用参数里的敏感字段名（小写匹配）——日志里一律打码
+_SENSITIVE_KEYS = frozenset({
+    "messages", "prompt", "content", "api_key", "apikey", "key", "token",
+    "secret", "password", "authorization", "auth", "headers", "cookie",
+})
+
+
+def _safe_func_label(func: Callable[..., Any]) -> str:
+    """提取适合写进日志的函数标识（不泄露调用参数）。
+
+    直接用 ``str(func)`` 是危险的——像 ``functools.partial`` 这种对象，
+    ``str()`` 会把绑定进去的关键字参数整个打印出来，其中可能包含
+    用户 prompt、API key 等敏感内容。
+
+    这里只提取「函数名」这一层标识：
+      - 普通函数 / 方法 → ``__name__``
+      - partial → ``<partial: 内部函数名>``（不打印其 args / keywords）
+      - 其余可调用对象 → ``类型名``
+    """
+    inner = getattr(func, "func", None)
+    if inner is not None and hasattr(inner, "__name__"):
+        # functools.partial —— 只取内层函数名，丢弃 args/keywords
+        return f"partial:{inner.__name__}"
+    name = getattr(func, "__name__", None)
+    if isinstance(name, str) and name:
+        return name
+    return type(func).__name__
+
+
+def _redact_kwargs(kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """对 kwargs 里的敏感字段打码（只用于日志展示）。"""
+    redacted: Dict[str, Any] = {}
+    for key, value in kwargs.items():
+        if key.lower() in _SENSITIVE_KEYS:
+            redacted[key] = "***"
+        else:
+            redacted[key] = value
+    return redacted
+
 
 @dataclass
 class RetryConfig:
@@ -114,10 +153,10 @@ class RetryExecutor:
                 if not self._should_retry(e) or attempt >= cfg.max_retries:
                     break
                 delay = self._calc_delay(attempt)
-                func_name = getattr(func, "__name__", str(func))
                 logger.warning(
-                    f"[Retry] {func_name} attempt={attempt+1}/{cfg.max_retries+1} "
-                    f"error={type(e).__name__}, sleep={delay:.2f}s"
+                    f"[Retry] {self._describe(func, kwargs)} "
+                    f"attempt={attempt+1}/{cfg.max_retries+1} "
+                    f"error={type(e).__name__}: {e}, sleep={delay:.2f}s"
                 )
                 time.sleep(delay)
 
@@ -151,16 +190,42 @@ class RetryExecutor:
                 if not self._should_retry(e) or attempt >= cfg.max_retries:
                     break
                 delay = self._calc_delay(attempt)
-                func_name = getattr(func, "__name__", str(func))
                 logger.warning(
-                    f"[Retry] {func_name} attempt={attempt+1}/{cfg.max_retries+1} "
-                    f"error={type(e).__name__}, sleep={delay:.2f}s"
+                    f"[Retry] {self._describe(func, kwargs)} "
+                    f"attempt={attempt+1}/{cfg.max_retries+1} "
+                    f"error={type(e).__name__}: {e}, sleep={delay:.2f}s"
                 )
                 await asyncio.sleep(delay)
 
         # 全部失败——raise 原始异常
         assert last_exc is not None
         raise last_exc
+
+    @staticmethod
+    def _describe(func: Callable[..., T], kwargs: Dict[str, Any]) -> str:
+        """生成重试日志里的「调用标识」——含 model 等上下文，不含敏感参数。
+
+        内容形如 ``func=partial:create model='gpt-4o' messages='***'``：
+          - ``func``：安全的函数名（不打印 partial 绑定的参数）
+          - ``model``：模型名（LLM 场景最关心的上下文）
+          - 敏感字段（messages / prompt / api_key...）一律打码
+
+        注意：LLM 客户端把参数绑在 ``functools.partial`` 上再传给 retry_async，
+        所以调用方的 ``**kwargs`` 往往是空的——真正的上下文要从 partial 里取。
+        """
+        parts = [f"func={_safe_func_label(func)}"]
+
+        # 合并「调用方显式传的 kwargs」与「partial 里绑定的 keywords」
+        context: Dict[str, Any] = {}
+        bound = getattr(func, "keywords", None)
+        if isinstance(bound, dict):
+            context.update(bound)
+        context.update(kwargs)
+
+        if context:
+            redacted = _redact_kwargs(context)
+            parts.append("kwargs=" + ", ".join(f"{k}={v!r}" for k, v in redacted.items()))
+        return " ".join(parts)
 
 
 # ==================== 函数式 API ====================

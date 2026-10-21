@@ -349,6 +349,177 @@ class TestGetLoggerTwice:
 
 
 # ============================================================
+# 11. console 开关（客户需求 3，20261021 新增）
+# ============================================================
+class TestConsoleOption:
+    """get_logger(name, console=True) —— 独立脚本能在终端看到日志。
+
+    关键回归点：``RotatingFileHandler`` 是 ``StreamHandler`` 的子类，
+    判重时若不排除 ``FileHandler``，console handler 会永远装不上
+    （静默失效）。
+    """
+
+    def test_default_is_no_console(self):
+        """默认不挂 console handler——服务端行为不变。"""
+        lg = get_logger("infra.console.default")
+        assert lg._console is False
+
+    def test_console_true_sets_flag(self):
+        lg = get_logger("infra.console.flag", console=True)
+        assert lg._console is True
+
+    def test_console_adds_stream_handler(self, tmp_path, capsys):
+        """console=True → 输出到 stdout。"""
+        configure_logging(LogConfig(level="DEBUG", log_dir=str(tmp_path / "logs")))
+        lg = get_logger("infra.console.out", console=True)
+        lg.info("这条应该出现在终端")
+        captured = capsys.readouterr()
+        assert "这条应该出现在终端" in captured.out
+
+    def test_console_false_no_stdout(self, tmp_path, capsys):
+        """console=False（默认）→ 不输出到 stdout。"""
+        configure_logging(LogConfig(level="DEBUG", log_dir=str(tmp_path / "logs")))
+        lg = get_logger("infra.console.silent")
+        lg.info("这条不该出现在终端")
+        captured = capsys.readouterr()
+        assert "这条不该出现在终端" not in captured.out
+
+    def test_console_handler_not_confused_with_file_handler(self, tmp_path):
+        """文件 handler 不应被误判成 console handler。"""
+        configure_logging(LogConfig(level="DEBUG", log_dir=str(tmp_path / "logs")))
+        lg = get_logger("infra.console.dedup", console=True)
+        real = lg._get_real_logger()
+        stream_handlers = [h for h in real.handlers if isinstance(h, logging.StreamHandler)]
+        file_handlers = [h for h in real.handlers if isinstance(h, logging.FileHandler)]
+        # 文件 handler 1 个 + console handler 1 个
+        assert len(file_handlers) == 1
+        assert len(stream_handlers) == 2  # FileHandler 是 StreamHandler 子类
+        # 非文件的 StreamHandler 恰好 1 个
+        console_handlers = [
+            h for h in stream_handlers if not isinstance(h, logging.FileHandler)
+        ]
+        assert len(console_handlers) == 1
+
+    def test_console_is_idempotent(self, tmp_path, capsys):
+        """重复输出不会叠加多个 console handler。"""
+        configure_logging(LogConfig(level="DEBUG", log_dir=str(tmp_path / "logs")))
+        lg = get_logger("infra.console.idem", console=True)
+        for _ in range(5):
+            lg.info("重复输出")
+        real = lg._get_real_logger()
+        console_handlers = [
+            h for h in real.handlers
+            if isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler)
+        ]
+        assert len(console_handlers) == 1
+
+    def test_console_two_loggers_same_name_share_handler(self, tmp_path):
+        """同名 logger 的 console handler 共享（不重复挂）。"""
+        configure_logging(LogConfig(level="DEBUG", log_dir=str(tmp_path / "logs")))
+        get_logger("infra.console.shared", console=True).info("x")
+        get_logger("infra.console.shared", console=True).info("y")
+        real = logging.getLogger("infra.console.shared")
+        console_handlers = [
+            h for h in real.handlers
+            if isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler)
+        ]
+        assert len(console_handlers) == 1
+
+    def test_console_also_writes_to_file(self, tmp_path, capsys):
+        """console=True 时文件日志照常写。"""
+        configure_logging(LogConfig(level="DEBUG", log_dir=str(tmp_path / "logs")))
+        lg = get_logger("infra.console.both", console=True)
+        lg.info("双写")
+        log_file = tmp_path / "logs" / "infra_console_both.log"
+        assert "双写" in log_file.read_text(encoding="utf-8")
+
+
+# ============================================================
+# 12. log_dir 变更后 logger 缓存失效（20261021 修复）
+# ============================================================
+class TestLoggerCacheInvalidation:
+    """改 log_dir 后旧 logger 不能继续写老目录（测试间污染的根源）。"""
+
+    def test_changing_log_dir_rebuilds_handler(self, tmp_path):
+        d1 = tmp_path / "d1"
+        d2 = tmp_path / "d2"
+        configure_logging(LogConfig(level="DEBUG", log_dir=str(d1)))
+        lg = get_logger("infra.cache.dir")
+        lg.info("first")
+        assert (d1 / "infra_cache_dir.log").exists()
+
+        # 改 log_dir（level 不变）→ 必须重建 handler
+        configure_logging(LogConfig(level="DEBUG", log_dir=str(d2)))
+        lg.info("second")
+
+        assert (d2 / "infra_cache_dir.log").exists()
+        assert "second" in (d2 / "infra_cache_dir.log").read_text(encoding="utf-8")
+        assert "second" not in (d1 / "infra_cache_dir.log").read_text(encoding="utf-8")
+
+    def test_changing_level_rebuilds_handler(self, tmp_path):
+        """改 level 也重建（原有行为保持）。"""
+        d = tmp_path / "logs"
+        configure_logging(LogConfig(level="INFO", log_dir=str(d)))
+        lg = get_logger("infra.cache.level")
+        lg.info("info-line")
+        configure_logging(LogConfig(level="DEBUG", log_dir=str(d)))
+        lg.debug("debug-line")
+        content = (d / "infra_cache_level.log").read_text(encoding="utf-8")
+        assert "info-line" in content
+        assert "debug-line" in content
+
+    def test_reset_logging_clears_signatures(self, tmp_path):
+        """reset_logging 后签名表清空。"""
+        configure_logging(LogConfig(level="INFO", log_dir=str(tmp_path / "logs")))
+        _raw_get_logger("infra.cache.reset")
+        assert "infra.cache.reset" in logger_module._logger_signatures
+        reset_logging()
+        assert logger_module._logger_signatures == {}
+
+
+# ============================================================
+# 13. LazyLogger 代理方法补全（20261021 新增）
+# ============================================================
+class TestLazyLoggerProxyCompleteness:
+    """LazyLogger 之前只代理 5 个方法，缺 exception / log 等。"""
+
+    def test_exception_method_exists(self):
+        assert hasattr(LazyLogger, "exception")
+
+    def test_exception_writes_traceback(self, tmp_path):
+        configure_logging(LogConfig(level="DEBUG", log_dir=str(tmp_path / "logs")))
+        lg = get_logger("infra.proxy.exception")
+        try:
+            raise ValueError("故意的异常")
+        except ValueError:
+            lg.exception("捕获到异常")
+        content = (tmp_path / "logs" / "infra_proxy_exception.log").read_text(encoding="utf-8")
+        assert "捕获到异常" in content
+        assert "ValueError" in content
+        assert "Traceback" in content
+
+    def test_log_method(self, tmp_path):
+        configure_logging(LogConfig(level="DEBUG", log_dir=str(tmp_path / "logs")))
+        lg = get_logger("infra.proxy.log")
+        lg.log(logging.WARNING, "按级别记录")
+        content = (tmp_path / "logs" / "infra_proxy_log.log").read_text(encoding="utf-8")
+        assert "按级别记录" in content
+        assert "WARNING" in content
+
+    def test_is_enabled_for(self, tmp_path):
+        configure_logging(LogConfig(level="INFO", log_dir=str(tmp_path / "logs")))
+        lg = get_logger("infra.proxy.enabled")
+        assert lg.isEnabledFor(logging.INFO) is True
+        assert lg.isEnabledFor(logging.DEBUG) is False
+
+    def test_set_level(self, tmp_path):
+        configure_logging(LogConfig(level="INFO", log_dir=str(tmp_path / "logs")))
+        lg = get_logger("infra.proxy.setlevel")
+        lg.setLevel(logging.DEBUG)
+        assert lg.isEnabledFor(logging.DEBUG) is True
+
+
+# ============================================================
 # 运行入口
 # ============================================================
 if __name__ == "__main__":
