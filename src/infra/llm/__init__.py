@@ -55,6 +55,7 @@ from infra.llm.models import ImageResult, VideoResult, AudioResult
 from infra.llm.models import LLMRequest, LLMResponse
 from infra.llm.models import UsageCallback
 from infra.llm.retry import LLMRetryConfig
+from infra.utils.retry import RetryAttempt
 from infra.llm.postprocess import (
     is_likely_cot,
     strip_cot_after_answer,
@@ -108,7 +109,7 @@ __all__ = [
     "ImageResult", "VideoResult", "AudioResult",
     "UsageCallback",
     # retry
-    "LLMRetryConfig",
+    "LLMRetryConfig", "RetryAttempt",
     # postprocess
     "is_likely_cot",
     "strip_cot_after_answer",

@@ -76,6 +76,27 @@ def _redact_kwargs(kwargs: Dict[str, Any]) -> Dict[str, Any]:
 
 
 @dataclass
+class RetryAttempt:
+    """一次重试尝试的上下文——供 ``on_retry`` 回调观测退避过程。"""
+
+    #: 第几次尝试（1-based）——1 表示首次调用失败后的第一次重试
+    attempt: int
+    #: 最多会尝试几次（含首次）
+    max_attempts: int
+    #: 本次等待的秒数
+    delay: float
+    #: 触发重试的异常
+    exception: Exception
+    #: 异常类型名（便捷访问，避免调用方自己写 type(e).__name__）
+    error_type: str
+
+    @property
+    def is_last(self) -> bool:
+        """是否是最后一次尝试。"""
+        return self.attempt >= self.max_attempts
+
+
+@dataclass
 class RetryConfig:
     """重试配置——纯数据对象，可自由拷贝修改。"""
     max_retries: int = 3
@@ -85,6 +106,10 @@ class RetryConfig:
     jitter: bool = True
     allow_exceptions: Tuple[Type[Exception], ...] = _DEFAULT_RETRY_EXCEPTIONS
     deny_exceptions: Tuple[Type[Exception], ...] = ()
+    #: 退避过程回调——每次决定重试时调用一次。
+    #: 签名 ``callback(attempt: RetryAttempt) -> None``；异常会被吞掉（不影响重试）。
+    #: 设为 None 时不产生回调开销。
+    on_retry: Optional[Callable[["RetryAttempt"], None]] = None
 
     def copy(self, **override: Any) -> "RetryConfig":
         """拷贝并局部覆盖参数——方便单次调用修改配置。"""
@@ -141,6 +166,25 @@ class RetryExecutor:
         """公开方法——判断异常是否应被重试（暴露给业务使用）。"""
         return self._should_retry(exc)
 
+    def _notify_retry(self, attempt: int, delay: float, exc: Exception) -> None:
+        """通知「即将重试」——调用 ``on_retry`` 回调（异常吞掉，不影响重试）。"""
+        callback = self.config.on_retry
+        if callback is None:
+            return
+        try:
+            callback(
+                RetryAttempt(
+                    attempt=attempt,
+                    max_attempts=self.config.max_retries + 1,
+                    delay=delay,
+                    exception=exc,
+                    error_type=type(exc).__name__,
+                )
+            )
+        except Exception:
+            # 观测回调不该影响重试主流程
+            logger.debug("[Retry] on_retry 回调异常（忽略）", exc_info=True)
+
     def execute_sync(self, func: Callable[..., T], *args: Any, **kwargs: Any) -> T:
         """同步执行带重试——失败 raise 原始异常。"""
         last_exc: Optional[Exception] = None
@@ -158,6 +202,7 @@ class RetryExecutor:
                     f"attempt={attempt+1}/{cfg.max_retries+1} "
                     f"error={type(e).__name__}: {e}, sleep={delay:.2f}s"
                 )
+                self._notify_retry(attempt + 1, delay, e)
                 time.sleep(delay)
 
         # 全部失败——raise 原始异常
@@ -195,6 +240,7 @@ class RetryExecutor:
                     f"attempt={attempt+1}/{cfg.max_retries+1} "
                     f"error={type(e).__name__}: {e}, sleep={delay:.2f}s"
                 )
+                self._notify_retry(attempt + 1, delay, e)
                 await asyncio.sleep(delay)
 
         # 全部失败——raise 原始异常
@@ -280,6 +326,7 @@ def retry_async_deco(config: Optional[RetryConfig] = None) -> Callable:
 
 __all__ = [
     "RetryConfig",
+    "RetryAttempt",
     "RetryExecutor",
     "retry_sync",
     "retry_async",

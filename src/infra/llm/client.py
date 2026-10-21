@@ -16,7 +16,7 @@ from abc import ABC, abstractmethod
 from functools import partial
 from typing import Any, List, Optional, Callable, Dict, Union, Tuple
 
-from infra.utils.retry import RetryConfig, retry_async, retry_sync
+from infra.utils.retry import RetryAttempt, RetryConfig, retry_async, retry_sync
 from infra.llm.models import (
     LLMRequest,
     LLMResponse,
@@ -419,6 +419,7 @@ class LLMClient(ABC):
         fallback_base_url: Optional[str] = None,
         fallback_api_key: Optional[str] = None,
         capability_probe: bool = True,
+        on_retry: Optional[Callable[[RetryAttempt], None]] = None,
     ):
         self.api_key = api_key
         self.base_url = base_url
@@ -432,6 +433,9 @@ class LLMClient(ABC):
         self.fallback_api_key = fallback_api_key or api_key
         if retry_config is None:
             retry_config = LLMRetryConfig.default().retry_config.copy(max_retries=max_retries)
+        if on_retry is not None:
+            # 退避过程回调——注入到 retry_config，观测每次重试的等待
+            retry_config = retry_config.copy(on_retry=on_retry)
         self.retry_config = retry_config
         # 能力探测状态——懒探测时避免重复请求（见 _ensure_probed）
         self._probed_keys: set = set()
@@ -842,6 +846,7 @@ class LLMClient(ABC):
         request: LLMRequest,
         use_fallback: bool = False,
         usage_callback: Optional[UsageCallback] = None,
+        _apply_post_processor: bool = True,
     ) -> Any:
         """异步流式调用——返回流式响应迭代器。子类必须实现。
 
@@ -857,6 +862,7 @@ class LLMClient(ABC):
         request: LLMRequest,
         use_fallback: bool = False,
         usage_callback: Optional[UsageCallback] = None,
+        _apply_post_processor: bool = True,
     ) -> Any:
         """同步流式调用——返回流式响应迭代器。子类必须实现。
 
@@ -883,6 +889,228 @@ class LLMClient(ABC):
                     "completion_tokens": response.usage.get("completion_tokens", 0),
                     "total_tokens": response.usage.get("total_tokens", 0),
                 })
+
+    # ==================== 批量 / 并发调用 ====================
+
+    async def abatch(
+        self,
+        requests: List[LLMRequest],
+        *,
+        concurrency: int = 5,
+        use_fallback: bool = False,
+        usage_callback: Optional[UsageCallback] = None,
+        return_exceptions: bool = False,
+    ) -> List[Any]:
+        """并发执行多个请求。
+
+        Args:
+            requests: 请求列表
+            concurrency: 最大并发数（默认 5）——防止打爆 provider 限流
+            use_fallback: 是否走 fallback provider
+            usage_callback: 每次成功响应后的回调
+            return_exceptions: True 时单个失败不中断整体，失败项以异常对象返回；
+                False（默认）时任一失败立即抛出
+
+        Returns:
+            响应列表——顺序与 ``requests`` **一致**（不因完成先后而乱序）
+
+        Note:
+            用 ``asyncio.Semaphore`` 限流；``asyncio.gather`` 保持顺序，
+            因此结果可按索引与输入对应。
+        """
+        if not requests:
+            return []
+        if concurrency < 1:
+            raise ValueError(f"concurrency 必须 >= 1，收到 {concurrency}")
+        sem = asyncio.Semaphore(concurrency)
+
+        async def _run(req: LLMRequest) -> LLMResponse:
+            async with sem:
+                return await self.ainvoke(
+                    req, use_fallback=use_fallback, usage_callback=usage_callback
+                )
+
+        tasks = [_run(r) for r in requests]
+        if return_exceptions:
+            return list(
+                await asyncio.gather(*tasks, return_exceptions=True)
+            )
+        return list(await asyncio.gather(*tasks))
+
+    def batch(
+        self,
+        requests: List[LLMRequest],
+        *,
+        concurrency: int = 5,
+        use_fallback: bool = False,
+        usage_callback: Optional[UsageCallback] = None,
+        return_exceptions: bool = False,
+    ) -> List[Any]:
+        """并发执行多个请求（同步版）。
+
+        用线程池跑异步实现——同步代码也能享受并发。
+
+        Args:
+            requests: 请求列表
+            concurrency: 最大并发数
+            use_fallback: 是否走 fallback provider
+            usage_callback: 每次成功响应后的回调
+            return_exceptions: 同 :meth:`abatch`
+
+        Returns:
+            响应列表——顺序与 ``requests`` 一致
+        """
+        if not requests:
+            return []
+        if concurrency < 1:
+            raise ValueError(f"concurrency 必须 >= 1，收到 {concurrency}")
+
+        # 同步实现——直接调 self.invoke（同步客户端），
+        # 而不是复用 abatch（那会走 async 客户端）。
+        # 用线程池并发执行——同步 IO 正好适合线程池。
+        import concurrent.futures
+
+        def _run(req: LLMRequest) -> Any:
+            return self.invoke(
+                req, use_fallback=use_fallback, usage_callback=usage_callback
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=concurrency
+        ) as pool:
+            futures = [pool.submit(_run, r) for r in requests]
+            if return_exceptions:
+                results: List[Any] = []
+                for f in futures:
+                    exc = f.exception()
+                    results.append(exc if exc is not None else f.result())
+                return results
+            # 按输入顺序收集结果——任一失败立即抛出
+            return [f.result() for f in futures]
+
+    # ==================== 流式聚合 ====================
+
+    async def astream_collect(
+        self,
+        request: LLMRequest,
+        *,
+        use_fallback: bool = False,
+        usage_callback: Optional[UsageCallback] = None,
+    ) -> LLMResponse:
+        """流式调用但返回**完整响应**（一站式）。
+
+        适用场景：需要流式的「首 token 延迟」优势，但最终要一个完整字符串
+        （比如要塞进数据库、要再加工）。
+
+        与手动 ``async for`` 累加内容的区别：本方法内部保证：
+          - 用 ``async with`` 确定性关闭底层连接
+          - 累加 content / reasoning_content / tool_calls
+          - 合并各 chunk 的 usage（取最后一次非空值）
+          - 应用 ``request.post_processor`` 到最终内容
+
+        Args:
+            request: 请求
+            use_fallback: 是否走 fallback provider
+            usage_callback: 流结束时的 usage 回调
+
+        Returns:
+            完整的 :class:`LLMResponse`
+        """
+        content_parts: List[str] = []
+        reasoning_parts: List[str] = []
+        tool_calls: List[Dict[str, Any]] = []
+        usage: Dict[str, int] = {}
+        model: Optional[str] = None
+        finish_reason: Optional[str] = None
+
+        async with self.astream(
+            request,
+            use_fallback=use_fallback,
+            usage_callback=usage_callback,
+            # post_processor 由本方法在**拼接后**统一应用——
+            # 逐 chunk 应用会破坏跨 chunk 的标记（如 "Final answer:"）
+            _apply_post_processor=False,
+        ) as stream:
+            async for chunk in stream:
+                if chunk.content:
+                    content_parts.append(chunk.content)
+                if chunk.reasoning_content:
+                    reasoning_parts.append(chunk.reasoning_content)
+                if chunk.tool_calls:
+                    tool_calls.extend(chunk.tool_calls)
+                if chunk.usage:
+                    usage = dict(chunk.usage)
+                if chunk.model:
+                    model = chunk.model
+                if chunk.finish_reason:
+                    finish_reason = chunk.finish_reason
+
+        content = "".join(content_parts)
+        reasoning = "".join(reasoning_parts) or None
+        # post_processor 应用到最终拼接后的内容——
+        # 逐 chunk 处理会破坏跨 chunk 的标记（如 "Final answer:"）
+        if request.post_processor is not None:
+            content = request.post_processor(content, reasoning)
+
+        return LLMResponse(
+            content=content,
+            reasoning_content=reasoning,
+            tool_calls=tool_calls,
+            usage=usage,
+            model=model,
+            finish_reason=finish_reason,
+        )
+
+    def stream_collect(
+        self,
+        request: LLMRequest,
+        *,
+        use_fallback: bool = False,
+        usage_callback: Optional[UsageCallback] = None,
+    ) -> LLMResponse:
+        """流式调用但返回完整响应（同步版）——见 :meth:`astream_collect`。"""
+        content_parts: List[str] = []
+        reasoning_parts: List[str] = []
+        tool_calls: List[Dict[str, Any]] = []
+        usage: Dict[str, int] = {}
+        model: Optional[str] = None
+        finish_reason: Optional[str] = None
+
+        with self.stream(
+            request,
+            use_fallback=use_fallback,
+            usage_callback=usage_callback,
+            # post_processor 由本方法在**拼接后**统一应用
+            _apply_post_processor=False,
+        ) as stream:
+            for chunk in stream:
+                if chunk.content:
+                    content_parts.append(chunk.content)
+                if chunk.reasoning_content:
+                    reasoning_parts.append(chunk.reasoning_content)
+                if chunk.tool_calls:
+                    tool_calls.extend(chunk.tool_calls)
+                if chunk.usage:
+                    usage = dict(chunk.usage)
+                if chunk.model:
+                    model = chunk.model
+                if chunk.finish_reason:
+                    finish_reason = chunk.finish_reason
+
+        content = "".join(content_parts)
+        reasoning = "".join(reasoning_parts) or None
+        if request.post_processor is not None:
+            content = request.post_processor(content, reasoning)
+
+        return LLMResponse(
+            content=content,
+            reasoning_content=reasoning,
+            tool_calls=tool_calls,
+            usage=usage,
+            model=model,
+            finish_reason=finish_reason,
+        )
+
 
 # ===========================================================================
 # OpenAI Provider（第一期实现）
@@ -1106,6 +1334,7 @@ class OpenAIClient(LLMClient):
         request: LLMRequest,
         use_fallback: bool = False,
         usage_callback: Optional[UsageCallback] = None,
+        _apply_post_processor: bool = True,
     ) -> Any:
         """Asynchronous streaming invocation.
 
@@ -1175,7 +1404,8 @@ class OpenAIClient(LLMClient):
             on_close=_on_close,
             on_chunk=lambda chunk: usage.add(getattr(chunk, "usage", None)),
             transform=lambda chunk: LLMResponse.from_openai_chunk(
-                chunk, post_processor=request.post_processor
+                chunk,
+                post_processor=request.post_processor if _apply_post_processor else None,
             ),
         )
 
@@ -1184,6 +1414,7 @@ class OpenAIClient(LLMClient):
         request: LLMRequest,
         use_fallback: bool = False,
         usage_callback: Optional[UsageCallback] = None,
+        _apply_post_processor: bool = True,
     ) -> Any:
         """Synchronous streaming invocation.
 
@@ -1241,7 +1472,8 @@ class OpenAIClient(LLMClient):
             on_close=_on_close,
             on_chunk=lambda chunk: usage.add(getattr(chunk, "usage", None)),
             transform=lambda chunk: LLMResponse.from_openai_chunk(
-                chunk, post_processor=request.post_processor
+                chunk,
+                post_processor=request.post_processor if _apply_post_processor else None,
             ),
         )
 
@@ -1250,7 +1482,10 @@ class LLMFactory:
     """LLM 工厂——按 config['provider'] 选 provider 客户端。"""
 
     @staticmethod
-    def create(config: dict) -> LLMClient:
+    def create(
+        config: dict,
+        on_retry: Optional[Callable[[RetryAttempt], None]] = None,
+    ) -> LLMClient:
         provider = config.get("provider", "openai").lower()
         api_key = config.get("api_key")
         base_url = config.get("base_url")
@@ -1279,6 +1514,7 @@ class LLMFactory:
                 fallback_base_url=fallback_base_url,
                 fallback_api_key=fallback_api_key,
                 capability_probe=capability_probe,
+                on_retry=on_retry,
             )
         raise ValueError(
             f"unsupported provider: {provider}（已支持：openai/deepseek/zhipu/glm/moonshot/lingyi/qwen/doubao，均走 OpenAI 兼容协议）"
@@ -2076,7 +2312,10 @@ def _pick(yaml_val: Any, env_key: str) -> Any:
     return os.getenv(env_key)
 
 
-async def init_llm_client(config: dict) -> Optional[LLMClient]:
+async def init_llm_client(
+    config: dict,
+    on_retry: Optional[Callable[[RetryAttempt], None]] = None,
+) -> Optional[LLMClient]:
     """初始化全局 LLM 客户端（按配置创建）。
 
     配置优先级（高→低）：
@@ -2089,6 +2328,11 @@ async def init_llm_client(config: dict) -> Optional[LLMClient]:
       LLM_MODEL_FALLBACK / LLM_FALLBACK_BASE_URL / LLM_FALLBACK_API_KEY
       控制主模型连续失败时切换的强模型/端点。
       LLM_CAPABILITY_PROBE —— 控制是否主动探测 provider 能力（默认开启）。
+
+    Args:
+        config: 完整配置 dict
+        on_retry: 退避过程回调——每次重试前调用一次，可观测等待时长与异常。
+            签名 ``callback(attempt: RetryAttempt) -> None``
     """
     global _llm_client
     if _llm_client is not None:
@@ -2126,7 +2370,7 @@ async def init_llm_client(config: dict) -> Optional[LLMClient]:
         "fallback_base_url": str(fallback_base_url) if fallback_base_url else None,
         "fallback_api_key": str(fallback_api_key) if fallback_api_key else None,
         "capability_probe": capability_probe,
-    })
+    }, on_retry=on_retry)
     _init_base_url = getattr(getattr(_llm_client, "_async_client", None), "base_url", None)
     logger.info(
         f"LLM global client initialized. base_url={_init_base_url}, "
