@@ -29,6 +29,12 @@ class TaskMessage:
     payload: Dict[str, Any]
     metadata: Dict[str, Any] = field(default_factory=dict)
     priority: str = "normal"
+    #: 消息队列里的消息 ID（如 Redis Stream 的 "1234-0"）——空表示不在队列里。
+    #:
+    #: **做幂等时用它**：MQ 的投递语义是「至少一次」——handler 成功但
+    #: ACK 失败时消息会被重新投递，handler 会被重复执行。用 msg_id
+    #: 作为幂等键（写库时唯一约束 / SETNX）可以避免重复副作用。
+    msg_id: str = ""
     
     # ========== 字典协议支持（向后兼容） ==========
     def __getitem__(self, key: str) -> Any:
@@ -60,7 +66,8 @@ class TaskMessage:
             'scheduled_time': self.scheduled_time,
             'payload': self.payload,
             'metadata': self.metadata,
-            'priority': self.priority
+            'priority': self.priority,
+            'msg_id': self.msg_id
         }
     
     def to_mq(self) -> Dict[str, str]:
@@ -74,6 +81,7 @@ class TaskMessage:
             'priority': self.priority,
             'created_at': str(datetime.now().timestamp())
         }
+        # msg_id 由 MQ 在入队后回填——发布时还没有，不写进存储格式
     
     @classmethod
     def from_mq(cls, mq_data: Dict[str, str]) -> 'TaskMessage':
@@ -98,7 +106,9 @@ class TaskMessage:
             scheduled_time=mq_data.get('scheduled_time', datetime.now().isoformat()),
             payload=payload,
             metadata=metadata,
-            priority=mq_data.get('priority', 'normal')
+            priority=mq_data.get('priority', 'normal'),
+            # msg_id 不在存储的字段里——由 MQ 消费时从 Redis 的消息 ID 注入
+            msg_id=mq_data.get('msg_id', '')
         )
     
     def __repr__(self) -> str:

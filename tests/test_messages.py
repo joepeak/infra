@@ -155,7 +155,7 @@ class TestToDict:
         d = msg.to_dict()
         assert set(d.keys()) == {
             "task_id", "task_type", "scheduled_time",
-            "payload", "metadata", "priority",
+            "payload", "metadata", "priority", "msg_id",
         }
         assert d["task_id"] == "t-1"
         assert d["task_type"] == "etl"

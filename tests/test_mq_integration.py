@@ -513,3 +513,233 @@ class TestStop:
         assert not mq._consumer_tasks, "消费者任务未清理"
         assert not mq._claim_tasks, "认领任务未清理"
         assert mq._redis is None, "连接未释放（应置空以便下次重连）"
+
+
+# ============================================================
+# 8. 消费者清理 —— 避免僵尸 consumer 累积
+# ============================================================
+class TestConsumerCleanup:
+    """stop() 应删除本次注册过的 consumer。
+
+    否则每次 start() 都会在消费者组里留下僵尸 consumer——
+    长期运行 / 频繁重启会无限累积（实测每轮 +3）。
+    """
+
+    async def test_stop_removes_consumers(self, mq, real_redis):
+        stream = _stream_name(mq, "cleanup")
+        mq.create_queue(stream, concurrency=2, block_ms=100)
+
+        async def handler(msg):
+            pass
+
+        mq.register(stream, "demo", handler)
+        await mq.start([stream])
+        await asyncio.sleep(0.3)
+
+        groups = await real_redis.xinfo_groups(stream)
+        assert groups[0]["consumers"] > 0, "消费者未注册"
+
+        await mq.stop()
+
+        groups_after = await real_redis.xinfo_groups(stream)
+        assert groups_after[0]["consumers"] == 0, (
+            f"stop() 后仍残留 {groups_after[0]['consumers']} 个僵尸 consumer"
+        )
+
+    async def test_repeated_start_stop_does_not_accumulate(self, mq, real_redis):
+        """反复 start/stop 不应累积 consumer。"""
+        stream = _stream_name(mq, "accum")
+        mq.create_queue(stream, concurrency=2, block_ms=100)
+
+        async def handler(msg):
+            pass
+
+        mq.register(stream, "demo", handler)
+
+        counts = []
+        for _ in range(3):
+            await mq.start([stream])
+            await asyncio.sleep(0.2)
+            await mq.stop()
+            groups = await real_redis.xinfo_groups(stream)
+            counts.append(groups[0]["consumers"])
+
+        assert all(c == 0 for c in counts), f"consumer 数在累积: {counts}"
+
+
+# ============================================================
+# 9. 并发限流
+# ============================================================
+class TestMaxConcurrency:
+    """max_concurrency 应真正限制「同时执行的 handler 数量」。
+
+    旧实现里 concurrency 只决定 worker 数，而每个 worker 一次会读
+    batch_size 条并行处理——实际并发度 = concurrency × batch_size
+    （实测 concurrency=2 + batch_size=10 跑出 17 个并发 handler）。
+    """
+
+    async def test_max_concurrency_limits_parallel_handlers(self, mq):
+        stream = _stream_name(mq, "conc")
+        limit = 3
+        mq.create_queue(
+            stream,
+            concurrency=2,
+            batch_size=10,
+            block_ms=100,
+            max_concurrency=limit,
+        )
+        active = {"now": 0, "max": 0}
+
+        async def handler(msg):
+            active["now"] += 1
+            active["max"] = max(active["max"], active["now"])
+            await asyncio.sleep(0.2)
+            active["now"] -= 1
+
+        mq.register(stream, "demo", handler)
+        await mq.start([stream])
+
+        for i in range(20):
+            await mq.publish(
+                stream, {"task_id": f"t{i}", "task_type": "demo", "payload": {}}
+            )
+        await asyncio.sleep(2)
+
+        assert active["max"] <= limit, (
+            f"并发峰值 {active['max']} 超过上限 {limit}"
+        )
+
+    async def test_no_limit_when_not_configured(self, mq):
+        """没配 max_concurrency 时不额外限制（行为与旧版一致）。"""
+        stream = _stream_name(mq, "nolimit")
+        mq.create_queue(stream, concurrency=2, batch_size=5, block_ms=100)
+
+        async def handler(msg):
+            pass
+
+        mq.register(stream, "demo", handler)
+        await mq.start([stream])
+        assert mq._queues[stream].max_concurrency is None
+
+    async def test_semaphore_released_on_handler_error(self, mq):
+        """handler 抛异常时也必须释放并发额度——否则额度耗尽队列卡死。"""
+        stream = _stream_name(mq, "semaerr")
+        mq.create_queue(
+            stream, concurrency=1, batch_size=5, block_ms=100, max_concurrency=1
+        )
+        calls = {"n": 0}
+
+        async def handler(msg):
+            calls["n"] += 1
+            raise RuntimeError("失败")
+
+        mq.register(stream, "demo", handler)
+        await mq.start([stream])
+
+        for i in range(5):
+            await mq.publish(
+                stream, {"task_id": f"t{i}", "task_type": "demo", "payload": {}}
+            )
+        # 额度只有 1 个——如果异常路径不释放，第 2 条就会永久阻塞
+        await asyncio.sleep(4)
+        assert calls["n"] >= 2, f"并发额度泄漏，handler 只调用了 {calls['n']} 次"
+
+
+# ============================================================
+# 10. 幂等：handler 能拿到 msg_id
+# ============================================================
+class TestMessageIdForIdempotency:
+    """handler 应能拿到 MQ 消息 ID——「至少一次」投递下做幂等需要它。"""
+
+    async def test_handler_receives_msg_id(self, mq):
+        stream = _stream_name(mq, "msgid")
+        mq.create_queue(stream, concurrency=1, block_ms=100)
+        received = []
+
+        async def handler(msg):
+            received.append(msg)
+
+        mq.register(stream, "demo", handler)
+        await mq.start([stream])
+
+        published_id = await mq.publish(
+            stream, {"task_id": "t", "task_type": "demo", "payload": {}}
+        )
+        assert await _wait_for(lambda: len(received) == 1)
+
+        assert received[0].msg_id == published_id
+        assert received[0].msg_id, "msg_id 不应为空"
+
+
+# ============================================================
+# 11. create_queue 幂等
+# ============================================================
+class TestCreateQueueIdempotent:
+    """重复 create_queue 不应清空已注册的 handler。"""
+
+    async def test_recreate_keeps_handlers(self, mq):
+        stream = _stream_name(mq, "recreate")
+
+        async def handler(msg):
+            pass
+
+        mq.create_queue(stream)
+        mq.register(stream, "demo", handler)
+        assert len(mq._handlers[stream]) == 1
+
+        mq.create_queue(stream)
+        assert len(mq._handlers[stream]) == 1, "重复 create_queue 清空了 handler"
+
+
+# ============================================================
+# 12. 死信队列管理
+# ============================================================
+class TestDeadLetterManagement:
+    """死信队列应可查询与清理。"""
+
+    async def test_get_and_clear_dead_letters(self, mq, real_redis):
+        stream = _stream_name(mq, "dlmgmt")
+        mq.create_queue(stream, concurrency=1, block_ms=100)
+        await mq.start([stream])
+
+        await mq.publish(
+            stream, {"task_id": "t", "task_type": "无处理器", "payload": {"x": 1}}
+        )
+        assert await _wait_for(
+            lambda: _dead_has_msg(real_redis, stream), timeout=8.0
+        )
+
+        dead = await mq.get_dead_letters(stream)
+        assert len(dead) == 1
+        assert dead[0].get("reason") == "no_handler"
+        assert dead[0].get("original_id")
+
+        cleared = await mq.clear_dead_letters(stream)
+        assert cleared == 1
+        assert not await _dead_has_msg(real_redis, stream)
+
+    async def test_clear_dead_letters_on_empty_queue(self, mq):
+        stream = _stream_name(mq, "dlempty")
+        mq.create_queue(stream)
+        assert await mq.clear_dead_letters(stream) == 0
+
+
+# ============================================================
+# 13. get_stats 不应有副作用
+# ============================================================
+class TestGetStatsNoSideEffect:
+    """统计查询是只读操作——不该触发阻塞式重连。"""
+
+    async def test_get_stats_without_connection_returns_error(self, mq):
+        stream = _stream_name(mq, "nostats")
+        mq.create_queue(stream)
+        mq._redis = None
+        result = await mq.get_stats()
+        assert "error" in result
+
+    async def test_get_stats_works_when_connected(self, mq):
+        stream = _stream_name(mq, "stats")
+        mq.create_queue(stream)
+        result = await mq.get_stats(stream)
+        assert "error" not in result
+        assert result["stream_name"] == stream

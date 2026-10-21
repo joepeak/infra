@@ -8,9 +8,10 @@
 import asyncio
 import json
 import uuid
+from collections import defaultdict
 import time
 from datetime import datetime
-from typing import Dict, Any, Optional, Callable, Awaitable, List, Tuple, Union
+from typing import Dict, Any, Optional, Callable, Awaitable, List, Set, Tuple, Union
 from dataclasses import dataclass
 
 import redis.asyncio as redis
@@ -23,7 +24,18 @@ logger = get_logger(__name__)
 
 
 class MessagePriority:
-    """消息优先级枚举"""
+    """消息优先级枚举。
+
+    **注意：当前只作为消息的元数据被记录，尚未实现「按优先级消费」。**
+
+    Redis Stream 本身不保证优先级顺序——消息按 ID 递增消费，
+    高优先级消息如果排在后面，依然会被后消费。若需要真正的优先级，
+    常规做法是**按优先级分多个 stream**（critical / high / normal / low），
+    消费者按优先级顺序依次拉取。
+
+    这里保留该枚举是为了让消息**携带**优先级信息（便于调用方决策、
+    便于将来实现多 stream 方案），而不是暗示已有优先级消费能力。
+    """
     CRITICAL = "critical"
     HIGH = "high"
     NORMAL = "normal"
@@ -34,11 +46,21 @@ class QueueConfig:
     """单个队列配置"""
     stream_name: str
     group_name: str = ""
+    #: stream 保留的最大消息条数。
+    #: 注意：Redis 的 MAXLEN 默认是**近似**裁剪（允许少量超出），
+    #: 追求精确可改用 ``XTRIM MAXLEN = n``。
     maxlen: int = 10000
     block_ms: int = 1000
     batch_size: int = 10
     max_retries: int = 3
+    #: 消费者（worker）数量——对应 Redis 消费者组里的 consumer 数。
+    #: **不等于并发度**：每个 worker 一次会读 batch_size 条消息并行处理，
+    #: 实际并发度 = concurrency × batch_size。
+    #: 真正的并发上限由 :attr:`max_concurrency` 控制。
     concurrency: int = 5
+    #: **同时执行的 handler 数量上限**（跨所有 worker 共享）。
+    #: None 表示不额外限制（实际并发度 = concurrency × batch_size）。
+    max_concurrency: Optional[int] = None
     claim_interval: int = 30
     claim_min_idle_ms: int = 60000
     ttl_seconds: int = 0  # 0 表示永不过期
@@ -58,6 +80,13 @@ class RedisStreamMQ:
         self._routing: Dict[str, str] = {}
         self._consumer_tasks: Dict[str, List[asyncio.Task]] = {}
         self._claim_tasks: Dict[str, asyncio.Task] = {}
+        # 每个 stream 上注册过的 consumer name——
+        # stop() 时用 XGROUP DELCONSUMER 清理，否则每次 start() 都会
+        # 在消费者组里留下僵尸 consumer（长期运行/频繁重启会无限累积）
+        self._consumer_names: Dict[str, Set[str]] = defaultdict(set)
+        # 每个 stream 的并发信号量——跨该 stream 的所有 worker 共享，
+        # 实现真正的「同时执行的 handler 数量上限」
+        self._semaphores: Dict[str, asyncio.Semaphore] = {}
         self._monitor_task: Optional[asyncio.Task] = None
         self._running = False
         self._default_queue: Optional[str] = None
@@ -137,10 +166,15 @@ class RedisStreamMQ:
         return False
     
     def create_queue(self, stream_name: str, group_name: Optional[str] = None, **kwargs: Any) -> 'RedisStreamMQ':
-        """创建/注册一个队列"""
+        """创建/注册一个队列。
+
+        重复调用是**幂等**的：已注册的 handler 不会被清空。
+        （旧实现每次都 ``self._handlers[stream_name] = {}``，
+        重复调用会静默丢失已注册的 handler——很容易踩坑。）
+        """
         if group_name is None:
             group_name = f"{stream_name}_group"
-        
+
         config = QueueConfig(
             stream_name=stream_name,
             group_name=group_name,
@@ -149,14 +183,16 @@ class RedisStreamMQ:
             batch_size=kwargs.get('batch_size', 10),
             max_retries=kwargs.get('max_retries', 3),
             concurrency=kwargs.get('concurrency', 5),
+            max_concurrency=kwargs.get('max_concurrency', None),
             claim_interval=kwargs.get('claim_interval', 30),
             claim_min_idle_ms=kwargs.get('claim_min_idle_ms', 60000),
             ttl_seconds=kwargs.get('ttl_seconds', 0)
         )
-        
+
         self._queues[stream_name] = config
-        self._handlers[stream_name] = {}
-        
+        # 保留已注册的 handler——重复 create_queue 不该清空它们
+        self._handlers.setdefault(stream_name, {})
+
         logger.info(f"队列已注册: {stream_name} (concurrency={config.concurrency}, ttl={config.ttl_seconds}s)")
         return self
     
@@ -336,6 +372,7 @@ class RedisStreamMQ:
     async def _claim_pending_loop(self, stream_name: str, config: QueueConfig) -> None:
         """独立协程：定期扫描并认领超时的待处理消息"""
         consumer_name = f"claimer_{uuid.uuid4().hex[:8]}"
+        self._consumer_names[stream_name].add(consumer_name)
         logger.info(f"🔁 认领协程启动: {stream_name}/{consumer_name}")
 
         # XAUTOCLAIM 的游标——续扫用，避免每次都从 0-0 开始
@@ -528,7 +565,20 @@ class RedisStreamMQ:
                 f"delivery_count={delivery_count}, reason={reason}"
             )
     
-    async def _process_message(self, stream_name: str, config: QueueConfig, 
+    def _get_semaphore(self, stream_name: str, config: QueueConfig) -> Optional[asyncio.Semaphore]:
+        """取该 stream 的并发信号量（跨所有 worker 共享）。
+
+        没配 ``max_concurrency`` 时返回 None——不限制并发。
+        """
+        if not config.max_concurrency or config.max_concurrency <= 0:
+            return None
+        sem = self._semaphores.get(stream_name)
+        if sem is None:
+            sem = asyncio.Semaphore(config.max_concurrency)
+            self._semaphores[stream_name] = sem
+        return sem
+
+    async def _process_message(self, stream_name: str, config: QueueConfig,
                                 msg_id: str, data: Dict[str, str]) -> Tuple[bool, Optional[str]]:
         """处理单条消息"""
         redis = self._r()  # narrow
@@ -542,9 +592,19 @@ class RedisStreamMQ:
             self._stats['total_expired'] += 1
             return True, None
 
+        # 并发限流——真正限制「同时执行的 handler 数量」。
+        # worker 数（concurrency）只决定有几个消费者在读，
+        # 每个 worker 一次读 batch_size 条并行处理，
+        # 不加这个限制实际并发度是 concurrency × batch_size。
+        sem = self._get_semaphore(stream_name, config)
+        if sem is not None:
+            await sem.acquire()
         try:
             # 自动反序列化为 TaskMessage 对象
             message = TaskMessage.from_mq(data)
+            # 注入 MQ 消息 ID——handler 可以用它做幂等
+            # （投递语义是「至少一次」，ACK 失败会重复投递）
+            message.msg_id = str(msg_id)
 
             logger.info(f"📨 处理消息: {stream_name}/{msg_id}, type={task_type}")
 
@@ -577,11 +637,17 @@ class RedisStreamMQ:
             self._stats['total_failed'] += 1
             self._stats['last_error'] = error_msg
             return False, error_msg
+        finally:
+            # 释放并发额度——必须放在 finally，否则异常路径会泄漏额度，
+            # 最终把 Semaphore 耗尽、整个队列卡死
+            if sem is not None:
+                sem.release()
     
     async def _consume_worker(self, stream_name: str, config: QueueConfig, worker_id: int) -> None:
         """单个消费工作协程"""
         consumer_name = f"worker_{worker_id}_{uuid.uuid4().hex[:8]}"
-        
+        self._consumer_names[stream_name].add(consumer_name)
+
         # 等待一下，避免所有 worker 同时启动
         await asyncio.sleep(worker_id * 0.1)
         
@@ -647,7 +713,17 @@ class RedisStreamMQ:
         while self._running:
             await asyncio.sleep(60)
             if self._running:
-                stats = await self.get_stats()
+                try:
+                    stats = await self.get_stats()
+                except Exception as e:
+                    # 统计查询失败不该让监控协程退出——
+                    # 否则会永久失去监控能力
+                    logger.warning(f"获取 MQ 统计失败: {type(e).__name__}: {e}")
+                    continue
+                if 'error' in stats and len(stats) == 1:
+                    # get_stats 返回 {'error': ...}——连接不可用
+                    logger.warning(f"获取 MQ 统计失败: {stats['error']}")
+                    continue
                 logger.info(f"📊 MQ 统计: processed={self._stats['total_processed']}, "
                            f"failed={self._stats['total_failed']}, "
                            f"expired={self._stats['total_expired']}, "
@@ -749,6 +825,11 @@ class RedisStreamMQ:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._consumer_tasks.clear()
 
+        # 清理消费者组成员——否则每次 start() 都会在消费者组里留下
+        # 僵尸 consumer（长期运行 / 频繁重启会无限累积）。
+        # 必须在关闭连接**之前**做。
+        await self._cleanup_consumers()
+
         if self._redis:
             try:
                 await self._redis.aclose()
@@ -760,14 +841,57 @@ class RedisStreamMQ:
                 self._redis = None
 
         logger.info("消息队列已停止")
+
+    async def _cleanup_consumers(self) -> None:
+        """从消费者组里删除本次注册过的 consumer。
+
+        消费者组本身保留（保留 PEL 里的未处理消息，便于下次启动继续处理），
+        只删掉 consumer 记录——避免僵尸 consumer 无限累积。
+        """
+        if self._redis is None:
+            self._consumer_names.clear()
+            return
+        redis = self._redis
+        for stream_name, names in list(self._consumer_names.items()):
+            if not names:
+                continue
+            config = self._queues.get(stream_name)
+            if config is None:
+                continue
+            for name in list(names):
+                try:
+                    await redis.xgroup_delconsumer(
+                        config.stream_name, config.group_name, name
+                    )
+                except ResponseError as e:
+                    # 组或 consumer 已不存在——忽略
+                    if "NOGROUP" not in str(e):
+                        logger.warning(
+                            f"删除消费者失败: {stream_name}/{name}, error={e}"
+                        )
+                except Exception as e:
+                    logger.warning(
+                        f"删除消费者异常: {stream_name}/{name}, error={e}"
+                    )
+            names.clear()
+        self._consumer_names.clear()
     
     async def get_stats(self, stream_name: Optional[str] = None) -> Dict[str, Any]:
-        """获取统计信息"""
-        await self.connect()
-        
+        """获取统计信息。
+
+        **不做自动重连**——统计查询是只读操作，不该有副作用。
+        旧实现调 ``await self.connect()``，Redis 断连时会触发最多 10 次
+        重连（每次 sleep(2^n) 最长 10s），把调用方（尤其是监控协程）
+        阻塞近 80 秒。
+
+        连接不可用时返回 ``{'error': ...}``，由调用方决定是否重试。
+        """
+        if self._redis is None:
+            return {'error': 'Redis 未连接'}
+
         if stream_name:
             return await self._get_queue_stats(stream_name)
-        
+
         stats = {}
         for name in self._queues.keys():
             stats[name] = await self._get_queue_stats(name)
@@ -846,6 +970,56 @@ class RedisStreamMQ:
 
         return False
 
+    async def get_dead_letters(
+        self,
+        stream_name: str,
+        count: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """读取死信队列的消息（供人工排查）。
+
+        Args:
+            stream_name: 队列名
+            count: 最多返回多少条
+
+        Returns:
+            死信记录列表（每项含 original_id / original_data /
+            delivery_count / reason / failed_at）
+        """
+        redis = self._r()
+        dead_letter_key = f"{stream_name}:dead_letter"
+        entries = await redis.xrange(dead_letter_key, "-", "+", count=count)
+        result: List[Dict[str, Any]] = []
+        for entry in entries or ():
+            if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+                continue
+            msg_id, data = entry[0], entry[1]
+            item: Dict[str, Any] = {"dead_letter_id": str(msg_id)}
+            if isinstance(data, dict):
+                # key 可能是 bytes（未开 decode_responses 时）——统一转 str
+                item.update({str(k): v for k, v in data.items()})
+            result.append(item)
+        return result
+
+    async def clear_dead_letters(self, stream_name: str) -> int:
+        """清空死信队列，返回被清除的消息条数。
+
+        死信队列只增不减（maxlen=1000 封顶），长期运行会一直占 Redis 内存。
+        确认死信已处理完（或已归档到别处）后调用此方法清理。
+
+        Args:
+            stream_name: 队列名
+
+        Returns:
+            被清除的条数
+        """
+        redis = self._r()
+        dead_letter_key = f"{stream_name}:dead_letter"
+        count = int(await redis.xlen(dead_letter_key))
+        if count:
+            await redis.delete(dead_letter_key)
+            logger.info(f"死信队列已清空: {dead_letter_key}, 清除 {count} 条")
+        return count
+
 
 # 队列名称常量（项目自定义——infra 不再硬编码）
 # 各项目在自己的模块中定义 QueueName，比如:
@@ -903,6 +1077,7 @@ async def init_mq(
             batch_size=q_dict.get('batch_size', 10),
             max_retries=q_dict.get('max_retries', 3),
             concurrency=q_dict.get('concurrency', 3),
+            max_concurrency=q_dict.get('max_concurrency', None),
             claim_interval=q_dict.get('claim_interval', 30),
             claim_min_idle_ms=q_dict.get('claim_min_idle_ms', 60000),
             ttl_seconds=q_dict.get('ttl_seconds', 0)
