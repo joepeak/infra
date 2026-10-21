@@ -8,11 +8,11 @@
 - infra.utils.time_util：时区转换工具（函数式 API）
 - infra.data_quality：DataQuality 枚举
 - infra.bootstrap：bootstrap_all() 一键启动所有基础设施
-- infra.utils：retry/lark/wechat/async_helpers/executor/trend_analyzer/common/time_util
+- infra.utils：retry/lark/wechat/async_helpers/executor/common/time_util/error_handler
 - infra.redis：Redis 客户端
-- infra.mq：消息队列（基于 Redis Stream）
+- infra.mq：消息队列（基于 Redis Stream——重试/死信/优先级/并发限流）
 - infra.messages：通用消息定义（TaskMessage dataclass）
-- infra.schedule：分布式任务调度（APScheduler + Redis 分布式锁）
+- infra.schedule：分布式任务调度（APScheduler + Redis leader 选举）
 - infra.script_logger：独立脚本日志（控制台+文件）
 """
 # 重新导出常用符号（向后兼容）
@@ -39,6 +39,7 @@ from infra.mq import (
     get_mq,
     RedisStreamMQ,
     MessagePriority,
+    PriorityConfig,
     QueueConfig,
     QueueName,
 )
@@ -75,7 +76,7 @@ __all__ = [
     "TaskMessage", "create_message",
     # mq（消息队列）
     "init_mq", "get_mq", "RedisStreamMQ",
-    "MessagePriority", "QueueConfig", "QueueName",
+    "MessagePriority", "PriorityConfig", "QueueConfig", "QueueName",
     # schedule（分布式调度）
     "SchedulerManager", "UnifiedScheduler", "TaskRegistry",
     "get_scheduler_manager", "get_unified_scheduler", "JobConfig",
